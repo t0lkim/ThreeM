@@ -1,0 +1,36 @@
+[package]
+name = "media-organiser"
+version = "0.1.0"
+edition = "2021"
+description = "Image and video organiser with deduplication, EXIF-based renaming, and date-based directory structure"
+authors = ["Mike Lott <me@t0lkim.dev>"]
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+nom-exif = "1"
+reverse_geocoder = "4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+thiserror = "2"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "media-organiser"
+path = "src/main.rs"
+
+[[bin]]
+name = "dedup-verifier"
+path = "src/bin/dedup_verifier.rs"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
