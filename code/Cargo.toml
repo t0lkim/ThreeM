@@ -1,5 +1,5 @@
 [package]
-name = "media-organiser"
+name = "mmm"
 version = "0.1.0"
 edition = "2021"
 description = "Image and video organiser with deduplication, EXIF-based renaming, and date-based directory structure"
@@ -23,12 +23,12 @@ walkdir = "2"
 tempfile = "3"
 
 [[bin]]
-name = "media-organiser"
+name = "mmm"
 path = "src/main.rs"
 
 [[bin]]
-name = "dedup-verifier"
-path = "src/bin/dedup_verifier.rs"
+name = "mmm-dedup-verifier"
+path = "src/bin/mmm_dedup_verifier.rs"
 
 [profile.release]
 lto = true

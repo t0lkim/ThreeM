@@ -30,7 +30,7 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    info!("media-organiser v{}", env!("CARGO_PKG_VERSION"));
+    info!("mmm v{}", env!("CARGO_PKG_VERSION"));
     info!(
         "scanning {} director{}",
         config.directories.len(),

@@ -6,13 +6,13 @@ Image and video organiser with deduplication, EXIF-based renaming, and date-base
 
 ```bash
 # Preview what would happen (nothing is modified)
-media-organiser ~/Photos --dry-run
+mmm ~/Photos --dry-run
 
 # Organise files from multiple sources
-media-organiser ~/Photos ~/Camera/DCIM -o ~/Organised
+mmm ~/Photos ~/Camera/DCIM -o ~/Organised
 
 # Verify duplicates independently
-dedup-verifier ~/Organised/duplicates/
+mmm-dedup-verifier ~/Organised/duplicates/
 ```
 
 ## Features
@@ -24,7 +24,7 @@ dedup-verifier ~/Organised/duplicates/
 - Date-based directory structure (`YYYY/MM/DD/`)
 - Chunked processing with confirmation between batches
 - Dry-run mode — preview all operations before committing
-- Independent `dedup-verifier` binary using keyed BLAKE3 for safety
+- Independent `mmm-dedup-verifier` binary using keyed BLAKE3 for safety
 
 ## Language
 

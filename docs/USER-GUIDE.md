@@ -1,8 +1,8 @@
-# media-organiser User Guide
+# mmm User Guide
 
 ## Overview
 
-`media-organiser` scans one or more directories for images and videos, detects duplicates, renames files by date and location, and sorts them into a `Year/Month/Day` directory hierarchy. A companion tool, `dedup-verifier`, independently verifies that flagged duplicates are genuine before you delete them.
+`mmm` scans one or more directories for images and videos, detects duplicates, renames files by date and location, and sorts them into a `Year/Month/Day` directory hierarchy. A companion tool, `mmm-dedup-verifier`, independently verifies that flagged duplicates are genuine before you delete them.
 
 Both binaries are installed at `~/bin/`.
 
@@ -13,29 +13,29 @@ Both binaries are installed at `~/bin/`.
 Preview what would happen (no files are modified):
 
 ```bash
-media-organiser ~/Photos --dry-run
+mmm ~/Photos --dry-run
 ```
 
 Organise files from multiple sources into a single output directory:
 
 ```bash
-media-organiser ~/Photos ~/Camera/DCIM -o ~/Organised
+mmm ~/Photos ~/Camera/DCIM -o ~/Organised
 ```
 
 After organising, verify the duplicates directory:
 
 ```bash
-dedup-verifier ~/Organised/duplicates/
+mmm-dedup-verifier ~/Organised/duplicates/
 ```
 
 ---
 
-## media-organiser
+## mmm
 
 ### Usage
 
 ```
-media-organiser [OPTIONS] <DIRECTORIES>...
+mmm [OPTIONS] <DIRECTORIES>...
 ```
 
 ### Arguments
@@ -134,19 +134,19 @@ The `[EXIF]`, `[FS]`, and `[NO DATE]` tags tell you where the date came from.
 
 ---
 
-## dedup-verifier
+## mmm-dedup-verifier
 
 ### Usage
 
 ```
-dedup-verifier [OPTIONS] <DUPLICATES_DIR>
+mmm-dedup-verifier [OPTIONS] <DUPLICATES_DIR>
 ```
 
 ### Arguments
 
 | Argument | Description |
 |---|---|
-| `<DUPLICATES_DIR>` | Path to the `duplicates/` directory created by `media-organiser` |
+| `<DUPLICATES_DIR>` | Path to the `duplicates/` directory created by `mmm` |
 
 ### Options
 
@@ -189,13 +189,13 @@ WARNING: 1 groups have hash mismatches — review before deleting!
 
 ```bash
 # 1. Dry run to review the plan
-media-organiser ~/Photos --dry-run
+mmm ~/Photos --dry-run
 
 # 2. Run for real
-media-organiser ~/Photos -o ~/Organised
+mmm ~/Photos -o ~/Organised
 
 # 3. Verify duplicates independently
-dedup-verifier ~/Organised/duplicates/
+mmm-dedup-verifier ~/Organised/duplicates/
 
 # 4. If all [OK], safe to delete duplicates
 rm -rf ~/Organised/duplicates/

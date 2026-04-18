@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "media-organiser",
+    name = "mmm",
     about = "Organise images and videos: deduplicate, rename by date/location, sort into directories",
     version
 )]

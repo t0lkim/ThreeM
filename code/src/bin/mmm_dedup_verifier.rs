@@ -1,6 +1,6 @@
 //! dedup-verifier: Independent duplicate verification using SHA-256
 //!
-//! Runs against the duplicates/ directory created by media-organiser.
+//! Runs against the duplicates/ directory created by mmm.
 //! Uses SHA-256 (not BLAKE3) to provide an independent hash verification
 //! that the files in each numbered group are truly duplicates of the
 //! original file referenced in the manifest.
@@ -17,11 +17,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 #[derive(Parser, Debug)]
 #[command(
     name = "dedup-verifier",
-    about = "Verify duplicate files using SHA-256 (independent of BLAKE3 used by media-organiser)",
+    about = "Verify duplicate files using SHA-256 (independent of BLAKE3 used by mmm)",
     version
 )]
 struct Args {
-    /// Path to the duplicates/ directory created by media-organiser
+    /// Path to the duplicates/ directory created by mmm
     #[arg(required = true)]
     duplicates_dir: PathBuf,
 

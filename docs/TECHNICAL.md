@@ -1,4 +1,4 @@
-# media-organiser Technical Documentation
+# mmm Technical Documentation
 
 ## Architecture
 
@@ -116,17 +116,17 @@ All files
 
 ---
 
-## Verification: media-organiser vs dedup-verifier
+## Verification: mmm vs mmm-dedup-verifier
 
 The two binaries use **deliberately different hashing approaches** so that a bug in one cannot produce a false positive in both. This is the same principle used in safety-critical systems: independent verification channels.
 
 ### Comparison Table
 
-| Property | media-organiser | dedup-verifier |
+| Property | mmm | mmm-dedup-verifier |
 |---|---|---|
 | **Purpose** | Detect duplicates, organise files | Verify that flagged duplicates are genuine |
 | **Hash algorithm** | BLAKE3 standard mode (unkeyed) | BLAKE3 keyed mode |
-| **Hash key** | None | `dedup-verifier-independent-key!!` (32-byte fixed key) |
+| **Hash key** | None | `mmm-dedup-verifier-independent-key!!` (32-byte fixed key) |
 | **Hashing strategy** | Three-phase cascade (size → partial → full) | Always full-file hash, no cascade |
 | **Read buffer size** | 128KB | 256KB |
 | **Partial hashing** | Yes (64KB head + 64KB tail in Phase 2) | No — always hashes the entire file |
@@ -146,7 +146,7 @@ Even though both binaries use the BLAKE3 crate, they produce **different hash va
 
 ### What the Verifier Proves
 
-When `dedup-verifier` reports `[OK]` for a group, it confirms:
+When `mmm-dedup-verifier` reports `[OK]` for a group, it confirms:
 
 1. The original file still exists at the path recorded in `manifest.txt`.
 2. Every file in the group directory produces the **same keyed BLAKE3 hash** as the original.
