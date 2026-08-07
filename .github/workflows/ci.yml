@@ -1,0 +1,90 @@
+name: CI
+
+# ThreeM moves other people's photo libraries. Every push and PR has to clear
+# the same gate the phase-01 safety net established locally: formatting, a
+# clippy run with `-D warnings` (which makes the pedantic group in
+# `code/Cargo.toml` binding), and the full test suite including the integration
+# suites that drive the real `mmm` binary.
+#
+# The crate root is `code/`, not the repository root, so every cargo step needs
+# `working-directory: code`.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt · clippy · test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Both platforms report independently — a Linux failure must not hide a
+      # macOS-only one, and vice versa. The integration suites touch the
+      # filesystem, where the two genuinely differ (APFS vs ext4 scan order,
+      # case sensitivity).
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The workspace lives one level down; without this the action looks
+          # for `Cargo.lock` at the repository root and caches nothing.
+          workspaces: code
+
+      - name: cargo fmt --check
+        working-directory: code
+        run: cargo fmt --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        working-directory: code
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test --all-targets
+        working-directory: code
+        run: cargo test --all-targets
+
+  release-build:
+    name: release build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code
+          # Distinct cache from the `test` job: the release profile sets
+          # `lto = true` and `codegen-units = 1`, so it shares no artifacts
+          # with the dev profile and would otherwise thrash the same entry.
+          key: release
+
+      - name: cargo build --release
+        working-directory: code
+        # The release profile (`lto = true`, `codegen-units = 1`,
+        # `strip = true`) exercises code paths the dev profile never compiles.
+        # This job exists to catch breakage that only appears there.
+        run: cargo build --release
