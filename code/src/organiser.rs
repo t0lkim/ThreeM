@@ -352,7 +352,12 @@ pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(
 /// half-happen to the file's contents, while a cross-volume move reads and
 /// rewrites every byte. Callers and the journal want to know which one moved
 /// a given photo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialisable because [`crate::journal`] records it verbatim: one definition
+/// of what a move did, shared by the code that performs it and the code that
+/// reverses it, rather than a parallel enum in the journal that could drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MoveKind {
     /// Same volume: the destination was linked to the source's inode and the
     /// source link dropped. No data was copied.

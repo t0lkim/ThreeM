@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod geocoder;
 pub mod hasher;
+pub mod journal;
 pub mod metadata;
 pub mod naming;
 pub mod organiser;
