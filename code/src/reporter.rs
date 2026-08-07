@@ -75,10 +75,10 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
 
     println!("\n═══ Dry Run Summary ═══");
     println!("  Total files: {}", moves.len());
-    println!("  Date from EXIF: {}", exif_count);
-    println!("  Date from filesystem: {}", fs_count);
-    println!("  No date (unsorted): {}", no_date_count);
-    println!("  With GPS location: {}", with_location);
+    println!("  Date from EXIF: {exif_count}");
+    println!("  Date from filesystem: {fs_count}");
+    println!("  No date (unsorted): {no_date_count}");
+    println!("  With GPS location: {with_location}");
 }
 
 /// Print the final summary after processing
@@ -90,23 +90,23 @@ pub fn print_summary(
     errors: usize,
 ) {
     println!("\n═══ Processing Complete ═══");
-    println!("  Files scanned:      {}", total_scanned);
-    println!("  Files organised:    {}", total_moved);
-    println!("  Duplicate groups:   {}", duplicate_groups);
-    println!("  Duplicate files:    {}", duplicate_files);
+    println!("  Files scanned:      {total_scanned}");
+    println!("  Files organised:    {total_moved}");
+    println!("  Duplicate groups:   {duplicate_groups}");
+    println!("  Duplicate files:    {duplicate_files}");
     if errors > 0 {
-        println!("  Errors:             {}", errors);
+        println!("  Errors:             {errors}");
     }
     println!("═══════════════════════════\n");
 }
 
 /// Prompt the user to continue processing the next chunk
 pub fn prompt_continue(chunk_number: usize, remaining: usize) -> bool {
-    print!(
-        "\nProcessed chunk {}. {} files remaining. Continue? [Y/n] ",
-        chunk_number, remaining
-    );
-    io::stdout().flush().expect("flush stdout");
+    print!("\nProcessed chunk {chunk_number}. {remaining} files remaining. Continue? [Y/n] ");
+    if io::stdout().flush().is_err() {
+        // We could not even show the prompt, so we have no consent to continue.
+        return false;
+    }
 
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_err() {

@@ -41,7 +41,7 @@ fn main() -> Result<()> {
     scan_spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg}")
-            .expect("valid spinner template"),
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     scan_spinner.set_message("discovering media files...");
     scan_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     // Dedup
     println!("\nAnalysing for duplicates...");
     let dedup_pb = hasher::hashing_progress_bar(files.len() as u64);
-    let dedup_result = hasher::find_duplicates(files, &dedup_pb)?;
+    let dedup_result = hasher::find_duplicates(&files, &dedup_pb)?;
     dedup_pb.finish_with_message("deduplication complete");
 
     // Report duplicates
@@ -76,12 +76,9 @@ fn main() -> Result<()> {
     // Plan all moves
     println!("Planning file organisation...");
     let plan_pb = ProgressBar::new(dedup_result.unique.len() as u64);
-    plan_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.green/white} {pos}/{len} planning")
-            .expect("valid progress template")
-            .progress_chars("##-"),
-    );
+    plan_pb.set_style(hasher::styled_bar(
+        "[{elapsed_precise}] {bar:40.green/white} {pos}/{len} planning",
+    ));
 
     let output_dir = config.output_dir();
     let mut planned_moves = Vec::new();
@@ -114,13 +111,13 @@ fn main() -> Result<()> {
     }
 
     // === Move duplicates to duplicates/ directory ===
-    let (_dup_moved, dup_errors) = if !dedup_result.duplicate_groups.is_empty() {
+    let (_dup_moved, dup_errors) = if dedup_result.duplicate_groups.is_empty() {
+        (0, 0)
+    } else {
         println!("\nMoving duplicates to duplicates/ directory...");
         let (dm, de) = organiser::move_duplicates(&dedup_result.duplicate_groups, output_dir)?;
-        println!("  Moved {} duplicate files ({} errors)", dm, de);
+        println!("  Moved {dm} duplicate files ({de} errors)");
         (dm, de)
-    } else {
-        (0, 0)
     };
 
     // === PHASE B: PROCESS (chunked) ===
@@ -131,12 +128,9 @@ fn main() -> Result<()> {
     let mut move_errors = 0;
 
     let move_pb = ProgressBar::new(total as u64);
-    move_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.yellow/white} {pos}/{len} {msg}")
-            .expect("valid progress template")
-            .progress_chars("##-"),
-    );
+    move_pb.set_style(hasher::styled_bar(
+        "[{elapsed_precise}] {bar:40.yellow/white} {pos}/{len} {msg}",
+    ));
 
     for (i, chunk) in chunks.iter().enumerate() {
         move_pb.set_message(format!("chunk {}/{}", i + 1, chunks.len()));
@@ -162,7 +156,7 @@ fn main() -> Result<()> {
         if remaining > 0 && !config.no_prompt && chunks.len() > 1 {
             move_pb.suspend(|| {
                 if !reporter::prompt_continue(i + 1, remaining) {
-                    println!("Stopped by user. {} files processed so far.", moved);
+                    println!("Stopped by user. {moved} files processed so far.");
                     std::process::exit(0);
                 }
             });

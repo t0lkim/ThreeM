@@ -26,6 +26,11 @@ pub struct ScannedFile {
 }
 
 /// Scan one or more directories recursively for media files
+///
+/// # Errors
+///
+/// Returns an error if a directory cannot be walked, or if the filesystem
+/// metadata for a discovered file cannot be read.
 pub fn scan_directories(dirs: &[PathBuf]) -> Result<Vec<ScannedFile>> {
     let image_ext: HashSet<&str> = IMAGE_EXTENSIONS.iter().copied().collect();
     let video_ext: HashSet<&str> = VIDEO_EXTENSIONS.iter().copied().collect();
@@ -46,9 +51,8 @@ pub fn scan_directories(dirs: &[PathBuf]) -> Result<Vec<ScannedFile>> {
             }
 
             let path = entry.path();
-            let ext = match normalised_extension(path) {
-                Some(e) => e,
-                None => continue,
+            let Some(ext) = normalised_extension(path) else {
+                continue;
             };
 
             let is_image = image_ext.contains(ext.as_str());
@@ -79,10 +83,15 @@ pub fn scan_directories(dirs: &[PathBuf]) -> Result<Vec<ScannedFile>> {
 fn normalised_extension(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
+        .map(str::to_lowercase)
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a panicking assertion in a test is a failing test, which is the desired signal"
+)]
 mod tests {
     use super::*;
     use std::fs;

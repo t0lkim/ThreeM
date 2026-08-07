@@ -1,0 +1,4 @@
+# Formatting is rustfmt's defaults; only the edition is pinned so `cargo fmt`
+# behaves identically whether invoked via cargo (which passes the edition) or
+# as a bare `rustfmt` in CI.
+edition = "2021"

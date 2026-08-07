@@ -6,8 +6,14 @@ pub struct GeoLookup {
     geocoder: ReverseGeocoder,
 }
 
+impl Default for GeoLookup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GeoLookup {
-    /// Create a new geocoder (loads the GeoNames dataset into a k-d tree)
+    /// Create a new geocoder (loads the `GeoNames` dataset into a k-d tree)
     pub fn new() -> Self {
         debug!("loading GeoNames dataset for reverse geocoding");
         let geocoder = ReverseGeocoder::new();
@@ -19,10 +25,10 @@ impl GeoLookup {
         let result: SearchResult = self.geocoder.search((lat, lon));
 
         let record = result.record;
-        let name = record.name.to_string();
-        let country = record.cc.to_string();
+        let name = record.name.clone();
+        let country = record.cc.clone();
 
-        let location = sanitise_for_filename(&format!("{}-{}", name, country));
+        let location = sanitise_for_filename(&format!("{name}-{country}"));
 
         debug!(lat, lon, location = %location, "reverse geocoded");
 
@@ -57,6 +63,11 @@ fn sanitise_for_filename(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a panicking assertion in a test is a failing test, which is the desired signal"
+)]
 mod tests {
     use super::*;
 

@@ -20,7 +20,13 @@ thiserror = "2"
 walkdir = "2"
 
 [dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+proptest = "1"
 tempfile = "3"
+# NOTE: `walkdir` is a normal dependency above. Cargo makes normal dependencies
+# available to test targets too, so it needs no promotion here for the
+# `snapshot_tree` helper the integration suites will use.
 
 [lib]
 name = "mmm"
@@ -33,6 +39,37 @@ path = "src/main.rs"
 [[bin]]
 name = "mmm-dedup-verifier"
 path = "src/bin/mmm_dedup_verifier.rs"
+
+[lints.clippy]
+# ThreeM moves other people's photo libraries. A panic mid-run leaves a tree
+# half-organised, so panicking helpers are banned outside `#[cfg(test)]`
+# modules (which carry a local `allow` — a test that unwraps is a test that
+# fails loudly, which is what we want there).
+#
+# NOTE for integration tests: files under `tests/` are separate crates, so the
+# in-module `allow` does not reach them. Each `tests/*.rs` needs its own
+# crate-level attribute at the top of the file:
+#
+#   #![allow(clippy::unwrap_used, clippy::expect_used)]
+unwrap_used = "deny"
+expect_used = "deny"
+
+# Pedantic is on as a warning group; `-D warnings` in CI makes it binding.
+# `priority = -1` lets the individual `allow`s below win over the group.
+pedantic = { level = "warn", priority = -1 }
+
+# Deliberately suppressed pedantic lints:
+#   must_use_candidate  — noisy across a mostly-internal API surface; the
+#                         library exists to be driven by the two binaries and
+#                         the integration tests, not by third-party callers.
+#   too_many_lines      — the scan/plan/move pipeline in `main` and the
+#                         verifier reads better as one linear narrative than
+#                         as a chain of single-call-site helpers.
+#   large_stack_arrays  — the 64 KiB hashing read buffers are a deliberate
+#                         throughput choice, not an oversight.
+must_use_candidate = "allow"
+too_many_lines = "allow"
+large_stack_arrays = "allow"
 
 [profile.release]
 lto = true

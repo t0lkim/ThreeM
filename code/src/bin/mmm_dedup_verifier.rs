@@ -12,7 +12,7 @@ use std::process;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -104,12 +104,9 @@ fn main() -> Result<()> {
     );
 
     let pb = ProgressBar::new(groups.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-            .expect("valid template")
-            .progress_chars("##-"),
-    );
+    pb.set_style(mmm::hasher::styled_bar(
+        "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}",
+    ));
 
     let mut results: Vec<VerificationResult> = Vec::new();
     let mut confirmed = 0;
@@ -123,7 +120,7 @@ fn main() -> Result<()> {
             .to_string_lossy()
             .to_string();
 
-        pb.set_message(format!("group {}", group_id));
+        pb.set_message(format!("group {group_id}"));
 
         let manifest_path = group_dir.join("manifest.txt");
         if !manifest_path.exists() {
@@ -146,17 +143,9 @@ fn main() -> Result<()> {
         for entry in fs::read_dir(group_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file()
-                && path
-                    .file_name()
-                    .map(|n| n != "manifest.txt")
-                    .unwrap_or(false)
-            {
+            if path.is_file() && path.file_name().is_some_and(|n| n != "manifest.txt") {
                 let hash = verification_hash(&path)?;
-                let matches = original_hash
-                    .as_ref()
-                    .map(|oh| oh == &hash)
-                    .unwrap_or(false);
+                let matches = original_hash.as_ref().is_some_and(|oh| oh == &hash);
                 duplicate_checks.push(DuplicateCheck {
                     path,
                     hash,
@@ -199,11 +188,7 @@ fn main() -> Result<()> {
             Verdict::OriginalMissing => "MISSING",
         };
 
-        let hash_display = result
-            .original_hash
-            .as_deref()
-            .map(|h| &h[..16])
-            .unwrap_or("N/A");
+        let hash_display = result.original_hash.as_deref().map_or("N/A", |h| &h[..16]);
         println!(
             "  [{}] Group {}: {} ({} duplicates, hash: {}...)",
             icon,
@@ -228,23 +213,17 @@ fn main() -> Result<()> {
 
     println!("\n═══ Summary ═══");
     println!("  Groups verified: {}", results.len());
-    println!("  Confirmed duplicates: {}", confirmed);
-    println!("  Hash mismatches: {}", mismatches);
-    println!("  Original missing: {}", missing);
+    println!("  Confirmed duplicates: {confirmed}");
+    println!("  Hash mismatches: {mismatches}");
+    println!("  Original missing: {missing}");
 
     if mismatches > 0 {
-        println!(
-            "\nWARNING: {} groups have hash mismatches — review before deleting!",
-            mismatches
-        );
+        println!("\nWARNING: {mismatches} groups have hash mismatches — review before deleting!");
         process::exit(1);
     }
 
     if missing > 0 && args.check_originals {
-        println!(
-            "\nWARNING: {} originals not found at recorded paths!",
-            missing
-        );
+        println!("\nWARNING: {missing} originals not found at recorded paths!");
         process::exit(1);
     }
 

@@ -1,4 +1,4 @@
-//! ThreeM (`mmm`) — media organiser library.
+//! `ThreeM` (`mmm`) — media organiser library.
 //!
 //! The binaries in `src/main.rs` and `src/bin/` are thin consumers of this
 //! crate. Everything the CLI does lives here so integration tests under

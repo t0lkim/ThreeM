@@ -24,13 +24,21 @@ pub enum DateSource {
 }
 
 /// Extract metadata from an image or video file
+///
+/// EXIF/video-container extraction is best-effort: if it fails or yields no
+/// date, this falls back to filesystem timestamps.
+///
+/// # Errors
+///
+/// Returns an error only if the filesystem fallback itself fails — i.e. the
+/// file's own metadata cannot be read.
 pub fn extract_metadata(path: &Path, is_video: bool) -> Result<FileMetadata> {
     if is_video {
         match extract_video_metadata(path) {
             Ok(meta) if meta.date.is_some() => return Ok(meta),
             Ok(_) => debug!(path = %path.display(), "video metadata found but no date"),
             Err(e) => {
-                debug!(path = %path.display(), error = %e, "video metadata extraction failed")
+                debug!(path = %path.display(), error = %e, "video metadata extraction failed");
             }
         }
     } else {
@@ -51,16 +59,13 @@ fn extract_image_metadata(path: &Path) -> Result<FileMetadata> {
     let iter =
         parse_exif(reader, None).with_context(|| format!("parsing EXIF for {}", path.display()))?;
 
-    let iter = match iter {
-        Some(i) => i,
-        None => {
-            return Ok(FileMetadata {
-                date: None,
-                latitude: None,
-                longitude: None,
-                date_source: DateSource::None,
-            });
-        }
+    let Some(iter) = iter else {
+        return Ok(FileMetadata {
+            date: None,
+            latitude: None,
+            longitude: None,
+            date_source: DateSource::None,
+        });
     };
 
     // Collect into Exif struct for easy tag access
@@ -168,7 +173,7 @@ fn extract_filesystem_metadata(path: &Path) -> Result<FileMetadata> {
     })
 }
 
-/// Convert an EntryValue to a DateTime<Utc>
+/// Convert an `EntryValue` to a `DateTime`<Utc>
 fn entry_to_datetime(value: &EntryValue) -> Option<DateTime<Utc>> {
     match value {
         EntryValue::Time(dt) => Some(dt.with_timezone(&Utc)),
@@ -217,18 +222,16 @@ fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
     let lon_part = &s[pos..];
     let lon_str: &str = lon_part
         .find(|c: char| ['+', '-'].contains(&c))
-        .map(|i| {
+        .map_or(lon_part, |i| {
             if i == 0 {
                 // This is the sign of longitude itself, find the next one
                 lon_part[1..]
                     .find(|c: char| ['+', '-'].contains(&c))
-                    .map(|j| &lon_part[..j + 1])
-                    .unwrap_or(lon_part)
+                    .map_or(lon_part, |j| &lon_part[..=j])
             } else {
                 &lon_part[..i]
             }
-        })
-        .unwrap_or(lon_part);
+        });
 
     let lat: f64 = lat_str.parse().ok()?;
     let lon: f64 = lon_str.parse().ok()?;
@@ -236,6 +239,11 @@ fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a panicking assertion in a test is a failing test, which is the desired signal"
+)]
 mod tests {
     use super::*;
 

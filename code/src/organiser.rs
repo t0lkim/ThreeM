@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,10 @@ pub struct PlannedMove {
 }
 
 /// Build the target path for a file based on its metadata
+///
+/// # Errors
+///
+/// Returns an error if the file's metadata cannot be extracted.
 pub fn plan_move(file: &ScannedFile, output_dir: &Path, geo: &GeoLookup) -> Result<PlannedMove> {
     let meta = metadata::extract_metadata(&file.path, file.is_video)?;
 
@@ -36,18 +41,19 @@ pub fn plan_move(file: &ScannedFile, output_dir: &Path, geo: &GeoLookup) -> Resu
 
 /// Build the directory path (YYYY/MM/DD) and filename (YYYY-MM-DD-HHMMSS[-location].ext)
 // exposed for integration tests
-pub fn build_target_path(meta: &FileMetadata, extension: &str, geo: &GeoLookup) -> (PathBuf, String) {
-    match meta.date {
-        Some(dt) => {
-            let dir = date_directory(&dt);
-            let filename = date_filename(&dt, meta, extension, geo);
-            (dir, filename)
-        }
-        None => {
-            let dir = PathBuf::from("unsorted");
-            let filename = format!("unknown.{}", extension);
-            (dir, filename)
-        }
+pub fn build_target_path(
+    meta: &FileMetadata,
+    extension: &str,
+    geo: &GeoLookup,
+) -> (PathBuf, String) {
+    if let Some(dt) = meta.date {
+        let dir = date_directory(&dt);
+        let filename = date_filename(&dt, meta, extension, geo);
+        (dir, filename)
+    } else {
+        let dir = PathBuf::from("unsorted");
+        let filename = format!("unknown.{extension}");
+        (dir, filename)
     }
 }
 
@@ -79,8 +85,8 @@ fn date_filename(
     };
 
     match location_part {
-        Some(loc) => format!("{}{}.{}", base, loc, extension),
-        None => format!("{}.{}", base, extension),
+        Some(loc) => format!("{base}{loc}.{extension}"),
+        None => format!("{base}.{extension}"),
     }
 }
 
@@ -96,9 +102,9 @@ pub fn resolve_collision(path: &Path) -> PathBuf {
 
     for i in 1..10000 {
         let candidate = if ext.is_empty() {
-            parent.join(format!("{}-{}", stem, i))
+            parent.join(format!("{stem}-{i}"))
         } else {
-            parent.join(format!("{}-{}.{}", stem, i, ext))
+            parent.join(format!("{stem}-{i}.{ext}"))
         };
         if !candidate.exists() {
             return candidate;
@@ -117,13 +123,18 @@ pub fn resolve_collision(path: &Path) -> PathBuf {
 /// Move duplicate files into numbered subdirectories under duplicates/
 /// Each duplicate group gets its own directory: duplicates/000/, duplicates/001/, etc.
 /// The first file in each group is the "original" and is NOT moved here.
+///
+/// # Errors
+///
+/// Returns an error if a `duplicates/NNN/` directory or its `manifest.txt`
+/// cannot be created. Individual failed moves are counted, not propagated.
 pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(usize, usize)> {
     let dup_base = output_dir.join("duplicates");
     let mut moved = 0;
     let mut errors = 0;
 
     for (i, group) in groups.iter().enumerate() {
-        let group_dir = dup_base.join(format!("{:03}", i));
+        let group_dir = dup_base.join(format!("{i:03}"));
         fs::create_dir_all(&group_dir)
             .with_context(|| format!("creating duplicate dir {}", group_dir.display()))?;
 
@@ -144,7 +155,7 @@ pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(
                 .to_string();
             let dest = resolve_collision(&group_dir.join(&filename));
 
-            manifest.push_str(&format!("{}\n", dup_path.display()));
+            let _ = writeln!(manifest, "{}", dup_path.display());
 
             let planned = PlannedMove {
                 source: dup_path.clone(),
@@ -170,6 +181,11 @@ pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(
 }
 
 /// Execute a planned move atomically
+///
+/// # Errors
+///
+/// Returns an error if the destination has no parent directory, if that
+/// directory cannot be created, or if the rename/copy of the file fails.
 pub fn execute_move(planned: &PlannedMove) -> Result<()> {
     let dest_dir = planned
         .destination
@@ -245,6 +261,11 @@ fn cross_volume_move(src: &Path, dst: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a panicking assertion in a test is a failing test, which is the desired signal"
+)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

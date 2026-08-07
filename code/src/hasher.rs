@@ -32,9 +32,14 @@ pub struct DuplicateGroup {
 /// 1. Group by file size (free — metadata only)
 /// 2. Partial BLAKE3 hash (first 64KB + last 64KB)
 /// 3. Full BLAKE3 hash (only for partial-hash matches)
-pub fn find_duplicates(files: Vec<ScannedFile>, progress: &ProgressBar) -> Result<DedupResult> {
+///
+/// # Errors
+///
+/// Returns an error if any candidate file cannot be opened or read while
+/// computing its partial or full hash.
+pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> Result<DedupResult> {
     progress.set_message("Phase 1: grouping by file size");
-    let size_groups = group_by_size(&files);
+    let size_groups = group_by_size(files);
 
     // Files with unique sizes are immediately unique
     let mut unique: Vec<ScannedFile> = Vec::new();
@@ -109,6 +114,11 @@ pub fn group_by_size(files: &[ScannedFile]) -> HashMap<u64, Vec<ScannedFile>> {
     groups
 }
 
+/// Group files by a partial (head + tail) BLAKE3 hash
+///
+/// # Errors
+///
+/// Returns an error if a file cannot be opened, seeked, or read.
 // exposed for integration tests
 pub fn group_by_partial_hash<'a>(
     files: &[&'a ScannedFile],
@@ -121,6 +131,11 @@ pub fn group_by_partial_hash<'a>(
     Ok(groups)
 }
 
+/// Group files by a full-content BLAKE3 hash
+///
+/// # Errors
+///
+/// Returns an error if a file cannot be opened or read to completion.
 // exposed for integration tests
 pub fn group_by_full_hash<'a>(
     files: &[&'a ScannedFile],
@@ -141,15 +156,18 @@ fn partial_hash(path: &PathBuf, size: u64) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
 
     // Read first chunk
-    let first_bytes = std::cmp::min(PARTIAL_HASH_BYTES, size);
-    let mut buf = vec![0u8; first_bytes as usize];
+    let first_bytes = usize::try_from(std::cmp::min(PARTIAL_HASH_BYTES, size))
+        .context("partial-hash chunk size does not fit in usize on this platform")?;
+    let mut buf = vec![0u8; first_bytes];
     file.read_exact(&mut buf)
         .with_context(|| format!("reading first bytes of {}", path.display()))?;
     hasher.update(&buf);
 
     // Read last chunk (if file is large enough for it to differ from the first)
     if size > PARTIAL_HASH_BYTES * 2 {
-        file.seek(SeekFrom::End(-(PARTIAL_HASH_BYTES as i64)))
+        let tail_offset = i64::try_from(PARTIAL_HASH_BYTES)
+            .context("partial-hash chunk size does not fit in i64")?;
+        file.seek(SeekFrom::End(-tail_offset))
             .with_context(|| format!("seeking in {}", path.display()))?;
         file.read_exact(&mut buf)
             .with_context(|| format!("reading last bytes of {}", path.display()))?;
@@ -183,16 +201,27 @@ fn full_hash(path: &PathBuf) -> Result<String> {
 /// Create a progress bar styled for hashing operations
 pub fn hashing_progress_bar(total: u64) -> ProgressBar {
     let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-            .expect("valid progress template")
-            .progress_chars("##-"),
-    );
+    pb.set_style(styled_bar(
+        "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}",
+    ));
     pb
 }
 
+/// Build a bar style from `template`, falling back to the default bar if the
+/// template is malformed — cosmetics must never abort a run.
+pub fn styled_bar(template: &str) -> ProgressStyle {
+    ProgressStyle::default_bar().template(template).map_or_else(
+        |_| ProgressStyle::default_bar(),
+        |s| s.progress_chars("##-"),
+    )
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a panicking assertion in a test is a failing test, which is the desired signal"
+)]
 mod tests {
     use super::*;
     use std::fs;
@@ -218,7 +247,7 @@ mod tests {
         let files = vec![make_scanned(f1, 5), make_scanned(f2, 24)];
 
         let pb = ProgressBar::hidden();
-        let result = find_duplicates(files, &pb).unwrap();
+        let result = find_duplicates(&files, &pb).unwrap();
         assert_eq!(result.unique.len(), 2);
         assert!(result.duplicate_groups.is_empty());
     }
@@ -236,7 +265,7 @@ mod tests {
         let files = vec![make_scanned(f1, size), make_scanned(f2, size)];
 
         let pb = ProgressBar::hidden();
-        let result = find_duplicates(files, &pb).unwrap();
+        let result = find_duplicates(&files, &pb).unwrap();
         assert_eq!(result.duplicate_groups.len(), 1);
         assert_eq!(result.duplicate_groups[0].files.len(), 2);
     }
@@ -253,7 +282,7 @@ mod tests {
         let files = vec![make_scanned(f1, 8), make_scanned(f2, 8)];
 
         let pb = ProgressBar::hidden();
-        let result = find_duplicates(files, &pb).unwrap();
+        let result = find_duplicates(&files, &pb).unwrap();
         assert_eq!(result.unique.len(), 2);
         assert!(result.duplicate_groups.is_empty());
     }
