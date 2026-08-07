@@ -31,6 +31,23 @@ pub fn print_duplicates(groups: &[DuplicateGroup]) {
     );
 }
 
+/// Announced before anything is scanned, and again after a dry-run listing.
+pub const DRY_RUN_BANNER: &str =
+    "DRY RUN — no files will be modified. Re-run with --commit to apply.";
+
+/// Announced before any file is moved.
+pub const COMMIT_BANNER: &str = "COMMIT MODE — files will be moved.";
+
+/// Print the posture banner so the caller knows which mode they are in
+/// before a single file is touched.
+pub fn print_mode_banner(dry_run: bool) {
+    if dry_run {
+        println!("\n{DRY_RUN_BANNER}");
+    } else {
+        println!("\n{COMMIT_BANNER}");
+    }
+}
+
 /// Print the planned moves for dry-run mode
 pub fn print_dry_run(moves: &[PlannedMove]) {
     if moves.is_empty() {

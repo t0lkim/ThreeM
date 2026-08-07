@@ -23,6 +23,14 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    if let Some(notice) = config.deprecation_notice() {
+        eprintln!("{notice}");
+    }
+
+    // Say which posture we are in before doing any work, not after — a user
+    // who expected a preview must not learn otherwise from the aftermath.
+    reporter::print_mode_banner(config.is_dry_run());
+
     info!("mmm v{}", env!("CARGO_PKG_VERSION"));
     info!(
         "scanning {} director{}",
@@ -96,8 +104,8 @@ fn main() -> Result<()> {
     }
     plan_pb.finish_with_message("planning complete");
 
-    // === DRY RUN: stop here ===
-    if config.dry_run {
+    // === DRY RUN (the default): stop here, before anything is moved ===
+    if config.is_dry_run() {
         reporter::print_dry_run(&planned_moves);
         reporter::print_summary(
             dedup_result.unique.len() + total_duplicate_files,
@@ -106,7 +114,7 @@ fn main() -> Result<()> {
             total_duplicate_files,
             plan_errors,
         );
-        println!("Dry run complete. No files were modified.");
+        println!("{}", reporter::DRY_RUN_BANNER);
         return Ok(());
     }
 
