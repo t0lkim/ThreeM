@@ -145,7 +145,7 @@ fn main() -> Result<()> {
 
         for planned in *chunk {
             match organiser::execute_move(planned) {
-                Ok(()) => moved += 1,
+                Ok(_) => moved += 1,
                 Err(e) => {
                     error!(
                         src = %planned.source.display(),

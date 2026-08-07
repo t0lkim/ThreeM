@@ -30,13 +30,17 @@
 //!
 //! ## What passes today, and why that is still worth asserting
 //!
-//! Not all of these fail against the current implementation, and the honest
-//! record of which do is in
-//! `.maestro/playbooks/Initiation/Phase-02-Destructive-Path-Hardening.md`.
-//! The ones that pass today pass *by luck of ordering* — `resolve_collision`
-//! happens to run immediately before the rename in a single-threaded test, so
-//! the TOCTOU window never opens. They are here to stay green through the
-//! rewrite in the next task, which is exactly what a regression test is for.
+//! Defect 1 is fixed as of task 2 of the phase: `execute_move` now walks the
+//! collision candidates and lets `move_no_clobber` — `link(2)` plus `unlink`,
+//! which fails `EEXIST` on any occupied name including a dangling symlink —
+//! decide which one is free. Both no-clobber tests below pass on merit rather
+//! than on ordering luck.
+//!
+//! Defects 2, 3 and 4 are still live, and the two tests that fail are the
+//! ones that describe them. The honest per-test record is in
+//! `.maestro/playbooks/Initiation/Phase-02-Destructive-Path-Hardening.md`;
+//! CI stays red until tasks 3 and 4 land, which is the intended test-first
+//! posture of this phase.
 
 #![allow(
     clippy::unwrap_used,
