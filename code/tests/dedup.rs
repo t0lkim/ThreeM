@@ -465,13 +465,27 @@ fn three_identical_files_make_one_group_with_two_files_moved_into_it() {
         snapshot_tree(&out_dir)
     );
 
-    // The duplicate that came from a subdirectory is flattened into the group
-    // directory under its bare filename — worth pinning, because it is what
-    // makes the leaf-name collision below possible.
-    assert!(
-        out_dir.join("duplicates/000/c.jpg").is_file(),
-        "the nested duplicate was not flattened into the group directory"
-    );
+    // Every surplus copy is a flat *file* directly inside the group directory,
+    // under its bare leaf name — including any that came from a subdirectory.
+    //
+    // Derived from scan order rather than naming a file, because which of the
+    // three copies is kept is decided by the filesystem, and ext4 and APFS
+    // disagree. Asserting `duplicates/000/c.jpg` here passed on macOS and
+    // failed on Linux, where `nested/c.jpg` is scanned first and so becomes
+    // the *retained* copy, never entering the duplicates set at all.
+    //
+    // Nested flattening specifically is pinned unconditionally by
+    // `duplicates_sharing_a_leaf_name_do_not_overwrite_each_other` below,
+    // where all three copies live in subdirectories — so whichever one is
+    // kept, both survivors are nested and flattening must happen.
+    for name in &moved {
+        assert!(
+            groups[0].join(name).is_file(),
+            "surplus copy {name} is not a flat file in the group directory; \
+             group holds {:?}",
+            files_in_group(&groups[0])
+        );
+    }
 }
 
 #[test]
