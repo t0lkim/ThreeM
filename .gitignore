@@ -5,3 +5,7 @@ TIMECONFIG.json
 diagrams/
 specs/
 SPECS/
+
+# Local agent tooling — not part of the project
+CLAUDE.md
+.maestro/
