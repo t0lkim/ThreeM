@@ -98,21 +98,73 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
     println!("  With GPS location: {with_location}");
 }
 
-/// Print the final summary after processing
-pub fn print_summary(
-    total_scanned: usize,
-    total_moved: usize,
-    duplicate_groups: usize,
-    duplicate_files: usize,
-    errors: usize,
-) {
+/// Everything the closing summary reports.
+///
+/// Named fields rather than a row of positional `usize`s. Every figure here
+/// is the same type, so a transposed pair would compile, run, and quietly
+/// report the wrong thing — and two of these fields exist precisely so that
+/// files the run passed over cannot go unnoticed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunSummary {
+    /// Media files the scan discovered.
+    pub scanned: usize,
+    /// Files actually moved into the output tree.
+    pub organised: usize,
+    pub duplicate_groups: usize,
+    pub duplicate_files: usize,
+    /// Entries the scan could not read — see [`crate::scanner::ScanResult`].
+    pub scan_skipped: usize,
+    /// Files excluded from duplicate detection because they could not be
+    /// hashed — see [`crate::hasher::DedupResult`].
+    pub hash_skipped: usize,
+    pub errors: usize,
+}
+
+/// Column width of the summary labels, so every figure lines up.
+const LABEL_WIDTH: usize = 20;
+
+/// Label for entries the scan passed over. Exported so the integration suite
+/// asserts against the string the binary actually prints.
+pub const SCAN_SKIPPED_LABEL: &str = "Unreadable (scan):";
+
+/// Label for files dropped from duplicate detection.
+pub const HASH_SKIPPED_LABEL: &str = "Unhashable (dedup):";
+
+/// Print the final summary after processing.
+///
+/// The skip lines appear only when something was skipped — a run that omitted
+/// nothing should not invite the operator to look for what it omitted. When
+/// they do appear they are unconditional: a file left out of the plan is
+/// reported here or it is not reported at all.
+pub fn print_summary(summary: &RunSummary) {
     println!("\n═══ Processing Complete ═══");
-    println!("  Files scanned:      {total_scanned}");
-    println!("  Files organised:    {total_moved}");
-    println!("  Duplicate groups:   {duplicate_groups}");
-    println!("  Duplicate files:    {duplicate_files}");
-    if errors > 0 {
-        println!("  Errors:             {errors}");
+    println!("  {:<LABEL_WIDTH$}{}", "Files scanned:", summary.scanned);
+    println!(
+        "  {:<LABEL_WIDTH$}{}",
+        "Files organised:", summary.organised
+    );
+    println!(
+        "  {:<LABEL_WIDTH$}{}",
+        "Duplicate groups:", summary.duplicate_groups
+    );
+    println!(
+        "  {:<LABEL_WIDTH$}{}",
+        "Duplicate files:", summary.duplicate_files
+    );
+    if summary.scan_skipped > 0 {
+        println!(
+            "  {SCAN_SKIPPED_LABEL:<LABEL_WIDTH$}{}",
+            summary.scan_skipped
+        );
+    }
+    if summary.hash_skipped > 0 {
+        println!(
+            "  {HASH_SKIPPED_LABEL:<LABEL_WIDTH$}{}",
+            summary.hash_skipped
+        );
+    }
+    if summary.errors > 0 {
+        println!("  {:<LABEL_WIDTH$}{}", "Errors:", summary.errors);
     }
     println!("═══════════════════════════\n");
 }

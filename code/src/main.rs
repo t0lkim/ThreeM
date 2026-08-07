@@ -54,18 +54,29 @@ fn main() -> Result<()> {
     scan_spinner.set_message("discovering media files...");
     scan_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let files = scanner::scan_directories(&config.directories)?;
+    let scanner::ScanResult {
+        files,
+        skipped: scan_skipped,
+    } = scanner::scan_directories(&config.directories);
     scan_spinner.finish_with_message(format!("found {} media files", files.len()));
 
     if files.is_empty() {
         println!("No media files found in the specified directories.");
+        if scan_skipped > 0 {
+            // "Nothing here" and "we could not look" must never read the same.
+            println!(
+                "{scan_skipped} entr{} could not be read and {} skipped — see the warnings above.",
+                if scan_skipped == 1 { "y" } else { "ies" },
+                if scan_skipped == 1 { "was" } else { "were" }
+            );
+        }
         return Ok(());
     }
 
     // Dedup
     println!("\nAnalysing for duplicates...");
     let dedup_pb = hasher::hashing_progress_bar(files.len() as u64);
-    let dedup_result = hasher::find_duplicates(&files, &dedup_pb)?;
+    let dedup_result = hasher::find_duplicates(&files, &dedup_pb);
     dedup_pb.finish_with_message("deduplication complete");
 
     // Report duplicates
@@ -104,16 +115,22 @@ fn main() -> Result<()> {
     }
     plan_pb.finish_with_message("planning complete");
 
+    // Every figure but `organised` is already known, so the two summaries
+    // differ in exactly one field rather than in five positional arguments.
+    let summary = reporter::RunSummary {
+        scanned: files.len(),
+        organised: 0,
+        duplicate_groups: dedup_result.duplicate_groups.len(),
+        duplicate_files: total_duplicate_files,
+        scan_skipped,
+        hash_skipped: dedup_result.skipped,
+        errors: plan_errors,
+    };
+
     // === DRY RUN (the default): stop here, before anything is moved ===
     if config.is_dry_run() {
         reporter::print_dry_run(&planned_moves);
-        reporter::print_summary(
-            dedup_result.unique.len() + total_duplicate_files,
-            0,
-            dedup_result.duplicate_groups.len(),
-            total_duplicate_files,
-            plan_errors,
-        );
+        reporter::print_summary(&summary);
         println!("{}", reporter::DRY_RUN_BANNER);
         return Ok(());
     }
@@ -173,13 +190,11 @@ fn main() -> Result<()> {
 
     move_pb.finish_with_message("organisation complete");
 
-    reporter::print_summary(
-        dedup_result.unique.len() + total_duplicate_files,
-        moved,
-        dedup_result.duplicate_groups.len(),
-        total_duplicate_files,
-        plan_errors + move_errors + dup_errors,
-    );
+    reporter::print_summary(&reporter::RunSummary {
+        organised: moved,
+        errors: plan_errors + move_errors + dup_errors,
+        ..summary
+    });
 
     Ok(())
 }

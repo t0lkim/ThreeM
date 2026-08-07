@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::scanner::ScannedFile;
 
@@ -26,6 +26,29 @@ pub struct DedupResult {
     pub unique: Vec<ScannedFile>,
     /// Groups of duplicate files (each group shares identical content)
     pub duplicate_groups: Vec<DuplicateGroup>,
+    /// Files excluded from the analysis because their contents could not be
+    /// read — deleted or truncated mid-run, or permission denied.
+    ///
+    /// Excluded means excluded from *everything*: they are absent from
+    /// `unique` too, so nothing downstream moves a file whose content this
+    /// pass never managed to establish. That is deliberate, and it is why the
+    /// count exists — a file dropped from the plan must be reported, or the
+    /// operator reads a clean summary over a library that was quietly only
+    /// partly processed.
+    pub skipped: usize,
+}
+
+/// Files grouped by a hash, plus a count of those that could not be hashed.
+///
+/// One unreadable file used to abort the whole dedup pass with `?`. A photo
+/// library is a live filesystem — files get deleted, truncated and locked
+/// underneath a long run — so a per-file read failure is ordinary, and the
+/// only correct response is to leave that file out of the comparison and say
+/// so.
+#[derive(Debug)]
+pub struct HashGroups<'a> {
+    pub groups: HashMap<String, Vec<&'a ScannedFile>>,
+    pub skipped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -40,11 +63,10 @@ pub struct DuplicateGroup {
 /// 2. Partial BLAKE3 hash (first 64KB + last 64KB)
 /// 3. Full BLAKE3 hash (only for partial-hash matches)
 ///
-/// # Errors
-///
-/// Returns an error if any candidate file cannot be opened or read while
-/// computing its partial or full hash.
-pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> Result<DedupResult> {
+/// Infallible by construction. A file that cannot be read is dropped from the
+/// analysis with a warning and counted in [`DedupResult::skipped`]; it never
+/// takes the rest of the run down with it.
+pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupResult {
     progress.set_message("Phase 1: grouping by file size");
     let size_groups = group_by_size(files);
 
@@ -69,10 +91,12 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> Result<
     // Phase 2: Partial hash
     progress.set_message("Phase 2: partial hashing size-matched files");
     let mut phase3_candidates: Vec<Vec<&ScannedFile>> = Vec::new();
+    let mut skipped = 0;
 
     for group in &candidates {
-        let partial_groups = group_by_partial_hash(group)?;
-        for (_hash, pgroup) in partial_groups {
+        let partial = group_by_partial_hash(group);
+        skipped += partial.skipped;
+        for (_hash, pgroup) in partial.groups {
             if pgroup.len() == 1 {
                 unique.push(pgroup[0].clone());
             } else {
@@ -89,8 +113,9 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> Result<
     let mut duplicate_groups: Vec<DuplicateGroup> = Vec::new();
 
     for group in &phase3_candidates {
-        let full_groups = group_by_full_hash(group)?;
-        for (hash, fgroup) in full_groups {
+        let full = group_by_full_hash(group);
+        skipped += full.skipped;
+        for (hash, fgroup) in full.groups {
             if fgroup.len() == 1 {
                 unique.push(fgroup[0].clone());
             } else {
@@ -106,10 +131,15 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> Result<
         progress.inc(group.len() as u64);
     }
 
-    Ok(DedupResult {
+    if skipped > 0 {
+        warn!(count = skipped, "files excluded from duplicate detection");
+    }
+
+    DedupResult {
         unique,
         duplicate_groups,
-    })
+        skipped,
+    }
 }
 
 // exposed for integration tests
@@ -121,52 +151,76 @@ pub fn group_by_size(files: &[ScannedFile]) -> HashMap<u64, Vec<ScannedFile>> {
     groups
 }
 
-/// Group files by a partial (head + tail) BLAKE3 hash
+/// Group files by a partial (head + tail) BLAKE3 hash.
 ///
-/// # Errors
-///
-/// Returns an error if a file cannot be opened, seeked, or read.
+/// A file that cannot be opened, seeked or read is left out of the returned
+/// groups and counted in [`HashGroups::skipped`], with a warning naming it.
 // exposed for integration tests
-pub fn group_by_partial_hash<'a>(
-    files: &[&'a ScannedFile],
-) -> Result<HashMap<String, Vec<&'a ScannedFile>>> {
-    let mut groups: HashMap<String, Vec<&'a ScannedFile>> = HashMap::new();
-    for file in files {
-        let hash = partial_hash(&file.path, file.size)?;
-        groups.entry(hash).or_default().push(file);
-    }
-    Ok(groups)
+pub fn group_by_partial_hash<'a>(files: &[&'a ScannedFile]) -> HashGroups<'a> {
+    group_by(files, |file| partial_hash(&file.path))
 }
 
-/// Group files by a full-content BLAKE3 hash
+/// Group files by a full-content BLAKE3 hash.
 ///
-/// # Errors
-///
-/// Returns an error if a file cannot be opened or read to completion.
+/// A file that cannot be opened or read to completion is left out of the
+/// returned groups and counted in [`HashGroups::skipped`], with a warning
+/// naming it.
 // exposed for integration tests
-pub fn group_by_full_hash<'a>(
-    files: &[&'a ScannedFile],
-) -> Result<HashMap<String, Vec<&'a ScannedFile>>> {
-    let mut groups: HashMap<String, Vec<&'a ScannedFile>> = HashMap::new();
-    for file in files {
-        let hash = full_hash(&file.path)?;
-        groups.entry(hash).or_default().push(file);
-    }
-    Ok(groups)
+pub fn group_by_full_hash<'a>(files: &[&'a ScannedFile]) -> HashGroups<'a> {
+    group_by(files, |file| full_hash(&file.path))
 }
 
-/// Hash first 64KB + last 64KB of a file using BLAKE3
-fn partial_hash(path: &Path, size: u64) -> Result<String> {
+/// The shared body of both grouping passes: hash each file, bucket it by the
+/// digest, and drop — loudly — the ones that would not read.
+///
+/// One implementation rather than two, because the interesting behaviour here
+/// is the skip, and two copies of it are two chances for one of them to go
+/// back to `?` unnoticed.
+fn group_by<'a>(
+    files: &[&'a ScannedFile],
+    hash: impl Fn(&ScannedFile) -> Result<String>,
+) -> HashGroups<'a> {
+    let mut groups: HashMap<String, Vec<&'a ScannedFile>> = HashMap::new();
+    let mut skipped = 0;
+
+    for file in files {
+        match hash(file) {
+            Ok(digest) => groups.entry(digest).or_default().push(file),
+            Err(e) => {
+                warn!(
+                    path = %file.path.display(),
+                    error = %format!("{e:#}"),
+                    "cannot read this file — excluding it from duplicate detection"
+                );
+                skipped += 1;
+            }
+        }
+    }
+
+    HashGroups { groups, skipped }
+}
+
+/// Hash first 64KB + last 64KB of a file using BLAKE3.
+///
+/// The length is taken from the open handle, not from the scan. The old code
+/// sized a `read_exact` from the scan-time figure, so a file that shrank in
+/// between — a camera import still writing, a sync client rewriting a photo —
+/// failed with "failed to fill whole buffer" and took the whole run with it.
+/// Every read here tolerates a short answer, and hashes what was actually
+/// there.
+fn partial_hash(path: &Path) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("opening {} for partial hash", path.display()))?;
+    let size = file
+        .metadata()
+        .with_context(|| format!("reading the length of {}", path.display()))?
+        .len();
 
     let mut hasher = blake3::Hasher::new();
+    let mut buf = Vec::new();
 
     // Read first chunk
-    let first_bytes = usize::try_from(std::cmp::min(PARTIAL_HASH_BYTES, size))
-        .context("partial-hash chunk size does not fit in usize on this platform")?;
-    let mut buf = vec![0u8; first_bytes];
-    file.read_exact(&mut buf)
+    read_up_to(&mut file, PARTIAL_HASH_BYTES, &mut buf)
         .with_context(|| format!("reading first bytes of {}", path.display()))?;
     hasher.update(&buf);
 
@@ -176,12 +230,21 @@ fn partial_hash(path: &Path, size: u64) -> Result<String> {
             .context("partial-hash chunk size does not fit in i64")?;
         file.seek(SeekFrom::End(-tail_offset))
             .with_context(|| format!("seeking in {}", path.display()))?;
-        file.read_exact(&mut buf)
+        read_up_to(&mut file, PARTIAL_HASH_BYTES, &mut buf)
             .with_context(|| format!("reading last bytes of {}", path.display()))?;
         hasher.update(&buf);
     }
 
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Read at most `limit` bytes into `buf`, replacing whatever it held.
+///
+/// Short reads are not an error: end-of-file is an answer, not a failure.
+fn read_up_to<R: Read>(reader: &mut R, limit: u64, buf: &mut Vec<u8>) -> io::Result<()> {
+    buf.clear();
+    reader.by_ref().take(limit).read_to_end(buf)?;
+    Ok(())
 }
 
 /// Stream everything `reader` yields through BLAKE3 and return the hex digest.
@@ -323,8 +386,7 @@ mod tests {
 
         let files = vec![make_scanned(f1, 5), make_scanned(f2, 24)];
 
-        let pb = ProgressBar::hidden();
-        let result = find_duplicates(&files, &pb).unwrap();
+        let result = find_duplicates(&files, &ProgressBar::hidden());
         assert_eq!(result.unique.len(), 2);
         assert!(result.duplicate_groups.is_empty());
     }
@@ -341,8 +403,7 @@ mod tests {
         let size = content.len() as u64;
         let files = vec![make_scanned(f1, size), make_scanned(f2, size)];
 
-        let pb = ProgressBar::hidden();
-        let result = find_duplicates(&files, &pb).unwrap();
+        let result = find_duplicates(&files, &ProgressBar::hidden());
         assert_eq!(result.duplicate_groups.len(), 1);
         assert_eq!(result.duplicate_groups[0].files.len(), 2);
     }
@@ -414,6 +475,159 @@ mod tests {
         assert_eq!(fs::read(&dst).unwrap(), b"PRE-EXISTING");
     }
 
+    /// A file that shrank after the scan recorded its size must still hash.
+    ///
+    /// The old `partial_hash` sized a `read_exact` from the scan-time figure
+    /// and failed with "failed to fill whole buffer", taking the whole dedup
+    /// pass down with it. A photo library being written to during a long run
+    /// is ordinary — a camera import, a sync client, the user themselves.
+    #[test]
+    fn test_partial_hash_survives_a_file_that_shrank_since_the_scan() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("shrinking.jpg");
+        fs::write(&path, multi_buffer_body()).unwrap();
+
+        // The scan saw 300 000 bytes; by the time we read it there are 4.
+        fs::write(&path, b"tiny").unwrap();
+
+        assert_eq!(
+            partial_hash(&path).unwrap(),
+            blake3::hash(b"tiny").to_hex().to_string(),
+            "the digest must describe the bytes that were actually there"
+        );
+    }
+
+    /// For a file large enough to have a distinct tail, the partial hash is
+    /// head-then-tail over the file's *current* length.
+    ///
+    /// Pins the digest against an independent one-shot computation so the
+    /// rewrite from `read_exact` to a tolerant read cannot have quietly
+    /// changed which bytes are hashed — that would repartition every existing
+    /// user's library on upgrade.
+    #[test]
+    fn test_partial_hash_is_head_then_tail_of_the_current_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("big.jpg");
+        let size = u32::try_from(PARTIAL_HASH_BYTES).unwrap() * 3;
+        let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let size = usize::try_from(size).unwrap();
+        fs::write(&path, &body).unwrap();
+
+        let head = usize::try_from(PARTIAL_HASH_BYTES).unwrap();
+        let mut expected = blake3::Hasher::new();
+        expected.update(&body[..head]);
+        expected.update(&body[size - head..]);
+
+        assert_eq!(
+            partial_hash(&path).unwrap(),
+            expected.finalize().to_hex().to_string()
+        );
+    }
+
+    /// A file the dedup pass cannot read is dropped from the analysis and
+    /// counted — it does not abort the run, and it does not silently vanish.
+    ///
+    /// The two fixtures share a size so the unreadable one actually reaches
+    /// the hashing phase; a file with a unique size never gets hashed at all.
+    ///
+    /// Skips itself with a printed reason where permission bits do not deny
+    /// reads (running as root, as some CI containers do).
+    #[cfg(unix)]
+    #[test]
+    fn test_an_unreadable_file_is_excluded_from_dedup_not_fatal() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let readable = tmp.path().join("readable.jpg");
+        let locked = tmp.path().join("locked.jpg");
+        fs::write(&readable, b"same-length-aaaa").unwrap();
+        fs::write(&locked, b"same-length-bbbb").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let denied = File::open(&locked).is_err();
+        let files = vec![
+            make_scanned(readable.clone(), 16),
+            make_scanned(locked.clone(), 16),
+        ];
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+
+        // Restore before asserting, or `TempDir` cannot clean up after a panic.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+
+        if !denied {
+            eprintln!(
+                "SKIPPED test_an_unreadable_file_is_excluded_from_dedup_not_fatal: a 0o000 \
+                 file was still readable, so this process ignores permission bits (running \
+                 as root?)"
+            );
+            return;
+        }
+
+        assert_eq!(result.skipped, 1, "the unreadable file must be counted");
+        assert_eq!(
+            result.unique.iter().map(|f| &f.path).collect::<Vec<_>>(),
+            vec![&readable],
+            "the readable file must survive, and the unreadable one must not be \
+             offered to the organiser as though its content were known"
+        );
+        assert!(result.duplicate_groups.is_empty());
+    }
+
+    /// The same property one phase later: `group_by_full_hash` skips rather
+    /// than aborting. Asserted directly because a file that fails to open in
+    /// phase 3 would already have failed in phase 2, so the cascade cannot
+    /// reach this branch on its own.
+    #[cfg(unix)]
+    #[test]
+    fn test_group_by_full_hash_skips_what_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let readable = tmp.path().join("readable.jpg");
+        let locked = tmp.path().join("locked.jpg");
+        fs::write(&readable, b"same-length-aaaa").unwrap();
+        fs::write(&locked, b"same-length-bbbb").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let denied = File::open(&locked).is_err();
+        let a = make_scanned(readable, 16);
+        let b = make_scanned(locked.clone(), 16);
+        let grouped = group_by_full_hash(&[&a, &b]);
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+
+        if !denied {
+            eprintln!(
+                "SKIPPED test_group_by_full_hash_skips_what_it_cannot_read: a 0o000 file was \
+                 still readable, so this process ignores permission bits (running as root?)"
+            );
+            return;
+        }
+
+        assert_eq!(grouped.skipped, 1);
+        assert_eq!(grouped.groups.len(), 1);
+        assert_eq!(grouped.groups.values().next().unwrap().len(), 1);
+    }
+
+    /// A clean run reports nothing skipped — the counter is a signal, so it
+    /// has to be silent when there is nothing to signal.
+    #[test]
+    fn test_nothing_is_skipped_when_everything_reads() {
+        let tmp = TempDir::new().unwrap();
+        let content = b"identical content for both files";
+        let f1 = tmp.path().join("a.jpg");
+        let f2 = tmp.path().join("b.jpg");
+        fs::write(&f1, content).unwrap();
+        fs::write(&f2, content).unwrap();
+
+        let size = content.len() as u64;
+        let files = vec![make_scanned(f1, size), make_scanned(f2, size)];
+
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.duplicate_groups.len(), 1);
+    }
+
     #[test]
     fn test_same_size_different_content() {
         let tmp = TempDir::new().unwrap();
@@ -425,8 +639,7 @@ mod tests {
 
         let files = vec![make_scanned(f1, 8), make_scanned(f2, 8)];
 
-        let pb = ProgressBar::hidden();
-        let result = find_duplicates(&files, &pb).unwrap();
+        let result = find_duplicates(&files, &ProgressBar::hidden());
         assert_eq!(result.unique.len(), 2);
         assert!(result.duplicate_groups.is_empty());
     }

@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
@@ -25,17 +24,42 @@ pub struct ScannedFile {
     pub is_video: bool,
 }
 
-/// Scan one or more directories recursively for media files
+/// What a scan found, and what it had to pass over.
 ///
-/// # Errors
+/// One unreadable directory used to abort the entire walk, so a single
+/// permission-denied folder could hide a whole photo library behind an error
+/// about that folder. The rest of the tree is worth returning.
 ///
-/// Returns an error if a directory cannot be walked, or if the filesystem
-/// metadata for a discovered file cannot be read.
-pub fn scan_directories(dirs: &[PathBuf]) -> Result<Vec<ScannedFile>> {
+/// `skipped` is not decoration. It is the difference between "there was
+/// nothing else there" and "we could not look", and those two must never
+/// arrive at the operator looking the same — [`crate::reporter::print_summary`]
+/// prints it for exactly that reason.
+#[derive(Debug, Default)]
+pub struct ScanResult {
+    /// Media files successfully discovered, in filesystem walk order.
+    pub files: Vec<ScannedFile>,
+    /// Entries inside the scanned trees that could not be read and were
+    /// passed over — a directory the walk could not descend into, or a file
+    /// whose metadata could not be read. Each one is logged at `warn`.
+    ///
+    /// A caller-supplied path that is not a directory is *not* counted here:
+    /// it is a distinct condition, loud in its own right, and mixing it into
+    /// this figure would make the number mean two things at once.
+    pub skipped: usize,
+}
+
+/// Scan one or more directories recursively for media files.
+///
+/// Infallible by construction. Every per-entry failure is a warning and a
+/// skip, never an abort, because the caller is about to organise whatever
+/// comes back and "the scan died two directories in" must not be
+/// indistinguishable from "that is all there was".
+pub fn scan_directories(dirs: &[PathBuf]) -> ScanResult {
     let image_ext: HashSet<&str> = IMAGE_EXTENSIONS.iter().copied().collect();
     let video_ext: HashSet<&str> = VIDEO_EXTENSIONS.iter().copied().collect();
 
     let mut files = Vec::new();
+    let mut skipped = 0;
 
     for dir in dirs {
         if !dir.is_dir() {
@@ -44,7 +68,18 @@ pub fn scan_directories(dirs: &[PathBuf]) -> Result<Vec<ScannedFile>> {
         }
 
         for entry in WalkDir::new(dir).follow_links(false) {
-            let entry = entry.with_context(|| format!("walking {}", dir.display()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    warn!(
+                        root = %dir.display(),
+                        error = %e,
+                        "skipping an entry the scan could not read"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
 
             if !entry.file_type().is_file() {
                 continue;
@@ -62,9 +97,18 @@ pub fn scan_directories(dirs: &[PathBuf]) -> Result<Vec<ScannedFile>> {
                 continue;
             }
 
-            let metadata = entry
-                .metadata()
-                .with_context(|| format!("reading metadata for {}", path.display()))?;
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping a media file whose metadata could not be read"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
 
             debug!(path = %path.display(), size = metadata.len(), "found media file");
 
@@ -77,7 +121,7 @@ pub fn scan_directories(dirs: &[PathBuf]) -> Result<Vec<ScannedFile>> {
         }
     }
 
-    Ok(files)
+    ScanResult { files, skipped }
 }
 
 fn normalised_extension(path: &Path) -> Option<String> {
@@ -103,10 +147,11 @@ mod tests {
         let jpg = tmp.path().join("photo.jpg");
         fs::write(&jpg, b"fake jpeg data").unwrap();
 
-        let files = scan_directories(&[tmp.path().to_path_buf()]).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].extension, "jpg");
-        assert!(!files[0].is_video);
+        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].extension, "jpg");
+        assert!(!scan.files[0].is_video);
+        assert_eq!(scan.skipped, 0);
     }
 
     #[test]
@@ -115,9 +160,9 @@ mod tests {
         let mov = tmp.path().join("clip.mov");
         fs::write(&mov, b"fake mov data").unwrap();
 
-        let files = scan_directories(&[tmp.path().to_path_buf()]).unwrap();
-        assert_eq!(files.len(), 1);
-        assert!(files[0].is_video);
+        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        assert_eq!(scan.files.len(), 1);
+        assert!(scan.files[0].is_video);
     }
 
     #[test]
@@ -126,8 +171,12 @@ mod tests {
         fs::write(tmp.path().join("readme.txt"), b"text").unwrap();
         fs::write(tmp.path().join("doc.pdf"), b"pdf").unwrap();
 
-        let files = scan_directories(&[tmp.path().to_path_buf()]).unwrap();
-        assert!(files.is_empty());
+        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        assert!(scan.files.is_empty());
+        assert_eq!(
+            scan.skipped, 0,
+            "a file the scanner is not interested in was not skipped, it was never a candidate"
+        );
     }
 
     #[test]
@@ -137,8 +186,8 @@ mod tests {
         fs::create_dir(&sub).unwrap();
         fs::write(sub.join("deep.png"), b"png data").unwrap();
 
-        let files = scan_directories(&[tmp.path().to_path_buf()]).unwrap();
-        assert_eq!(files.len(), 1);
+        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        assert_eq!(scan.files.len(), 1);
     }
 
     #[test]
@@ -148,9 +197,8 @@ mod tests {
         fs::write(tmp1.path().join("a.jpg"), b"data").unwrap();
         fs::write(tmp2.path().join("b.mp4"), b"data").unwrap();
 
-        let files =
-            scan_directories(&[tmp1.path().to_path_buf(), tmp2.path().to_path_buf()]).unwrap();
-        assert_eq!(files.len(), 2);
+        let scan = scan_directories(&[tmp1.path().to_path_buf(), tmp2.path().to_path_buf()]);
+        assert_eq!(scan.files.len(), 2);
     }
 
     #[test]
@@ -159,7 +207,56 @@ mod tests {
         fs::write(tmp.path().join("photo.JPG"), b"data").unwrap();
         fs::write(tmp.path().join("clip.MOV"), b"data").unwrap();
 
-        let files = scan_directories(&[tmp.path().to_path_buf()]).unwrap();
-        assert_eq!(files.len(), 2);
+        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        assert_eq!(scan.files.len(), 2);
+    }
+
+    /// One directory the walk cannot descend into must cost that directory
+    /// and nothing else.
+    ///
+    /// Before this, `WalkDir`'s error went out through `?` and the caller got
+    /// *no* files at all — the readable sibling below would have been invisible
+    /// behind "Permission denied" on a folder the user may not even care about.
+    ///
+    /// Skips itself with a printed reason where permission bits do not deny
+    /// reads (running as root, as some CI containers do).
+    #[cfg(unix)]
+    #[test]
+    fn test_an_unreadable_directory_costs_one_entry_not_the_whole_scan() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("readable.jpg"), b"visible").unwrap();
+        let locked = tmp.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("hidden.jpg"), b"invisible").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let readable = fs::read_dir(&locked).is_ok();
+        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+
+        // Restore before asserting, or `TempDir` cannot clean up after a panic.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if readable {
+            eprintln!(
+                "SKIPPED test_an_unreadable_directory_costs_one_entry_not_the_whole_scan: \
+                 a 0o000 directory was still readable, so this process ignores permission \
+                 bits (running as root?)"
+            );
+            return;
+        }
+
+        assert_eq!(
+            scan.files.len(),
+            1,
+            "the readable sibling must survive an unreadable directory; got {:?}",
+            scan.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(scan.files[0].path.ends_with("readable.jpg"));
+        assert_eq!(
+            scan.skipped, 1,
+            "the directory that could not be read must be counted, not silently dropped"
+        );
     }
 }

@@ -35,11 +35,13 @@ use std::path::Path;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+use common::deny_reads;
 use common::{file_contents_by_marker, naive, snapshot_tree, snapshot_tree_hashed, MediaTree};
 use mmm::geocoder::GeoLookup;
 use mmm::metadata::{DateSource, FileMetadata};
 use mmm::organiser::build_target_path;
-use mmm::reporter::{COMMIT_BANNER, DRY_RUN_BANNER};
+use mmm::reporter::{COMMIT_BANNER, DRY_RUN_BANNER, HASH_SKIPPED_LABEL, SCAN_SKIPPED_LABEL};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -529,4 +531,111 @@ fn a_directory_holding_only_non_media_is_treated_as_empty() {
         before,
         "a non-media-only input tree was modified"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Resilience: one unreadable entry must not cost the whole run
+// ---------------------------------------------------------------------------
+
+/// The figure printed against `label` in the closing summary block.
+///
+/// Returns `None` when the label is absent, which is itself an assertion the
+/// tests below make — the skip lines only appear when something was skipped.
+fn summary_figure(stdout: &str, label: &str) -> Option<usize> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(label))
+        .and_then(|line| line.rsplit(char::is_whitespace).next())
+        .and_then(|figure| figure.parse().ok())
+}
+
+/// A tree with one unreadable directory and one unreadable file must still
+/// organise everything else, and must say what it passed over.
+///
+/// Before this, either one aborted the run: the directory took `scan_directories`
+/// out through `?`, and the file took `find_duplicates` out the same way. The
+/// operator saw one "Permission denied" line and an untouched library, with no
+/// indication that the other several thousand photos were fine.
+///
+/// **The two fixtures named `twin-*` share a byte length deliberately.** The
+/// embedded marker is the declared path and the EXIF stamp is fixed-width, so
+/// equal-length names give equal-length files — which is what puts the
+/// unreadable one into the size-matched group that phase 2 actually hashes. A
+/// file with a unique size is never opened by the dedup pass at all, and the
+/// test would prove nothing.
+///
+/// Skips itself with a printed reason where permission bits do not deny reads
+/// (running as root, as some CI containers do).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_and_file_are_skipped_reported_and_left_alone() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("beach.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_with_exif("twin-a.jpg", naive(2024, 3, 4, 5, 6, 7), None)
+        .jpeg_with_exif("twin-b.jpg", naive(2024, 8, 9, 10, 11, 12), None)
+        .jpeg_with_exif("locked/hidden.jpg", naive(2024, 6, 7, 8, 9, 10), None);
+
+    let (_scratch, out_dir) = scratch_output();
+
+    let Some(locked_dir) = deny_reads(&tree.join("locked")) else {
+        eprintln!(
+            "SKIPPED an_unreadable_directory_and_file_are_skipped_reported_and_left_alone: \
+             a 0o000 directory was still readable, so this process ignores permission bits \
+             (running as root?)"
+        );
+        return;
+    };
+    let Some(_locked_file) = deny_reads(&tree.join("twin-b.jpg")) else {
+        eprintln!(
+            "SKIPPED an_unreadable_directory_and_file_are_skipped_reported_and_left_alone: \
+             a 0o000 file was still readable, so this process ignores permission bits \
+             (running as root?)"
+        );
+        return;
+    };
+
+    let out = run_commit(tree.path(), &out_dir);
+    assert_ok(&out, "commit run over a tree with unreadable entries");
+    let stdout = stdout_of(&out);
+
+    // What the run says it did.
+    assert_eq!(
+        summary_figure(&stdout, "Files scanned:"),
+        Some(3),
+        "the three reachable media files should have been found\n{stdout}"
+    );
+    assert_eq!(
+        summary_figure(&stdout, "Files organised:"),
+        Some(2),
+        "the two readable files should have been organised\n{stdout}"
+    );
+    assert_eq!(
+        summary_figure(&stdout, SCAN_SKIPPED_LABEL),
+        Some(1),
+        "the unreadable directory must be reported, not silently omitted\n{stdout}"
+    );
+    assert_eq!(
+        summary_figure(&stdout, HASH_SKIPPED_LABEL),
+        Some(1),
+        "the unhashable file must be reported, not silently omitted\n{stdout}"
+    );
+
+    // What the run actually did.
+    let landed = file_contents_by_marker(&out_dir);
+    assert_eq!(
+        landed.keys().cloned().collect::<Vec<_>>(),
+        vec!["beach.jpg".to_string(), "twin-a.jpg".to_string()],
+        "exactly the readable files should have reached the output tree"
+    );
+
+    // A file the run could not read is a file the run does not move. Both
+    // unreadable entries are still exactly where the user left them.
+    assert!(tree.join("twin-b.jpg").exists());
+
+    // The directory has to be readable again before that claim can be checked
+    // inside it — a 0o000 parent hides its contents from `exists()` just as
+    // thoroughly as it hid them from the scan.
+    drop(locked_dir);
+    assert!(tree.join("locked/hidden.jpg").exists());
 }

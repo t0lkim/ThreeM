@@ -115,7 +115,7 @@ fn scratch_output() -> (TempDir, PathBuf) {
 /// calls, over the same unmodified directory.
 fn scan_order(input: &Path) -> Vec<PathBuf> {
     mmm::scanner::scan_directories(&[input.to_path_buf()])
-        .expect("scanning the fixture tree")
+        .files
         .into_iter()
         .map(|f| f.path)
         .collect()
@@ -388,8 +388,7 @@ fn two_files_of_identical_size_but_different_content_are_not_grouped() {
         .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
         .jpeg_with_exif("b.jpg", naive(2024, 5, 6, 7, 8, 9), None);
 
-    let scanned =
-        mmm::scanner::scan_directories(&[tree.path().to_path_buf()]).expect("scanning fixtures");
+    let scanned = mmm::scanner::scan_directories(&[tree.path().to_path_buf()]).files;
     assert_eq!(scanned.len(), 2);
     assert_eq!(
         scanned[0].size, scanned[1].size,

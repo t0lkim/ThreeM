@@ -142,9 +142,11 @@ The `[EXIF]`, `[FS]`, and `[NO DATE]` tags tell you where the date came from.
 
 - **Safe by default.** Without `--commit`, not a single file is created, moved, or deleted — including the `duplicates/` directory, which is not created at all during a preview.
 - **Originals are never deleted during dedup.** The first file in each group is kept; only copies are moved to `duplicates/`.
-- **Atomic moves on the same volume.** Uses `rename()` which is an atomic filesystem operation.
-- **Cross-volume moves use copy-verify-delete.** The file is copied to a temp file on the target volume, the temp file's size is verified against the source, then it is atomically renamed to the final name. Only after verification succeeds is the source deleted.
+- **Same-volume moves never overwrite.** The move is a `link()` followed by an `unlink()`, and `link()` refuses any destination that is already occupied — including a dangling symlink, which an `exists()` check would report as free. A file already at the target name is never replaced.
+- **Cross-volume moves use copy-verify-delete.** The file is streamed to a temp file on the target volume and hashed on the way through; the file that landed is then hashed and the two BLAKE3 digests compared. Only once they match is the source deleted. A copy that is the right length and the wrong bytes is caught, and the original is kept.
 - **Filename collisions are resolved.** If the target filename already exists, a numeric suffix (`-1`, `-2`, etc.) is appended.
+- **One unreadable file costs one file.** A directory that cannot be read, or a photo that cannot be opened, is skipped with a warning — the rest of the library is still organised. Nothing is skipped silently: the closing summary reports `Unreadable (scan):` and `Unhashable (dedup):` counts, and each skipped path is named in a warning.
+- **A file that cannot be read is never moved.** If its contents could not be established, it stays exactly where you put it.
 - **You can stop at any chunk.** Between chunks, the tool asks whether to continue. Answering `n` stops immediately; files already moved stay moved, nothing else is touched.
 
 ---

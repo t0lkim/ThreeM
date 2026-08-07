@@ -38,8 +38,8 @@ The system uses a **two-pass architecture**:
 | Module | Responsibility |
 |---|---|
 | `config.rs` | CLI argument parsing via clap derive API |
-| `scanner.rs` | Recursive directory traversal, extension filtering |
-| `hasher.rs` | Three-phase dedup cascade, BLAKE3 hashing |
+| `scanner.rs` | Recursive directory traversal, extension filtering, skip-and-count on unreadable entries |
+| `hasher.rs` | Three-phase dedup cascade, BLAKE3 hashing, skip-and-count on unhashable files |
 | `metadata.rs` | EXIF extraction (images), container metadata (video), filesystem fallback |
 | `geocoder.rs` | Offline reverse geocoding via GeoNames k-d tree |
 | `organiser.rs` | Target path computation, atomic file moves, duplicate movement |
@@ -109,10 +109,42 @@ All files
 ### Implementation Details
 
 - Hash algorithm: **BLAKE3** (standard mode, unkeyed)
-- Partial hash read: first 64KB + last 64KB via `File::read_exact` and `File::seek(SeekFrom::End)`
+- Partial hash read: first 64KB + last 64KB via a bounded `Read::take` and `File::seek(SeekFrom::End)`. The length comes from the open file handle, not from the scan record — see [Resilience](#resilience-one-bad-file-costs-one-file) below
 - Full hash read: streaming 128KB buffer via `File::read` loop
 - Hash output: 256-bit hex string (64 characters)
 - Data structure: `HashMap<u64, Vec<ScannedFile>>` for size groups, `HashMap<String, Vec<&ScannedFile>>` for hash groups
+
+---
+
+## Resilience: one bad file costs one file
+
+A photo library is a live filesystem. Files are locked, deleted and rewritten underneath a run that may take hours — a camera import still writing, a sync client rewriting a photo, a directory the user has no permission to read. None of that is exceptional, so none of it aborts a run.
+
+`scan_directories` and `find_duplicates` are both **infallible by signature**. There is no `Result` to propagate, which is what makes "one unreadable file took the whole library down" a state the code cannot reach rather than a bug to be careful about.
+
+| Failure | Response |
+|---|---|
+| A directory the walk cannot descend into | Warn, skip that entry, continue the walk. Counted in `ScanResult::skipped`. |
+| A media file whose metadata cannot be read | Warn, skip that file, continue. Counted in `ScanResult::skipped`. |
+| A candidate that cannot be opened or read during partial or full hashing | Warn, exclude from duplicate detection, continue. Counted in `DedupResult::skipped`. |
+| A file that **shrank** between the scan and the hash | Hashed at its current length. The partial hash reads the length from the open handle and tolerates short reads, so a file that lost bytes mid-run produces a digest of what is actually there rather than an error. |
+
+**Excluded means excluded from everything.** A file the dedup pass could not read is absent from `DedupResult::unique` too, so nothing downstream moves a file whose content was never established. Its bytes are left exactly where the user put them.
+
+**Every skip is reported.** Both counts surface in the closing summary, on lines that appear only when the count is non-zero:
+
+```
+═══ Processing Complete ═══
+  Files scanned:      1284
+  Files organised:    1281
+  Duplicate groups:   4
+  Duplicate files:    9
+  Unreadable (scan):  1
+  Unhashable (dedup): 2
+═══════════════════════════
+```
+
+That is the point of the counters: a summary that silently omitted files would be indistinguishable from a clean run over a library that was only partly processed. Each skipped entry also logs a `warn!` naming the path and the underlying error, which is visible at the default log level.
 
 ---
 

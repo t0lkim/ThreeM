@@ -297,6 +297,85 @@ fn with_marker(bytes: &[u8], rel: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Permission helpers
+// ---------------------------------------------------------------------------
+
+/// Restores a path's permission bits when dropped.
+///
+/// A test that makes something unreadable has to put it back, or `TempDir`
+/// cannot clean up — and it has to do so even when the assertion in the middle
+/// panics, which is the normal outcome while a defect is unfixed.
+#[cfg(unix)]
+pub struct RestorePerms {
+    path: PathBuf,
+    mode: u32,
+}
+
+#[cfg(unix)]
+impl Drop for RestorePerms {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> RestorePerms {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let original = fs::metadata(path)
+        .unwrap_or_else(|e| panic!("reading permissions of {}: {e}", path.display()))
+        .permissions()
+        .mode();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|e| panic!("setting mode {mode:o} on {}: {e}", path.display()));
+    RestorePerms {
+        path: path.to_path_buf(),
+        mode: original,
+    }
+}
+
+/// Make `dir` read-only, returning a guard that restores it — or `None` when
+/// the mode does not actually deny writes.
+///
+/// Running as root (which some container-based CI images do) ignores the
+/// permission bits entirely, and a test that silently asserts nothing is worse
+/// than a test that says why it stood down. The probe is a measurement, not an
+/// assumption about the runner.
+#[cfg(unix)]
+pub fn deny_writes(dir: &Path) -> Option<RestorePerms> {
+    let guard = set_mode(dir, 0o555);
+
+    let probe = dir.join(".write-probe");
+    if fs::write(&probe, b"probe").is_ok() {
+        let _ = fs::remove_file(&probe);
+        return None;
+    }
+    Some(guard)
+}
+
+/// Make `path` — a file or a directory — unreadable, returning a guard that
+/// restores it, or `None` when the mode does not actually deny reads.
+///
+/// Same measured stand-down as [`deny_writes`], with the probe matched to what
+/// `path` is: opening a file, listing a directory.
+#[cfg(unix)]
+pub fn deny_reads(path: &Path) -> Option<RestorePerms> {
+    let is_dir = path.is_dir();
+    let guard = set_mode(path, 0o000);
+
+    let still_readable = if is_dir {
+        fs::read_dir(path).is_ok()
+    } else {
+        fs::File::open(path).is_ok()
+    };
+    if still_readable {
+        return None;
+    }
+    Some(guard)
+}
+
+// ---------------------------------------------------------------------------
 // JPEG synthesiser
 // ---------------------------------------------------------------------------
 

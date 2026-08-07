@@ -62,11 +62,16 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use mmm::metadata::DateSource;
 use mmm::organiser::{copy_verify_delete, execute_move, PlannedMove};
 use tempfile::TempDir;
+
+mod common;
+
+#[cfg(unix)]
+use common::deny_writes;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -106,51 +111,6 @@ fn files_by_name(root: &Path) -> BTreeMap<String, String> {
 /// The full anyhow chain as a single string, for asserting on context.
 fn chain(err: &anyhow::Error) -> String {
     format!("{err:#}")
-}
-
-/// Restores a directory's permissions when dropped.
-///
-/// The read-only test has to leave the directory writable again or `TempDir`
-/// cannot clean it up, and it has to do so even when the assertion in the
-/// middle panics — which is the normal outcome while the defect is unfixed.
-#[cfg(unix)]
-struct RestorePerms {
-    dir: PathBuf,
-    mode: u32,
-}
-
-#[cfg(unix)]
-impl Drop for RestorePerms {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(self.mode));
-    }
-}
-
-/// Make `dir` read-only, returning a guard that restores it — or `None` when
-/// the mode does not actually deny writes.
-///
-/// Running as root (which some container-based CI images do) ignores the
-/// permission bits entirely, and a test that silently asserts nothing is worse
-/// than a test that says why it stood down. The probe below is a measurement,
-/// not an assumption about the runner.
-#[cfg(unix)]
-fn deny_writes(dir: &Path) -> Option<RestorePerms> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let original = fs::metadata(dir).unwrap().permissions().mode();
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
-    let guard = RestorePerms {
-        dir: dir.to_path_buf(),
-        mode: original,
-    };
-
-    let probe = dir.join(".write-probe");
-    if fs::write(&probe, b"probe").is_ok() {
-        let _ = fs::remove_file(&probe);
-        return None;
-    }
-    Some(guard)
 }
 
 // ---------------------------------------------------------------------------
