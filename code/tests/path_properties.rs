@@ -9,7 +9,7 @@
 //! inputs that break them. Four of them, all of which the phase's earlier
 //! tasks assumed without ever asserting:
 //!
-//! 1. **A dated file lands in a `YYYY/MM/DD` directory**, and its filename
+//! 1. **A dated file lands in a `YYYY-MM-DD` directory**, and its filename
 //!    begins with the matching `YYYY-MM-DD-HHMMSS`. The whole tool is a promise
 //!    about where a photo will be afterwards; this is that promise written down.
 //! 2. **A derived filename is a single, safe path component** — no separators,
@@ -63,15 +63,19 @@ fn dated(date: Option<DateTime<Utc>>, gps: Option<(f64, f64)>) -> FileMetadata {
     }
 }
 
-/// `^\d{4}/\d{2}/\d{2}$`, spelled out rather than pulled in.
+/// `^\d{4}-\d{2}-\d{2}$`, spelled out rather than pulled in.
 ///
 /// A regex crate for one anchored shape would be a dependency carried by every
 /// build of a tool that moves photographs; this is the same assertion and it
 /// says out loud that "four digits" means four *ASCII* digits — `٢٠٢٤` is four
 /// characters that `char::is_numeric` calls digits and that no `YYYY` was ever
 /// meant to admit.
+///
+/// Splitting on `-` also means a negative year cannot pass by accident: `-44`
+/// would split into an empty first part and fail the width check, rather than
+/// arriving as one component the way it would under a `/` split.
 fn is_yyyy_mm_dd(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('/').collect();
+    let parts: Vec<&str> = s.split('-').collect();
     parts.len() == 3
         && [4, 2, 2]
             .iter()
@@ -163,7 +167,7 @@ fn gps() -> impl Strategy<Value = Option<(f64, f64)>> {
 }
 
 // ---------------------------------------------------------------------------
-// 1. A dated file lands in YYYY/MM/DD, named for the same instant
+// 1. A dated file lands in YYYY-MM-DD, named for the same instant
 // ---------------------------------------------------------------------------
 
 proptest! {
@@ -182,7 +186,7 @@ proptest! {
 
         prop_assert!(
             is_yyyy_mm_dd(&dir),
-            "the directory for {dt:?} must be YYYY/MM/DD; got {dir:?}"
+            "the directory for {dt:?} must be YYYY-MM-DD; got {dir:?}"
         );
 
         let stamp = format!(

@@ -9,7 +9,7 @@
 
 use std::ops::RangeInclusive;
 
-/// The years `YYYY/MM/DD` can spell.
+/// The years `YYYY-MM-DD` can spell.
 ///
 /// Not a plausibility judgement — that would be inventing policy, and a
 /// scanned negative from 1890 is as real a photograph as one from last week.
@@ -18,7 +18,7 @@ use std::ops::RangeInclusive;
 ///
 /// Year 0 is inside it: `{:04}` renders it `0000`, and `0000:01:01 00:00:00` is
 /// what a camera with a dead clock writes into EXIF. Filing those under
-/// `0000/01/01` keeps the original date visible and the file findable, which is
+/// `0000-01-01` keeps the original date visible and the file findable, which is
 /// more use to whoever goes looking than the alternative below.
 pub const REPRESENTABLE_YEARS: RangeInclusive<i32> = 0..=9999;
 

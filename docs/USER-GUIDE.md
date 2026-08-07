@@ -76,7 +76,7 @@ mmm [OPTIONS] <DIRECTORIES>...
 2. **Scans** all input directories recursively for media files.
 3. **Deduplicates** using a three-phase hash cascade (see Technical Documentation).
 4. **Extracts metadata** — creation date and GPS coordinates from EXIF (images) or container atoms (video). Falls back to filesystem creation date when metadata is absent.
-5. **Plans renames** — each unique file is assigned a target path: `<output>/YYYY/MM/DD/YYYY-MM-DD-HHMMSS[-location].ext`.
+5. **Plans renames** — each unique file is assigned a target path: `<output>/YYYY-MM-DD/YYYY-MM-DD-HHMMSS[-location].ext`.
 6. **Reports** — without `--commit`, prints the full plan and duplicate list, then exits. Nothing is created, moved or deleted.
 7. **Moves duplicates** — with `--commit`, duplicate files are moved to `<output>/duplicates/000/`, `001/`, etc. Each group directory includes a `manifest.txt` recording the BLAKE3 hash and original file path.
 8. **Organises** — with `--commit`, unique files are renamed and moved into the date-based hierarchy, pausing every `--chunk-size` files for confirmation.

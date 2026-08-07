@@ -16,7 +16,7 @@
 //!
 //! ## Proving *which* file landed where
 //!
-//! Asserting that `2024/01/15/2024-01-15-143000.jpg` exists is weaker than it
+//! Asserting that `2024-01-15/2024-01-15-143000.jpg` exists is weaker than it
 //! looks: any file of that name satisfies it. Every fixture therefore carries
 //! an embedded `MMMTEST:<declared path>;` marker, and the assertions below go
 //! through [`file_contents_by_marker`] so they pin the specific source file to
@@ -118,20 +118,21 @@ fn scratch_output() -> (TempDir, std::path::PathBuf) {
     (dir, out)
 }
 
-/// True if `rel` looks like `YYYY/MM/DD/<file>` — the date-tree shape.
+/// True if `rel` looks like `YYYY-MM-DD/<file>` — the date-directory shape.
 ///
 /// Used where the exact date is not knowable in advance (filesystem-timestamp
 /// fallback resolves to "now"), so asserting a literal path would be flaky
 /// around a UTC midnight rollover.
 fn is_date_tree_path(rel: &str) -> bool {
-    let parts: Vec<&str> = rel.split('/').collect();
-    parts.len() == 4
-        && parts[0].len() == 4
-        && parts[1].len() == 2
-        && parts[2].len() == 2
-        && parts[..3]
+    let Some((dir, _file)) = rel.split_once('/') else {
+        return false;
+    };
+    let parts: Vec<&str> = dir.split('-').collect();
+    parts.len() == 3
+        && [4, 2, 2]
             .iter()
-            .all(|p| p.bytes().all(|b| b.is_ascii_digit()))
+            .zip(&parts)
+            .all(|(&width, part)| part.len() == width && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +164,7 @@ fn a_default_run_leaves_the_input_tree_byte_identical() {
 
     // Hashed snapshots cover file content and layout, but not directories that
     // were created and left empty. A dry run must not create those either.
-    for created in ["2024", "unsorted", "duplicates"] {
+    for created in ["2024-01-15", "unsorted", "duplicates"] {
         assert!(
             !tree.join(created).exists(),
             "preview created {created}/ in the input tree"
@@ -222,14 +223,14 @@ fn commit_moves_an_exif_dated_jpeg_into_its_date_path() {
     // fixture's EXIF, so this pins the whole EXIF -> path pipeline.
     assert_eq!(
         snapshot_tree(&out_dir),
-        vec!["2024/01/15/2024-01-15-143000.jpg".to_string()]
+        vec!["2024-01-15/2024-01-15-143000.jpg".to_string()]
     );
 
     // ...and it is *that* file, not merely a file of that name.
     let landed = file_contents_by_marker(&out_dir);
     assert_eq!(
         landed.get("beach.jpg").map(Vec::as_slice),
-        Some(["2024/01/15/2024-01-15-143000.jpg".to_string()].as_slice()),
+        Some(["2024-01-15/2024-01-15-143000.jpg".to_string()].as_slice()),
         "the file that landed did not come from the declared source"
     );
 
@@ -254,22 +255,22 @@ fn commit_derives_the_path_from_each_file_s_own_datetime() {
         (
             "a.jpg",
             naive(2024, 1, 15, 14, 30, 0),
-            "2024/01/15/2024-01-15-143000.jpg",
+            "2024-01-15/2024-01-15-143000.jpg",
         ),
         (
             "b.jpg",
             naive(2019, 3, 4, 0, 0, 0),
-            "2019/03/04/2019-03-04-000000.jpg",
+            "2019-03-04/2019-03-04-000000.jpg",
         ),
         (
             "c.jpg",
             naive(2021, 12, 31, 23, 59, 59),
-            "2021/12/31/2021-12-31-235959.jpg",
+            "2021-12-31/2021-12-31-235959.jpg",
         ),
         (
             "d.jpg",
             naive(2020, 2, 29, 12, 0, 1),
-            "2020/02/29/2020-02-29-120001.jpg",
+            "2020-02-29/2020-02-29-120001.jpg",
         ),
     ];
 
@@ -320,7 +321,7 @@ fn a_gps_tagged_jpeg_gains_a_location_suffix() {
         .expect("non-GPS file did not land")[0];
 
     assert_eq!(
-        without, "2024/03/20/2024-03-20-090506.jpg",
+        without, "2024-03-20/2024-03-20-090506.jpg",
         "a file without coordinates must get a bare date filename"
     );
 
@@ -335,7 +336,7 @@ fn a_gps_tagged_jpeg_gains_a_location_suffix() {
         .filename_part;
     assert_eq!(
         with,
-        &format!("2024/02/20/2024-02-20-090506-{expected_part}.jpg")
+        &format!("2024-02-20/2024-02-20-090506-{expected_part}.jpg")
     );
 
     // Independently of the dataset, the suffix must be non-empty and must
@@ -398,7 +399,7 @@ fn a_file_with_unparseable_exif_is_dated_from_the_filesystem_not_sent_to_unsorte
     );
     assert!(
         is_date_tree_path(dest),
-        "expected a YYYY/MM/DD/ destination from the filesystem fallback, got {dest}"
+        "expected a YYYY-MM-DD/ destination from the filesystem fallback, got {dest}"
     );
     // The scanner lower-cases every extension it records, so the destination
     // extension is exactly "jpg" — asserting the precise value rather than a
@@ -453,7 +454,7 @@ fn non_media_files_are_never_touched_in_either_mode() {
     );
     assert_eq!(
         snapshot_tree(&out_dir_b),
-        vec!["2024/01/15/2024-01-15-143000.jpg".to_string()],
+        vec!["2024-01-15/2024-01-15-143000.jpg".to_string()],
         "a non-media file was copied into the output tree"
     );
 }
@@ -480,10 +481,10 @@ fn nested_subdirectories_are_traversed_and_their_files_organised() {
 
     let landed = file_contents_by_marker(&out_dir);
     for (declared, expected) in [
-        ("top.jpg", "2024/01/01/2024-01-01-010101.jpg"),
-        ("a/photo.jpg", "2024/02/02/2024-02-02-020202.jpg"),
-        ("a/b/photo.jpg", "2024/03/03/2024-03-03-030303.jpg"),
-        ("a/b/c/deep.jpg", "2024/04/04/2024-04-04-040404.jpg"),
+        ("top.jpg", "2024-01-01/2024-01-01-010101.jpg"),
+        ("a/photo.jpg", "2024-02-02/2024-02-02-020202.jpg"),
+        ("a/b/photo.jpg", "2024-03-03/2024-03-03-030303.jpg"),
+        ("a/b/c/deep.jpg", "2024-04-04/2024-04-04-040404.jpg"),
     ] {
         assert_eq!(
             landed.get(declared).map(Vec::as_slice),

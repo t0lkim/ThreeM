@@ -323,7 +323,7 @@ mod tests {
     }
 
     /// The other side of that line — the ones it must keep. Year 0 and year 44
-    /// are a flat camera battery, not a missing date, and `0000/01/01` says so
+    /// are a flat camera battery, not a missing date, and `0000-01-01` says so
     /// where `unsorted/unknown.jpg` would not.
     #[test]
     fn test_a_low_but_spellable_year_is_kept() {

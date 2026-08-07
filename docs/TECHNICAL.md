@@ -289,7 +289,7 @@ The metadata module handles multiple date formats:
 
 ## Path Derivation
 
-The target path is `<output>/YYYY/MM/DD/YYYY-MM-DD-HHMMSS[-location].ext`, and three invariants hold over it for *any* input, not merely for the inputs the CLI happens to produce:
+The target path is `<output>/YYYY-MM-DD/YYYY-MM-DD-HHMMSS[-location].ext`, and three invariants hold over it for *any* input, not merely for the inputs the CLI happens to produce:
 
 | Invariant | Why it is not obvious |
 |---|---|

@@ -18,7 +18,7 @@ related:
 
 ## Problem
 
-`mmm` moves files. It walks one or more directories, renames every media file it finds into a `YYYY/MM/DD/` hierarchy, and relocates every file it judges to be a duplicate into a `duplicates/` tree. When no `--output` is given, the output directory defaults to the *first input directory* — so the most natural invocation a person will type, `mmm ~/Photos`, rewrites the layout of `~/Photos` in place.
+`mmm` moves files. It walks one or more directories, renames every media file it finds into a `YYYY-MM-DD/` hierarchy, and relocates every file it judges to be a duplicate into a `duplicates/` tree. When no `--output` is given, the output directory defaults to the *first input directory* — so the most natural invocation a person will type, `mmm ~/Photos`, rewrites the layout of `~/Photos` in place.
 
 Until this change that invocation was destructive by default. Previewing required remembering to add `--dry-run`. The failure mode is therefore:
 

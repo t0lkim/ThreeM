@@ -43,7 +43,7 @@ Review a plain run first, then re-run the same command with `--commit` to apply 
 - Three-phase BLAKE3 deduplication (size → partial hash → full hash)
 - EXIF and video metadata extraction for original capture date
 - Offline reverse geocoding via bundled GeoNames dataset
-- Date-based directory structure (`YYYY/MM/DD/`)
+- Date-based directory structure (`YYYY-MM-DD/`)
 - Chunked processing with confirmation between batches
 - Safe by default — every run is a preview until you pass `--commit`
 - Independent `mmm-dedup-verifier` binary using keyed BLAKE3 for safety

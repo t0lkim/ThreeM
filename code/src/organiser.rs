@@ -41,9 +41,9 @@ pub fn plan_move(file: &ScannedFile, output_dir: &Path, geo: &GeoLookup) -> Resu
     })
 }
 
-/// Build the directory path (YYYY/MM/DD) and filename (YYYY-MM-DD-HHMMSS[-location].ext)
+/// Build the directory path (YYYY-MM-DD) and filename (YYYY-MM-DD-HHMMSS[-location].ext)
 ///
-/// Total by construction: the directory it returns is either `YYYY/MM/DD` in
+/// Total by construction: the directory it returns is either `YYYY-MM-DD` in
 /// four-two-two ASCII digits or exactly `unsorted`, and the filename is always
 /// a single ordinary path component. `tests/path_properties.rs` asserts both
 /// over generated input, which is what closed the three holes described below.
@@ -58,8 +58,8 @@ pub fn plan_move(file: &ScannedFile, output_dir: &Path, geo: &GeoLookup) -> Resu
 ///
 /// **A year outside four digits goes to `unsorted`.** See
 /// [`crate::naming::year_is_representable`] — printing it produced directories
-/// like `44/03/15` and, for the negative years `chrono` will parse out of an
-/// EXIF string, `-44/03/15` plus a filename beginning with `-`.
+/// like `44-03-15` and, for the negative years `chrono` will parse out of an
+/// EXIF string, `-44-03-15` plus a filename beginning with `-`.
 // exposed for integration tests
 pub fn build_target_path(
     meta: &FileMetadata,
@@ -82,17 +82,17 @@ pub fn build_target_path(
     }
 }
 
-/// `YYYY/MM/DD`, zero-padded.
+/// `YYYY-MM-DD`, zero-padded — one directory per day, not a nested tree.
 ///
 /// The year is `{:04}` and not `{}` because a photograph dated 44 AD — which is
 /// what a camera with a flat battery writes, and what `chrono` parses without
 /// complaint out of `0044:03:15 10:00:00` — was filed under a directory called
-/// `44`, sitting at the top of the output tree beside `2024` and matching none
-/// of the conventions the tool promises. Callers guarantee the year is
-/// representable; [`build_target_path`] is the only one, and it checks.
+/// `44-03-15`, sorting above every four-digit year in the output tree and
+/// matching none of the conventions the tool promises. Callers guarantee the
+/// year is representable; [`build_target_path`] is the only one, and it checks.
 fn date_directory(dt: &DateTime<Utc>) -> PathBuf {
     PathBuf::from(format!(
-        "{:04}/{:02}/{:02}",
+        "{:04}-{:02}-{:02}",
         dt.year(),
         dt.month(),
         dt.day()
@@ -984,7 +984,7 @@ mod tests {
             .and_hms_opt(10, 30, 0)
             .unwrap()
             .and_utc();
-        assert_eq!(date_directory(&dt), PathBuf::from("2024/03/15"));
+        assert_eq!(date_directory(&dt), PathBuf::from("2024-03-15"));
     }
 
     fn at(year: i32, month: u32, day: u32) -> FileMetadata {
@@ -1003,12 +1003,12 @@ mod tests {
     }
 
     /// A year under 1000 is still four digits wide. Without the padding it was
-    /// filed under `44/`, which sorts, reads and globs as nothing the tool
+    /// filed under `44-03-15`, which sorts, reads and globs as nothing the tool
     /// documents.
     #[test]
     fn test_a_low_year_is_padded_to_four_digits() {
         let (dir, filename) = build_target_path(&at(44, 3, 15), "jpg", &GeoLookup::new());
-        assert_eq!(dir, PathBuf::from("0044/03/15"));
+        assert_eq!(dir, PathBuf::from("0044-03-15"));
         assert_eq!(filename, "0044-03-15-103000.jpg");
     }
 
@@ -1030,7 +1030,7 @@ mod tests {
     fn test_a_hostile_extension_cannot_add_path_separators() {
         let (dir, filename) =
             build_target_path(&at(2024, 3, 15), "../../etc/passwd", &GeoLookup::new());
-        assert_eq!(dir, PathBuf::from("2024/03/15"));
+        assert_eq!(dir, PathBuf::from("2024-03-15"));
         assert_eq!(filename, "2024-03-15-103000.______etc_passwd");
         assert!(!filename.contains('/'));
     }
@@ -1089,7 +1089,7 @@ mod tests {
     fn test_execute_move_same_volume() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("source.jpg");
-        let dst_dir = tmp.path().join("2024/01/15");
+        let dst_dir = tmp.path().join("2024-01-15");
         let dst = dst_dir.join("2024-01-15-103000.jpg");
         fs::write(&src, b"image data").unwrap();
 

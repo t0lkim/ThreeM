@@ -265,7 +265,7 @@ fn two_identical_jpegs_make_one_group_keeping_the_first_and_setting_the_second_a
     assert_eq!(
         snapshot_tree(&out_dir),
         vec![
-            "2024/01/15/2024-01-15-143000.jpg".to_string(),
+            "2024-01-15/2024-01-15-143000.jpg".to_string(),
             format!("duplicates/000/{}", leaf(&expected_moved)),
             "duplicates/000/manifest.txt".to_string(),
         ]
@@ -407,8 +407,8 @@ fn two_files_of_identical_size_but_different_content_are_not_grouped() {
     assert_eq!(
         snapshot_tree(&out_dir),
         vec![
-            "2024/01/15/2024-01-15-143000.jpg".to_string(),
-            "2024/05/06/2024-05-06-070809.jpg".to_string(),
+            "2024-01-15/2024-01-15-143000.jpg".to_string(),
+            "2024-05-06/2024-05-06-070809.jpg".to_string(),
         ]
     );
     assert!(
@@ -459,7 +459,7 @@ fn three_identical_files_make_one_group_with_two_files_moved_into_it() {
         .collect();
     assert_eq!(
         in_date_tree,
-        vec![&"2024/01/15/2024-01-15-143000.jpg".to_string()],
+        vec![&"2024-01-15/2024-01-15-143000.jpg".to_string()],
         "exactly one copy belongs in the date tree; whole tree was {:?}",
         snapshot_tree(&out_dir)
     );
