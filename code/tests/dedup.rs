@@ -1,0 +1,679 @@
+//! Integration suite for deduplication, driven through the real `mmm` binary.
+//!
+//! Dedup is the most destructive thing `ThreeM` does: it decides that two of
+//! someone's files are the same file, keeps one, and moves the other somewhere
+//! else. A false positive here silently buries a photo that was never a
+//! duplicate. So these tests exercise the whole cascade end to end — scan,
+//! three-phase hash, `duplicates/NNN/` move, manifest — against synthetic
+//! trees built by the fixture harness.
+//!
+//! ## Three things measured, not assumed
+//!
+//! Each of these was established with a throwaway probe before anything was
+//! asserted, and each one would have produced a plausible-looking but wrong
+//! test if it had been guessed instead:
+//!
+//! 1. **Scan order is not declaration order and not alphabetical.** `WalkDir`
+//!    returns whatever the filesystem hands it — on APFS a tree declared
+//!    `a.jpg` then `b.jpg` scanned back as `b.jpg`, `a.jpg`. "The first file
+//!    is kept" therefore means *first in scan order*, so every test derives
+//!    that expectation from [`mmm::scanner::scan_directories`] rather than
+//!    hard-coding a name.
+//! 2. **`duplicates/NNN` numbering is not stable across runs.** The groups are
+//!    accumulated by iterating a `HashMap`, whose order is randomly seeded per
+//!    process. Two groups in one tree came back as `000`/`001` in one run and
+//!    swapped in the next, over six consecutive runs. `000` is only reliable
+//!    when the tree contains exactly one group; the multi-group test is
+//!    written order-agnostically for that reason.
+//! 3. **The manifest records *input* paths, so it goes stale the moment the
+//!    run finishes.** See
+//!    [`the_manifest_records_input_paths_which_go_stale_when_the_run_moves_them`].
+//!
+//! ## Proving *which* file landed where
+//!
+//! Byte-identical fixtures necessarily carry the same embedded marker, so
+//! [`file_contents_by_marker`] maps one marker to several paths here. Where a
+//! test needs to tell two duplicates apart it uses their filenames, which the
+//! organiser preserves when it moves a duplicate aside.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a panicking assertion in a test is a failing test, which is the desired signal"
+)]
+
+mod common;
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use assert_cmd::Command;
+use tempfile::TempDir;
+
+use common::{file_contents_by_marker, naive, snapshot_tree, snapshot_tree_hashed, MediaTree};
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+/// Run `mmm` against `input`, previewing only — no `--commit`.
+///
+/// Passes no `-o`, so the output directory defaults to the input directory.
+/// That is the shape in which a stray `duplicates/` would appear inside the
+/// user's own library, which is what the preview test is looking for.
+fn run_preview(input: &Path) -> std::process::Output {
+    Command::cargo_bin("mmm")
+        .unwrap()
+        .arg(input)
+        .output()
+        .expect("running mmm in preview mode")
+}
+
+/// Run `mmm --commit` against `input`, organising into `output`.
+fn run_commit(input: &Path, output: &Path) -> std::process::Output {
+    Command::cargo_bin("mmm")
+        .unwrap()
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .arg("--commit")
+        .arg("--no-prompt")
+        .output()
+        .expect("running mmm in commit mode")
+}
+
+/// Assert the process exited 0, printing both streams if it did not.
+fn assert_ok(out: &std::process::Output, what: &str) {
+    assert!(
+        out.status.success(),
+        "{what} exited with {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+fn stdout_of(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A scratch directory whose `out` child does not yet exist, so a test can
+/// assert that the binary did not create it.
+fn scratch_output() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().expect("creating output TempDir");
+    let out = dir.path().join("out");
+    assert!(!out.exists(), "the scratch output path must start absent");
+    (dir, out)
+}
+
+/// The order in which the binary will encounter the media files in `input`.
+///
+/// Filesystem walk order is neither declaration order nor alphabetical, and
+/// "the first file in the group is kept" is defined against it — so tests ask
+/// the scanner rather than assuming. This calls the same function the binary
+/// calls, over the same unmodified directory.
+fn scan_order(input: &Path) -> Vec<PathBuf> {
+    mmm::scanner::scan_directories(&[input.to_path_buf()])
+        .expect("scanning the fixture tree")
+        .into_iter()
+        .map(|f| f.path)
+        .collect()
+}
+
+/// The parsed contents of a `duplicates/NNN/manifest.txt`.
+struct Manifest {
+    hash: String,
+    size: u64,
+    /// Path recorded for the file that was *not* moved aside.
+    original: String,
+    /// Paths recorded for the files that were moved into this group.
+    duplicates: Vec<String>,
+}
+
+/// Parse a group manifest the same way `mmm-dedup-verifier` does.
+///
+/// Re-implemented here rather than reused, so that a change to the manifest
+/// format has to be made deliberately in two places instead of silently
+/// agreeing with itself.
+fn read_manifest(path: &Path) -> Manifest {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("reading manifest {}: {e}", path.display()));
+
+    let mut hash = None;
+    let mut size = None;
+    let mut original = None;
+    let mut duplicates = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("# BLAKE3 hash: ") {
+            hash = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("# File size: ") {
+            size = v.strip_suffix(" bytes").and_then(|n| n.parse::<u64>().ok());
+        } else if let Some(v) = line.strip_prefix("# Original kept at: ") {
+            original = Some(v.to_string());
+        } else if !line.starts_with('#') {
+            duplicates.push(line.to_string());
+        }
+    }
+
+    Manifest {
+        hash: hash.unwrap_or_else(|| panic!("no hash line in {}", path.display())),
+        size: size.unwrap_or_else(|| panic!("no size line in {}", path.display())),
+        original: original.unwrap_or_else(|| panic!("no original line in {}", path.display())),
+        duplicates,
+    }
+}
+
+/// Every `duplicates/NNN/` directory under `output`, sorted by name.
+///
+/// Empty (rather than panicking) when no `duplicates/` directory exists, so a
+/// test can assert its absence.
+fn duplicate_group_dirs(output: &Path) -> Vec<PathBuf> {
+    let base = output.join("duplicates");
+    if !base.is_dir() {
+        return Vec::new();
+    }
+    let mut dirs: Vec<PathBuf> = fs::read_dir(&base)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", base.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Sorted filenames of the duplicates set aside in a group directory, with the
+/// bookkeeping `manifest.txt` excluded.
+fn files_in_group(group_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(group_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", group_dir.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "manifest.txt")
+        .collect();
+    names.sort();
+    names
+}
+
+/// The multiset of content hashes under `root`, keyed by hash, excluding the
+/// manifests the organiser writes.
+///
+/// Counting paths proves nothing was *dropped*; counting content hashes also
+/// proves nothing was corrupted or quietly substituted along the way.
+fn content_hash_counts(root: &Path) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for line in snapshot_tree_hashed(root) {
+        let (path, hash) = line
+            .rsplit_once("  ")
+            .unwrap_or_else(|| panic!("malformed snapshot line: {line}"));
+        if path.ends_with("manifest.txt") {
+            continue;
+        }
+        *counts.entry(hash.to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn leaf(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Two identical files
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_identical_jpegs_make_one_group_keeping_the_first_and_setting_the_second_aside() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("b.jpg", "a.jpg");
+
+    // Which file is "first" is a property of the walk, not of the declaration
+    // order above — see the module note.
+    let order = scan_order(tree.path());
+    assert_eq!(order.len(), 2, "fixture setup: {order:?}");
+    let (expected_kept, expected_moved) = (order[0].clone(), order[1].clone());
+
+    let (_scratch, out_dir) = scratch_output();
+    let out = run_commit(tree.path(), &out_dir);
+    assert_ok(&out, "commit run");
+
+    // Exactly one group, and it is 000 — reliable here only because there is
+    // precisely one of them.
+    let groups = duplicate_group_dirs(&out_dir);
+    assert_eq!(
+        groups.len(),
+        1,
+        "expected exactly one duplicate group, got {groups:?}"
+    );
+    assert_eq!(leaf(&groups[0]), "000");
+
+    // The second file was set aside under its own name...
+    assert_eq!(files_in_group(&groups[0]), vec![leaf(&expected_moved)]);
+
+    // ...and the first was organised into the date tree instead, at the path
+    // its EXIF datetime dictates.
+    assert_eq!(
+        snapshot_tree(&out_dir),
+        vec![
+            "2024/01/15/2024-01-15-143000.jpg".to_string(),
+            format!("duplicates/000/{}", leaf(&expected_moved)),
+            "duplicates/000/manifest.txt".to_string(),
+        ]
+    );
+
+    // The manifest agrees about which file was kept. Asserting this against
+    // the *scan* order is what pins "the first is kept"; without it, a change
+    // that retained the last file would still satisfy everything above.
+    let manifest = read_manifest(&groups[0].join("manifest.txt"));
+    assert_eq!(
+        manifest.original,
+        expected_kept.display().to_string(),
+        "the retained original was not the first file in scan order"
+    );
+
+    // Both files left the input tree; neither was copied, both were moved.
+    assert!(snapshot_tree(tree.path()).is_empty());
+}
+
+#[test]
+fn the_manifest_names_both_the_retained_original_and_the_moved_duplicate() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("b.jpg", "a.jpg");
+
+    let order = scan_order(tree.path());
+    let (kept, moved) = (order[0].clone(), order[1].clone());
+
+    let (_scratch, out_dir) = scratch_output();
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    let manifest_path = out_dir.join("duplicates/000/manifest.txt");
+    assert!(
+        manifest_path.is_file(),
+        "no manifest at {}",
+        manifest_path.display()
+    );
+
+    let manifest = read_manifest(&manifest_path);
+    assert_eq!(manifest.original, kept.display().to_string());
+    assert_eq!(manifest.duplicates, vec![moved.display().to_string()]);
+
+    // The manifest is the audit trail a user consults before deleting
+    // anything, so its hash and size have to describe the actual bytes rather
+    // than being decorative.
+    let bytes = fs::read(out_dir.join("duplicates/000").join(leaf(&moved))).unwrap();
+    assert_eq!(manifest.size, bytes.len() as u64);
+    assert_eq!(manifest.hash, blake3::hash(&bytes).to_hex().to_string());
+}
+
+#[test]
+fn the_manifest_records_input_paths_which_go_stale_when_the_run_moves_them() {
+    // NOTE — this pins real behaviour that is arguably wrong, in the same
+    // spirit as the `unsorted/` test in `organise.rs`.
+    //
+    // `move_duplicates` runs *before* the organise pass, and writes the paths
+    // it sees at that moment: the original's location in the input tree, and
+    // the duplicates' locations in the input tree. The organise pass then
+    // moves the original into the date tree, and the duplicates are already
+    // gone. So every path in a finished manifest points at a file that no
+    // longer exists.
+    //
+    // The consequence is not cosmetic. `mmm-dedup-verifier` resolves
+    // `# Original kept at:` to hash the original and compare it against the
+    // set-aside copies. Given a tree `mmm` itself just produced, it finds
+    // nothing there, records `OriginalMissing`, confirms zero groups — and
+    // still exits 0 while printing "All verified groups are confirmed
+    // duplicates". The independent second opinion in this safety net is
+    // therefore vacuous by default; only `--check-originals` turns it into a
+    // failure. Fixing that means rewriting the manifest with final
+    // destinations after the organise pass, which is a product change beyond
+    // this suite's remit.
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("b.jpg", "a.jpg");
+
+    let (_scratch, out_dir) = scratch_output();
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    let manifest = read_manifest(&out_dir.join("duplicates/000/manifest.txt"));
+
+    assert!(
+        !Path::new(&manifest.original).exists(),
+        "the recorded original path now resolves — the manifest may have been \
+         fixed to record final destinations, which is a real improvement but \
+         needs this test and the verifier's expectations updated with it"
+    );
+    for dup in &manifest.duplicates {
+        assert!(
+            !Path::new(dup).exists(),
+            "recorded duplicate path {dup} still resolves"
+        );
+    }
+
+    // The bytes themselves are safe and accounted for; it is only the
+    // bookkeeping that dangles.
+    assert_eq!(
+        content_hash_counts(&out_dir).values().sum::<usize>(),
+        2,
+        "both copies must still exist somewhere in the output tree"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The cascade must not produce false positives
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_files_of_identical_size_but_different_content_are_not_grouped() {
+    // Phase 1 groups by size alone, so these two collide there and only the
+    // partial/full hash phases can separate them. If the cascade ever short
+    // circuits after phase 1, this is the test that catches it — and the cost
+    // of that bug is a user's photo buried in `duplicates/` for no reason.
+    //
+    // Equal size is arranged by giving both fixtures same-length declared
+    // paths (the embedded marker carries that path) and an EXIF timestamp,
+    // which is a fixed-width field. Different dates keep their destinations
+    // apart so a filename collision does not muddy the result.
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_with_exif("b.jpg", naive(2024, 5, 6, 7, 8, 9), None);
+
+    let scanned =
+        mmm::scanner::scan_directories(&[tree.path().to_path_buf()]).expect("scanning fixtures");
+    assert_eq!(scanned.len(), 2);
+    assert_eq!(
+        scanned[0].size, scanned[1].size,
+        "fixture setup: the two files must be the same size for this test to \
+         exercise the hash phases at all"
+    );
+
+    let (_scratch, out_dir) = scratch_output();
+    let out = run_commit(tree.path(), &out_dir);
+    assert_ok(&out, "commit run");
+
+    assert!(
+        !out_dir.join("duplicates").exists(),
+        "same-size, different-content files were treated as duplicates"
+    );
+    assert_eq!(
+        snapshot_tree(&out_dir),
+        vec![
+            "2024/01/15/2024-01-15-143000.jpg".to_string(),
+            "2024/05/06/2024-05-06-070809.jpg".to_string(),
+        ]
+    );
+    assert!(
+        stdout_of(&out).contains("No duplicates found."),
+        "the run should have reported no duplicates:\n{}",
+        stdout_of(&out)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// More than two copies
+// ---------------------------------------------------------------------------
+
+#[test]
+fn three_identical_files_make_one_group_with_two_files_moved_into_it() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("b.jpg", "a.jpg")
+        .duplicate_of("nested/c.jpg", "a.jpg");
+
+    let order = scan_order(tree.path());
+    assert_eq!(order.len(), 3, "fixture setup: {order:?}");
+    let kept = order[0].clone();
+    let mut moved: Vec<String> = order[1..].iter().map(|p| leaf(p)).collect();
+    moved.sort();
+
+    let (_scratch, out_dir) = scratch_output();
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    let groups = duplicate_group_dirs(&out_dir);
+    assert_eq!(groups.len(), 1, "expected one group, got {groups:?}");
+    assert_eq!(
+        files_in_group(&groups[0]),
+        moved,
+        "both surplus copies should sit in the one group"
+    );
+
+    let manifest = read_manifest(&groups[0].join("manifest.txt"));
+    assert_eq!(manifest.original, kept.display().to_string());
+    assert_eq!(manifest.duplicates.len(), 2);
+
+    // One copy — and only one — reaches the date tree.
+    let landed = file_contents_by_marker(&out_dir);
+    let places = landed.get("a.jpg").expect("no fixture file landed at all");
+    let in_date_tree: Vec<&String> = places
+        .iter()
+        .filter(|p| !p.starts_with("duplicates/"))
+        .collect();
+    assert_eq!(
+        in_date_tree,
+        vec![&"2024/01/15/2024-01-15-143000.jpg".to_string()],
+        "exactly one copy belongs in the date tree; whole tree was {:?}",
+        snapshot_tree(&out_dir)
+    );
+
+    // The duplicate that came from a subdirectory is flattened into the group
+    // directory under its bare filename — worth pinning, because it is what
+    // makes the leaf-name collision below possible.
+    assert!(
+        out_dir.join("duplicates/000/c.jpg").is_file(),
+        "the nested duplicate was not flattened into the group directory"
+    );
+}
+
+#[test]
+fn duplicates_sharing_a_leaf_name_do_not_overwrite_each_other() {
+    // Three identical files whose filenames are also identical. They all
+    // flatten into one group directory, so without collision handling the
+    // second write would destroy the first — silent data loss in the very
+    // directory a user is told to check before deleting anything.
+    let tree = MediaTree::new()
+        .jpeg_with_exif("one/photo.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("two/photo.jpg", "one/photo.jpg")
+        .duplicate_of("three/photo.jpg", "one/photo.jpg");
+
+    let (_scratch, out_dir) = scratch_output();
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    assert_eq!(
+        files_in_group(&out_dir.join("duplicates/000")),
+        vec!["photo-1.jpg".to_string(), "photo.jpg".to_string()],
+        "a same-named duplicate overwrote another instead of being suffixed"
+    );
+
+    // Three copies went in; three copies are still on disk.
+    assert_eq!(
+        content_hash_counts(&out_dir)
+            .values()
+            .copied()
+            .sum::<usize>(),
+        3
+    );
+}
+
+// ---------------------------------------------------------------------------
+// No duplicates at all
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_tree_with_no_duplicates_creates_no_duplicates_directory() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_with_exif("sub/b.jpg", naive(2023, 6, 7, 8, 9, 10), None)
+        .video("clip.mov", b"a video that is not a duplicate")
+        .non_media("notes.txt", b"not media at all");
+
+    let (_scratch, out_dir) = scratch_output();
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    assert!(
+        !out_dir.join("duplicates").exists(),
+        "a duplicate-free run created {}",
+        out_dir.join("duplicates").display()
+    );
+    // Not merely absent as a directory — nothing anywhere in the output tree
+    // is filed under a duplicates path.
+    assert!(
+        snapshot_tree(&out_dir)
+            .iter()
+            .all(|p| !p.starts_with("duplicates/")),
+        "output tree: {:?}",
+        snapshot_tree(&out_dir)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Conservation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nothing_is_lost_the_output_holds_every_file_that_went_in() {
+    // A tree mixing every case the suite covers: a pair, a triple, a lone
+    // file, and a same-size-different-content pair that must stay separate.
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("b.jpg", "a.jpg")
+        .jpeg_with_exif("x/p.jpg", naive(2023, 7, 4, 8, 9, 10), Some((51.5, -0.12)))
+        .duplicate_of("y/p.jpg", "x/p.jpg")
+        .duplicate_of("z/p.jpg", "x/p.jpg")
+        .jpeg_with_exif("solo.jpg", naive(2022, 11, 2, 3, 4, 5), None)
+        .video("clip.mov", b"a lone video");
+
+    let before = content_hash_counts(tree.path());
+    let input_count: usize = before.values().sum();
+    assert_eq!(input_count, 7, "fixture setup: {before:?}");
+
+    let (_scratch, out_dir) = scratch_output();
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    // Every file must be accounted for across *both* trees — counting only
+    // the output would let a file stranded in the input read as a pass.
+    let mut after = content_hash_counts(&out_dir);
+    for (hash, n) in content_hash_counts(tree.path()) {
+        *after.entry(hash).or_insert(0) += n;
+    }
+
+    assert_eq!(
+        after.values().sum::<usize>(),
+        input_count,
+        "file count changed: {input_count} in, {} out",
+        after.values().sum::<usize>()
+    );
+    // Stronger than a count: the same bytes, in the same multiplicities. A run
+    // that lost one photo and duplicated another would keep the count intact.
+    assert_eq!(
+        after, before,
+        "the set of file contents changed between input and output"
+    );
+    assert!(
+        snapshot_tree(tree.path()).is_empty(),
+        "media was left behind in the input tree: {:?}",
+        snapshot_tree(tree.path())
+    );
+}
+
+#[test]
+fn every_duplicate_group_gets_its_own_directory_and_manifest() {
+    // Deliberately order-agnostic: group numbering comes from `HashMap`
+    // iteration and is randomly seeded per process, so `000` and `001` swapped
+    // between consecutive runs during development. Asserting "group 000 is the
+    // a/b pair" would pass locally about half the time and fail in CI the
+    // other half. What is genuinely guaranteed is that each group is
+    // self-consistent, so that is what this checks.
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("b.jpg", "a.jpg")
+        .jpeg_with_exif("x/p.jpg", naive(2023, 7, 4, 8, 9, 10), Some((51.5, -0.12)))
+        .duplicate_of("y/p.jpg", "x/p.jpg");
+
+    let (_scratch, out_dir) = scratch_output();
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    let groups = duplicate_group_dirs(&out_dir);
+    assert_eq!(groups.len(), 2, "expected two groups, got {groups:?}");
+
+    let mut names: Vec<String> = groups.iter().map(|g| leaf(g)).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["000".to_string(), "001".to_string()],
+        "group directories should be numbered from zero without gaps"
+    );
+
+    let mut hashes = Vec::new();
+    for group in &groups {
+        let manifest = read_manifest(&group.join("manifest.txt"));
+        let set_aside = files_in_group(group);
+        assert_eq!(
+            set_aside.len(),
+            1,
+            "each pair should set exactly one file aside, group {} had {set_aside:?}",
+            group.display()
+        );
+
+        // The manifest's hash must actually describe the file sitting next to
+        // it, or the two groups' bookkeeping has been crossed over.
+        let bytes = fs::read(group.join(&set_aside[0])).unwrap();
+        assert_eq!(manifest.hash, blake3::hash(&bytes).to_hex().to_string());
+        assert_eq!(manifest.size, bytes.len() as u64);
+        hashes.push(manifest.hash);
+    }
+
+    hashes.sort();
+    hashes.dedup();
+    assert_eq!(hashes.len(), 2, "the two groups share a content hash");
+}
+
+// ---------------------------------------------------------------------------
+// The default posture applies to dedup too
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_preview_run_reports_duplicates_without_creating_or_moving_anything() {
+    // Dedup is destructive in its own right — it relocates files the user
+    // never asked about. `--commit` has to gate it just as it gates the date
+    // tree, and the preview still has to say what it found.
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("b.jpg", "a.jpg")
+        .non_media("notes.txt", b"leave me alone");
+
+    let before = snapshot_tree_hashed(tree.path());
+    let out = run_preview(tree.path());
+    assert_ok(&out, "preview run");
+
+    assert_eq!(
+        snapshot_tree_hashed(tree.path()),
+        before,
+        "a run without --commit moved a duplicate"
+    );
+    assert!(
+        !tree.join("duplicates").exists(),
+        "a preview created duplicates/ inside the input tree"
+    );
+
+    // A preview that silently declines to mention the duplicates it found is
+    // useless — the listing is the whole product of the run.
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("Duplicate Groups"),
+        "the preview did not report the duplicate group it found:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Duplicate files:    1"),
+        "the preview did not count the duplicate it found:\n{stdout}"
+    );
+}
