@@ -127,14 +127,121 @@ pub fn collision_candidate(path: &Path, attempt: usize) -> PathBuf {
     }
 }
 
+/// The record of one duplicate group, written before that group's files move.
+///
+/// Ordering is the whole point. The previous version accumulated the manifest
+/// text in a `String` and wrote it after the last move in the group, so a run
+/// interrupted anywhere in between — a kill, a full disk, an unplugged drive —
+/// left duplicates relocated into `duplicates/NNN/` with nothing on disk saying
+/// where they had come from. The files were safe and the map to them was not,
+/// which for a photo library is close to the same thing: `photo.jpg` in a
+/// numbered directory is unrecoverable without the path it was moved from.
+///
+/// So the header and the *complete* intended source list are written and synced
+/// before the first move is attempted, and each outcome is appended and synced
+/// as it happens. A manifest read from a half-finished run therefore says both
+/// what was meant to happen and how far it got.
+///
+/// The format stays compatible with `mmm-dedup-verifier`, which reads every
+/// non-`#` line as an intended source path. Outcome lines are comments for that
+/// reason.
+struct GroupManifest {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl GroupManifest {
+    /// Create the manifest and write everything known before the moves begin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be created or the header cannot be
+    /// written — in which case the group must not be moved at all, because
+    /// moving it would be the unrecorded relocation this type exists to
+    /// prevent.
+    fn create(path: &Path, index: usize, group: &DuplicateGroup) -> Result<Self> {
+        let mut header = format!(
+            "# Duplicate group {index:03}\n\
+             # BLAKE3 hash: {}\n\
+             # File size: {} bytes\n\
+             # Original kept at: {}\n\
+             # Duplicates intended for this directory: {}\n\
+             #\n\
+             # The paths below are written before the first move, so an\n\
+             # interrupted run still records where every file came from.\n\
+             # Outcomes follow, appended one line at a time as each move ends.\n\n",
+            group.hash,
+            group.size,
+            group.files[0].display(),
+            group.files.len().saturating_sub(1),
+        );
+        for source in group.files.iter().skip(1) {
+            let _ = writeln!(header, "{}", source.display());
+        }
+        header.push_str("\n# Outcomes\n");
+
+        let mut file = fs::File::create(path)
+            .with_context(|| format!("creating manifest {}", path.display()))?;
+        io::Write::write_all(&mut file, header.as_bytes())
+            .with_context(|| format!("writing manifest {}", path.display()))?;
+        file.sync_data()
+            .with_context(|| format!("flushing manifest {} to disk", path.display()))?;
+
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Append one line and put it on the disk before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying write or sync error. The caller stops moving the
+    /// group rather than continuing without a record.
+    fn append(&mut self, line: &str) -> Result<()> {
+        io::Write::write_all(&mut self.file, line.as_bytes())
+            .and_then(|()| self.file.sync_data())
+            .with_context(|| format!("appending to manifest {}", self.path.display()))
+    }
+
+    /// Record where a duplicate actually landed — suffix and all, because a
+    /// record that says only "moved" cannot be used to put anything back.
+    ///
+    /// # Errors
+    ///
+    /// As [`GroupManifest::append`].
+    fn record_move(&mut self, src: &Path, dst: &Path) -> Result<()> {
+        self.append(&format!(
+            "# moved: {} -> {}\n",
+            src.display(),
+            dst.display()
+        ))
+    }
+
+    /// Record a move that did not happen, and why.
+    ///
+    /// # Errors
+    ///
+    /// As [`GroupManifest::append`].
+    fn record_failure(&mut self, src: &Path, reason: &str) -> Result<()> {
+        self.append(&format!("# FAILED: {}: {reason}\n", src.display()))
+    }
+}
+
 /// Move duplicate files into numbered subdirectories under duplicates/
 /// Each duplicate group gets its own directory: duplicates/000/, duplicates/001/, etc.
 /// The first file in each group is the "original" and is NOT moved here.
 ///
+/// Each group's `manifest.txt` is written in full before any of that group's
+/// files move, and each outcome is appended as it happens — see
+/// [`GroupManifest`].
+///
 /// # Errors
 ///
 /// Returns an error if a `duplicates/NNN/` directory or its `manifest.txt`
-/// cannot be created. Individual failed moves are counted, not propagated.
+/// cannot be created. Individual failed moves are recorded and counted, not
+/// propagated.
 pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(usize, usize)> {
     let dup_base = output_dir.join("duplicates");
     let mut moved = 0;
@@ -145,16 +252,11 @@ pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(
         fs::create_dir_all(&group_dir)
             .with_context(|| format!("creating duplicate dir {}", group_dir.display()))?;
 
-        // Write a manifest file for the verifier
-        let manifest_path = group_dir.join("manifest.txt");
-        let mut manifest = format!(
-            "# Duplicate group {:03}\n# BLAKE3 hash: {}\n# File size: {} bytes\n# Original kept at: {}\n\n",
-            i, group.hash, group.size,
-            group.files[0].display()
-        );
+        // Before a single file moves.
+        let mut manifest = GroupManifest::create(&group_dir.join("manifest.txt"), i, group)?;
 
         // Skip the first file (kept as original), move the rest
-        for dup_path in group.files.iter().skip(1) {
+        for (done, dup_path) in group.files.iter().skip(1).enumerate() {
             let filename = dup_path
                 .file_name()
                 .unwrap_or_default()
@@ -165,8 +267,6 @@ pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(
             // which one is free.
             let dest = group_dir.join(&filename);
 
-            let _ = writeln!(manifest, "{}", dup_path.display());
-
             let planned = PlannedMove {
                 source: dup_path.clone(),
                 destination: dest,
@@ -174,17 +274,35 @@ pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(
                 has_location: false,
             };
 
-            match execute_move(&planned) {
-                Ok(_) => moved += 1,
+            let recorded = match execute_move(&planned) {
+                Ok(outcome) => {
+                    moved += 1;
+                    manifest.record_move(dup_path, &outcome.destination)
+                }
                 Err(e) => {
                     error!(path = %dup_path.display(), error = %e, "failed to move duplicate");
                     errors += 1;
+                    manifest.record_failure(dup_path, &format!("{e:#}"))
                 }
+            };
+
+            // A manifest that cannot be appended to stops the group. The
+            // alternative is to keep moving files whose new locations nothing
+            // is recording, which is the failure this whole structure exists
+            // to avoid — better to leave the rest where the user can still
+            // find them.
+            if let Err(e) = recorded {
+                let abandoned = group.files.len() - 1 - done - 1;
+                error!(
+                    group = i,
+                    error = %e,
+                    abandoned,
+                    "manifest is no longer writable; leaving the rest of this group in place"
+                );
+                errors += abandoned;
+                break;
             }
         }
-
-        fs::write(&manifest_path, manifest)
-            .with_context(|| format!("writing manifest {}", manifest_path.display()))?;
     }
 
     Ok((moved, errors))
@@ -205,6 +323,19 @@ pub enum MoveKind {
     /// Different volumes: copied to a temp file, verified, promoted into
     /// place, and only then was the source removed.
     CrossVolume,
+}
+
+/// What a move did, and where it ended up.
+///
+/// The destination is not always the one that was planned: [`execute_move`]
+/// walks the collision candidates, so a file planned for `photo.jpg` can land
+/// at `photo-1.jpg`. Callers that record the move — the duplicate manifest
+/// today, the journal later — need the name the file actually has, since that
+/// is the only one that can be used to find it again.
+#[derive(Debug, Clone)]
+pub struct MoveOutcome {
+    pub kind: MoveKind,
+    pub destination: PathBuf,
 }
 
 impl std::fmt::Display for MoveKind {
@@ -422,7 +553,7 @@ fn move_no_clobber(src: &Path, dst: &Path) -> Result<MoveKind, MoveError> {
 /// Returns an error if the destination has no parent directory, if that
 /// directory cannot be created, if the move itself fails, or if every one of
 /// [`MAX_COLLISION_ATTEMPTS`] candidate names is taken.
-pub fn execute_move(planned: &PlannedMove) -> Result<MoveKind> {
+pub fn execute_move(planned: &PlannedMove) -> Result<MoveOutcome> {
     let dest_dir = planned
         .destination
         .parent()
@@ -443,7 +574,10 @@ pub fn execute_move(planned: &PlannedMove) -> Result<MoveKind> {
                     kind = %kind,
                     "moved"
                 );
-                return Ok(kind);
+                return Ok(MoveOutcome {
+                    kind,
+                    destination: candidate,
+                });
             }
             Err(MoveError::DestinationExists(taken)) => {
                 debug!(
@@ -768,9 +902,17 @@ mod tests {
         let dst = dst_dir.join("2024-01-15-103000.jpg");
         fs::write(&src, b"image data").unwrap();
 
-        let kind = execute_move(&plan(&src, &dst)).unwrap();
+        let outcome = execute_move(&plan(&src, &dst)).unwrap();
 
-        assert_eq!(kind, MoveKind::Renamed, "a move within one volume links");
+        assert_eq!(
+            outcome.kind,
+            MoveKind::Renamed,
+            "a move within one volume links"
+        );
+        assert_eq!(
+            outcome.destination, dst,
+            "an uncontested move lands on the planned path"
+        );
         assert!(!src.exists());
         assert_eq!(fs::read(&dst).unwrap(), b"image data");
     }
@@ -834,8 +976,14 @@ mod tests {
         fs::write(&dst, b"TAKEN-0").unwrap();
         fs::write(tmp.path().join("out/photo-1.jpg"), b"TAKEN-1").unwrap();
 
-        execute_move(&plan(&src, &dst)).unwrap();
+        let outcome = execute_move(&plan(&src, &dst)).unwrap();
 
+        assert_eq!(
+            outcome.destination,
+            tmp.path().join("out/photo-2.jpg"),
+            "the outcome must name the path the file actually reached, not the \
+             one that was planned"
+        );
         assert_eq!(fs::read(&dst).unwrap(), b"TAKEN-0");
         assert_eq!(
             fs::read(tmp.path().join("out/photo-1.jpg")).unwrap(),
@@ -1281,6 +1429,191 @@ mod tests {
 
         assert!(!doomed.exists(), "an armed guard must remove its file");
         assert!(spared.exists(), "a disarmed guard must leave its file");
+    }
+
+    // -----------------------------------------------------------------------
+    // Duplicate manifests
+    // -----------------------------------------------------------------------
+
+    /// A group of byte-identical files, shaped as the dedup cascade hands it
+    /// over: `files[0]` is the retained original, the rest are moved aside.
+    fn duplicate_group(files: &[PathBuf], body: &[u8]) -> DuplicateGroup {
+        DuplicateGroup {
+            hash: blake3::hash(body).to_hex().to_string(),
+            size: body.len() as u64,
+            files: files.to_vec(),
+        }
+    }
+
+    /// The whole intended source list is on disk before a single file moves.
+    ///
+    /// This is the crash-safety property stated at the seam rather than
+    /// inferred from the caller: the manifest is complete the moment it is
+    /// created, so a run killed between the first and second move still says
+    /// where every file in the group came from. The old code built the text in
+    /// memory and wrote it *after* the loop, which meant an interruption left
+    /// duplicates relocated and no record of their origins at all.
+    #[test]
+    fn test_a_manifest_lists_every_intended_source_before_any_move_happens() {
+        let tmp = TempDir::new().unwrap();
+        let group_dir = tmp.path().join("duplicates/000");
+        fs::create_dir_all(&group_dir).unwrap();
+        let manifest_path = group_dir.join("manifest.txt");
+
+        let group = duplicate_group(
+            &[
+                PathBuf::from("/input/kept.jpg"),
+                PathBuf::from("/input/one/photo.jpg"),
+                PathBuf::from("/input/two/photo.jpg"),
+            ],
+            b"BODY",
+        );
+
+        // Deliberately still open — nothing is recorded, nothing is dropped.
+        let _manifest = GroupManifest::create(&manifest_path, 0, &group).unwrap();
+
+        let text = fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            text.contains(&format!("# BLAKE3 hash: {}", group.hash)),
+            "got: {text}"
+        );
+        assert!(text.contains("# File size: 4 bytes"), "got: {text}");
+        assert!(
+            text.contains("# Original kept at: /input/kept.jpg"),
+            "got: {text}"
+        );
+        for source in &group.files[1..] {
+            assert!(
+                text.lines().any(|l| l == source.display().to_string()),
+                "the intended source {} is not listed; got: {text}",
+                source.display()
+            );
+        }
+    }
+
+    /// Each outcome line reaches the disk as it is recorded, not when the
+    /// writer is dropped — a buffered manifest is no manifest at all if the
+    /// process dies mid-group.
+    #[test]
+    fn test_manifest_outcomes_are_readable_as_soon_as_they_are_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let manifest_path = tmp.path().join("manifest.txt");
+        let group = duplicate_group(
+            &[PathBuf::from("/input/kept.jpg"), PathBuf::from("/in/a.jpg")],
+            b"BODY",
+        );
+
+        let mut manifest = GroupManifest::create(&manifest_path, 0, &group).unwrap();
+        manifest
+            .record_move(
+                Path::new("/in/a.jpg"),
+                Path::new("/out/duplicates/000/a.jpg"),
+            )
+            .unwrap();
+
+        let text = fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            text.contains("/in/a.jpg -> /out/duplicates/000/a.jpg"),
+            "the outcome should be on disk before the writer is dropped; got: {text}"
+        );
+
+        manifest
+            .record_failure(Path::new("/in/b.jpg"), "the drive went away")
+            .unwrap();
+        let text = fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            text.contains("/in/b.jpg") && text.contains("the drive went away"),
+            "got: {text}"
+        );
+    }
+
+    /// A failed move inside a group must be recorded, not dropped — and the
+    /// files that never moved must still be named, because the manifest is the
+    /// only record of where they were meant to go.
+    #[test]
+    fn test_move_duplicates_records_the_intended_sources_even_when_a_move_fails() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let output = tmp.path().join("output");
+
+        let kept = input.join("kept.jpg");
+        let doomed = input.join("gone.jpg");
+        let survivor = input.join("survivor.jpg");
+        for path in [&kept, &doomed, &survivor] {
+            fs::write(path, b"BODY").unwrap();
+        }
+
+        // The scan saw three copies; one is deleted between planning and
+        // execution, which is the everyday shape of a mid-run failure.
+        let group = duplicate_group(&[kept, doomed.clone(), survivor.clone()], b"BODY");
+        fs::remove_file(&doomed).unwrap();
+
+        let (moved, errors) = move_duplicates(&[group], &output).unwrap();
+
+        assert_eq!((moved, errors), (1, 1), "one move must fail, one succeed");
+
+        let text = fs::read_to_string(output.join("duplicates/000/manifest.txt")).unwrap();
+        for source in [&doomed, &survivor] {
+            assert!(
+                text.contains(&source.display().to_string()),
+                "the manifest must name the intended source {}; got: {text}",
+                source.display()
+            );
+        }
+        assert!(
+            text.lines()
+                .any(|l| l.contains("FAILED") && l.contains(&doomed.display().to_string())),
+            "the failed move must be recorded as a failure; got: {text}"
+        );
+        assert!(
+            fs::read(output.join("duplicates/000/survivor.jpg")).unwrap() == b"BODY",
+            "the surviving duplicate should still have been moved"
+        );
+    }
+
+    /// The outcome lines name where each file actually landed, suffix and all
+    /// — a record that says only "moved" cannot be used to put anything back.
+    #[test]
+    fn test_move_duplicates_records_the_destination_each_duplicate_reached() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        fs::create_dir_all(input.join("one")).unwrap();
+        fs::create_dir_all(input.join("two")).unwrap();
+        let output = tmp.path().join("output");
+
+        let kept = input.join("kept.jpg");
+        let first = input.join("one/photo.jpg");
+        let second = input.join("two/photo.jpg");
+        for path in [&kept, &first, &second] {
+            fs::write(path, b"BODY").unwrap();
+        }
+
+        let group = duplicate_group(&[kept, first.clone(), second.clone()], b"BODY");
+        let (moved, errors) = move_duplicates(&[group], &output).unwrap();
+        assert_eq!((moved, errors), (2, 0));
+
+        let group_dir = output.join("duplicates/000");
+        let text = fs::read_to_string(group_dir.join("manifest.txt")).unwrap();
+
+        // Both flattened into one directory, so the second took a suffix. The
+        // manifest has to say so, or the two records are indistinguishable.
+        assert!(
+            text.contains(&format!(
+                "{} -> {}",
+                first.display(),
+                group_dir.join("photo.jpg").display()
+            )),
+            "got: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{} -> {}",
+                second.display(),
+                group_dir.join("photo-1.jpg").display()
+            )),
+            "got: {text}"
+        );
     }
 
     #[test]

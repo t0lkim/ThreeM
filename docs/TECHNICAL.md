@@ -167,14 +167,27 @@ Each group directory contains a `manifest.txt`:
 # BLAKE3 hash: 7a3b1c4d5e6f7890abcdef1234567890abcdef1234567890abcdef1234567890
 # File size: 4521984 bytes
 # Original kept at: ~/Organised/2024/01/15/2024-01-15-143022.jpg
+# Duplicates intended for this directory: 2
+#
+# The paths below are written before the first move, so an
+# interrupted run still records where every file came from.
+# Outcomes follow, appended one line at a time as each move ends.
 
 ~/Photos/IMG_0042.jpg
 ~/Camera/DCIM/IMG_0042.jpg
+
+# Outcomes
+# moved: ~/Photos/IMG_0042.jpg -> ~/Organised/duplicates/000/IMG_0042.jpg
+# FAILED: ~/Camera/DCIM/IMG_0042.jpg: moving … : No such file or directory (os error 2)
 ```
 
-- Lines starting with `#` are metadata (hash, size, original path).
-- Non-comment lines are the source paths of the duplicate files that were moved into this group directory.
+- Lines starting with `#` are metadata (hash, size, original path, per-file outcomes).
+- Non-comment lines are the source paths of the duplicate files that were *intended* for this group directory.
 - The verifier parses the `# Original kept at:` line to locate the original for hash comparison.
+
+**Write ordering is a safety property, not a formatting detail.** The header and the complete intended source list are written and `fsync`ed *before* the group's first file moves; each outcome line is appended and `fsync`ed as that move ends. A run interrupted part-way through a group therefore leaves a manifest that still says where every file came from and how far the group got. Writing the manifest after the moves — as the tool did before v0.2 — meant an interrupted run left duplicates relocated with no record of their origins at all.
+
+If the manifest itself becomes unwritable mid-group (a full disk), the remaining files in that group are left where they are and counted as errors, rather than moved without a record.
 
 ---
 
