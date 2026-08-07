@@ -225,7 +225,7 @@ impl std::fmt::Display for MoveKind {
 /// missed retry loses a photo's move, a spurious one writes a `-1` copy next
 /// to a file that failed for an unrelated reason.
 #[derive(Debug)]
-enum MoveError {
+pub enum MoveError {
     /// `dst` already exists. Not fatal — [`execute_move`] tries the next
     /// candidate name.
     DestinationExists(PathBuf),
@@ -238,6 +238,22 @@ impl From<anyhow::Error> for MoveError {
         Self::Fatal(err)
     }
 }
+
+impl std::fmt::Display for MoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DestinationExists(path) => {
+                write!(f, "destination {} already exists", path.display())
+            }
+            // `{:#}` rather than `{}`: the whole context chain, because the
+            // outermost layer alone ("moving X to Y") never says what went
+            // wrong, and this is what an operator reads off a failed run.
+            Self::Fatal(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for MoveError {}
 
 /// The step of a same-volume move that failed.
 ///
@@ -522,51 +538,142 @@ fn promote_into_place(temp: &Path, dst: &Path) -> Result<(), MoveError> {
     }
 }
 
-/// Safe cross-volume move: copy → verify → delete source
-fn cross_volume_move(src: &Path, dst: &Path) -> Result<(), MoveError> {
+/// Deletes the file it names when dropped, unless disarmed.
+///
+/// The copy path has six ways to leave early — a failed copy, a failed hash, a
+/// digest mismatch, an occupied destination, a failed promotion, a failed
+/// source removal — and each one used to need its own `let _ = remove_file`.
+/// Scattering the cleanup means the next early return added is the one that
+/// forgets it, and the symptom is `.tmp-1748…` files accumulating in somebody's
+/// photo library, indistinguishable from the photos except by name.
+///
+/// The guard is deliberately silent on failure: it runs during unwinding, when
+/// there is already an error on its way to the operator, and a leftover temp
+/// file is not worth displacing it.
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Stop tracking the file — it has been moved away and the path is either
+    /// free or somebody else's now.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// A temp filename unique within this process.
+///
+/// The millisecond alone is not unique — a run moving small files clears
+/// several per millisecond — and two moves sharing a temp name would have one
+/// overwrite the other's copy. `copy_hashing` creates the temp with
+/// `O_CREAT | O_EXCL` and would refuse rather than corrupt, but refusing a move
+/// over a clock collision is still a failure nobody should have to read about.
+fn temp_file_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    format!(
+        ".tmp-{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Copy `src` to `dst` via a verified temp file, then delete `src`.
+///
+/// The source is only ever deleted after the bytes at the destination have been
+/// proved identical to the bytes that were read — **identical in content**, not
+/// merely in length. Comparing `metadata().len()` is the defect this replaces:
+/// a copy truncated and padded, a copy off a failing drive, a copy through a
+/// filesystem that silently substituted a block, all have the right length and
+/// the wrong contents, and all passed a size check on the way to
+/// `fs::remove_file` on the original.
+///
+/// `copy` is a parameter so the corruption can be injected in a test at the one
+/// place a bad drive or cable would introduce it — between reading the source
+/// and writing the copy. It is handed the source and the temp path and must
+/// return the BLAKE3 digest of what it *read*; [`crate::hasher::copy_hashing`]
+/// is the real implementation and streams the file once, hashing as it writes.
+///
+/// # Errors
+///
+/// [`MoveError::DestinationExists`] if something occupies `dst`, and
+/// [`MoveError::Fatal`] if the copy, the verification or the source removal
+/// fails. On every one of those paths the temp file is removed and the source
+/// is left exactly where it was.
+pub fn copy_verify_delete<C>(src: &Path, dst: &Path, copy: C) -> Result<(), MoveError>
+where
+    C: FnOnce(&Path, &Path) -> Result<String>,
+{
     let dst_dir = dst.parent().context("destination has no parent")?;
 
-    // Copy to temp file in same directory as destination
-    let temp_name = format!(".tmp-{}", chrono::Utc::now().timestamp_millis());
-    let temp_path = dst_dir.join(temp_name);
+    // The temp file lives beside the destination, not beside the source: it has
+    // to be on the destination's volume for the promotion at the end to be a
+    // link rather than a second copy.
+    let mut temp = TempFileGuard::new(dst_dir.join(temp_file_name()));
 
-    fs::copy(src, &temp_path).with_context(|| {
+    let source_digest = copy(src, temp.path()).with_context(|| {
         format!(
             "copying {} to {} via temp file {}",
             src.display(),
             dst.display(),
-            temp_path.display()
+            temp.path().display()
         )
     })?;
 
-    // Verify the copy by comparing sizes
-    let src_size = fs::metadata(src)
-        .with_context(|| format!("reading source metadata: {}", src.display()))?
-        .len();
-    let tmp_size = fs::metadata(&temp_path)
-        .with_context(|| format!("reading temp file metadata: {}", temp_path.display()))?
-        .len();
-
-    if src_size != tmp_size {
-        // Clean up temp file and bail
-        let _ = fs::remove_file(&temp_path);
-        return Err(MoveError::Fatal(anyhow::anyhow!(
-            "copy verification failed for {}: source {} bytes, copy {} bytes",
+    let copy_digest = crate::hasher::full_hash(temp.path()).with_context(|| {
+        format!(
+            "verifying the copy of {} written to {}",
             src.display(),
-            src_size,
-            tmp_size
+            temp.path().display()
+        )
+    })?;
+
+    if source_digest != copy_digest {
+        return Err(MoveError::Fatal(anyhow::anyhow!(
+            "copy verification failed moving {} to {}: source BLAKE3 {}, copy BLAKE3 {} — \
+             the copy is corrupt, so it has been discarded and the source left in place",
+            src.display(),
+            dst.display(),
+            source_digest,
+            copy_digest
         )));
     }
+
+    debug!(
+        src = %src.display(),
+        dst = %dst.display(),
+        digest = %source_digest,
+        "copy verified by content"
+    );
 
     // Promote the temp file into place. Same directory, therefore same volume,
     // so this is the link path — and it refuses an occupied destination for
     // the same reason the first attempt did.
-    if let Err(e) = promote_into_place(&temp_path, dst) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(e);
-    }
+    promote_into_place(temp.path(), dst)?;
+    // The temp path is free again and must not be removed: on the
+    // `reserve_and_rename` fallback a later move could already have claimed it.
+    temp.disarm();
 
-    // Only now delete the source
+    // Only now delete the source.
     fs::remove_file(src).with_context(|| {
         format!(
             "removing source file {} after copying it to {}",
@@ -576,6 +683,11 @@ fn cross_volume_move(src: &Path, dst: &Path) -> Result<(), MoveError> {
     })?;
 
     Ok(())
+}
+
+/// Safe cross-volume move: copy → verify by content → delete source.
+fn cross_volume_move(src: &Path, dst: &Path) -> Result<(), MoveError> {
+    copy_verify_delete(src, dst, crate::hasher::copy_hashing)
 }
 
 #[cfg(test)]
@@ -1072,6 +1184,103 @@ mod tests {
             "nothing should have been created at {}",
             dst.display()
         );
+    }
+
+    /// A copy that fails halfway leaves nothing behind and takes nothing away.
+    ///
+    /// This is the path the old code got wrong by omission: `fs::copy` failing
+    /// part-way through still leaves a partial temp file, and the early return
+    /// above the size check had no cleanup on it.
+    #[test]
+    fn test_a_failed_copy_leaves_no_temp_file_and_no_damage() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("input/holiday.jpg");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        let dst_dir = tmp.path().join("output");
+        fs::create_dir_all(&dst_dir).unwrap();
+        let dst = dst_dir.join("photo.jpg");
+        fs::write(&src, b"KEEP ME").unwrap();
+
+        // Writes a partial temp file, then gives up — a copy interrupted by a
+        // full disk or an unplugged drive.
+        let failing_copy = |_from: &Path, temp: &Path| -> Result<String> {
+            fs::write(temp, b"KEEP")?;
+            bail!("the drive went away")
+        };
+
+        let err = copy_verify_delete(&src, &dst, failing_copy)
+            .expect_err("a failed copy must not report success");
+
+        assert!(
+            format!("{err}").contains("the drive went away"),
+            "the underlying cause must survive the context; got: {err}"
+        );
+        assert_eq!(fs::read(&src).unwrap(), b"KEEP ME");
+        assert!(!dst.exists());
+        assert_eq!(
+            fs::read_dir(&dst_dir).unwrap().count(),
+            0,
+            "the partial temp file should have been cleaned up"
+        );
+    }
+
+    /// The size check this replaced would have caught a *short* copy. The
+    /// content check has to catch it too — a fix that trades one class of
+    /// failure for another is not a fix.
+    #[test]
+    fn test_a_truncated_copy_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("input/holiday.jpg");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        let dst_dir = tmp.path().join("output");
+        fs::create_dir_all(&dst_dir).unwrap();
+        let dst = dst_dir.join("photo.jpg");
+        fs::write(&src, b"THE WHOLE PHOTOGRAPH").unwrap();
+
+        let truncating_copy = |from: &Path, temp: &Path| -> Result<String> {
+            let read = fs::read(from)?;
+            fs::write(temp, &read[..4])?;
+            Ok(blake3::hash(&read).to_hex().to_string())
+        };
+
+        let err = copy_verify_delete(&src, &dst, truncating_copy)
+            .expect_err("a short copy must not verify");
+
+        assert!(
+            format!("{err}").contains("copy verification failed"),
+            "got: {err}"
+        );
+        assert_eq!(fs::read(&src).unwrap(), b"THE WHOLE PHOTOGRAPH");
+        assert_eq!(
+            fs::read_dir(&dst_dir).unwrap().count(),
+            0,
+            "the rejected copy should have been cleaned up"
+        );
+    }
+
+    /// Two moves in the same millisecond must not be handed the same temp path
+    /// — one would overwrite the other's copy, or refuse the move outright.
+    #[test]
+    fn test_temp_file_names_do_not_repeat() {
+        let names: std::collections::HashSet<String> = (0..100).map(|_| temp_file_name()).collect();
+        assert_eq!(names.len(), 100, "temp names collided within one process");
+    }
+
+    #[test]
+    fn test_temp_file_guard_removes_the_file_unless_disarmed() {
+        let tmp = TempDir::new().unwrap();
+        let doomed = tmp.path().join("doomed");
+        let spared = tmp.path().join("spared");
+        fs::write(&doomed, b"x").unwrap();
+        fs::write(&spared, b"x").unwrap();
+
+        drop(TempFileGuard::new(doomed.clone()));
+        let mut guard = TempFileGuard::new(spared.clone());
+        guard.disarm();
+        drop(guard);
+
+        assert!(!doomed.exists(), "an armed guard must remove its file");
+        assert!(spared.exists(), "a disarmed guard must leave its file");
     }
 
     #[test]

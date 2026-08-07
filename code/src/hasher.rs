@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -11,6 +11,13 @@ use crate::scanner::ScannedFile;
 
 /// Size of the partial hash read (first + last N bytes)
 const PARTIAL_HASH_BYTES: u64 = 64 * 1024; // 64KB
+
+/// Read buffer shared by every streaming operation in this module — the full
+/// hash, and the verified copy the organiser's cross-volume move runs.
+///
+/// One constant rather than one per function, so a copy and the hash that
+/// verifies it can never disagree about how they walk a file.
+const STREAM_BUFFER_BYTES: usize = 128 * 1024;
 
 /// Result of the three-phase dedup analysis
 #[derive(Debug)]
@@ -149,7 +156,7 @@ pub fn group_by_full_hash<'a>(
 }
 
 /// Hash first 64KB + last 64KB of a file using BLAKE3
-fn partial_hash(path: &PathBuf, size: u64) -> Result<String> {
+fn partial_hash(path: &Path, size: u64) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("opening {} for partial hash", path.display()))?;
 
@@ -177,23 +184,93 @@ fn partial_hash(path: &PathBuf, size: u64) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Full streaming BLAKE3 hash of a file
-fn full_hash(path: &PathBuf) -> Result<String> {
-    let mut file =
-        File::open(path).with_context(|| format!("opening {} for full hash", path.display()))?;
-
+/// Stream everything `reader` yields through BLAKE3 and return the hex digest.
+///
+/// The single hashing primitive in the crate. Dedup and the organiser's
+/// cross-volume verification both reach content identity through this function
+/// and no other, because two implementations of "is this the same file" are two
+/// chances to disagree — and the one place they would disagree is immediately
+/// before `remove_file` on somebody's only copy of a photograph.
+///
+/// # Errors
+///
+/// Returns the reader's own error, uncontextualised — the caller knows what it
+/// is reading and this function does not.
+pub fn hash_reader<R: Read>(reader: &mut R) -> io::Result<String> {
     let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 128 * 1024]; // 128KB read buffer
+    let mut buf = vec![0u8; STREAM_BUFFER_BYTES];
 
     loop {
-        let bytes_read = file
-            .read(&mut buf)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let bytes_read = reader.read(&mut buf)?;
         if bytes_read == 0 {
             break;
         }
         hasher.update(&buf[..bytes_read]);
     }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Full streaming BLAKE3 hash of a file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read to completion.
+pub fn full_hash(path: &Path) -> Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("opening {} for full hash", path.display()))?;
+
+    hash_reader(&mut file).with_context(|| format!("reading {}", path.display()))
+}
+
+/// Copy `src` to `dst`, hashing the bytes on the way through, and return the
+/// digest of what was *read*.
+///
+/// One pass over the file, not two: the source is read once and each buffer is
+/// both hashed and written. The digest describes the source as it was actually
+/// read during this copy, which is the only version of it that matters — the
+/// caller hashes the file that landed and compares.
+///
+/// `dst` is created with `O_CREAT | O_EXCL`, so this never writes over an
+/// existing file. The write is flushed and `fsync`ed before returning, because
+/// the caller deletes the source immediately afterwards and a copy still living
+/// in the page cache is not yet a copy.
+///
+/// # Errors
+///
+/// Returns an error if `src` cannot be opened or read, if `dst` already exists
+/// or cannot be created, or if the write, flush or sync fails.
+pub fn copy_hashing(src: &Path, dst: &Path) -> Result<String> {
+    let mut input =
+        File::open(src).with_context(|| format!("opening {} to copy it", src.display()))?;
+    let mut output = File::create_new(dst)
+        .with_context(|| format!("creating {} to copy into", dst.display()))?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_BUFFER_BYTES];
+
+    loop {
+        let bytes_read = input
+            .read(&mut buf)
+            .with_context(|| format!("reading {}", src.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buf[..bytes_read]);
+        output
+            .write_all(&buf[..bytes_read])
+            .with_context(|| format!("writing {}", dst.display()))?;
+    }
+
+    // `fs::copy` carries the source's mode across; `File::create_new` does not,
+    // so a read-only original would silently become writable without this.
+    if let Ok(metadata) = input.metadata() {
+        let _ = output.set_permissions(metadata.permissions());
+    }
+
+    output
+        .sync_all()
+        .with_context(|| format!("flushing {} to disk", dst.display()))?;
 
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -268,6 +345,73 @@ mod tests {
         let result = find_duplicates(&files, &pb).unwrap();
         assert_eq!(result.duplicate_groups.len(), 1);
         assert_eq!(result.duplicate_groups[0].files.len(), 2);
+    }
+
+    /// A body several buffers long, with a short final read — where an
+    /// off-by-one in a streaming loop shows up.
+    fn multi_buffer_body() -> Vec<u8> {
+        (0..300_000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn test_hash_reader_agrees_with_a_one_shot_hash() {
+        let body = multi_buffer_body();
+        let digest = hash_reader(&mut body.as_slice()).unwrap();
+        assert_eq!(digest, blake3::hash(&body).to_hex().to_string());
+    }
+
+    #[test]
+    fn test_hash_reader_handles_an_empty_stream() {
+        let digest = hash_reader(&mut [].as_slice()).unwrap();
+        assert_eq!(digest, blake3::hash(b"").to_hex().to_string());
+    }
+
+    #[test]
+    fn test_full_hash_reads_the_whole_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("photo.jpg");
+        let body = multi_buffer_body();
+        fs::write(&path, &body).unwrap();
+
+        assert_eq!(
+            full_hash(&path).unwrap(),
+            blake3::hash(&body).to_hex().to_string()
+        );
+    }
+
+    /// The copy reproduces the bytes exactly and reports the digest of what it
+    /// read — which is what makes the caller's comparison meaningful.
+    #[test]
+    fn test_copy_hashing_copies_the_bytes_and_reports_the_source_digest() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source.jpg");
+        let dst = tmp.path().join("copy.jpg");
+        let body = multi_buffer_body();
+        fs::write(&src, &body).unwrap();
+
+        let digest = copy_hashing(&src, &dst).unwrap();
+
+        assert_eq!(digest, blake3::hash(&body).to_hex().to_string());
+        assert_eq!(fs::read(&dst).unwrap(), body);
+        assert_eq!(
+            full_hash(&dst).unwrap(),
+            digest,
+            "the file that landed must hash to the digest that was reported"
+        );
+    }
+
+    /// `O_CREAT | O_EXCL`: the copy never writes over a file that is already
+    /// there, even when the caller hands it a path it thinks is free.
+    #[test]
+    fn test_copy_hashing_refuses_an_existing_destination() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("source.jpg");
+        let dst = tmp.path().join("taken.jpg");
+        fs::write(&src, b"NEW").unwrap();
+        fs::write(&dst, b"PRE-EXISTING").unwrap();
+
+        assert!(copy_hashing(&src, &dst).is_err());
+        assert_eq!(fs::read(&dst).unwrap(), b"PRE-EXISTING");
     }
 
     #[test]

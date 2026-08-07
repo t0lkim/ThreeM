@@ -1,11 +1,11 @@
 //! Regression suite for the destructive-path defects in `organiser`.
 //!
 //! Every test here was written *before* the fix it describes, and each one
-//! encodes a way `ThreeM` can currently lose someone's photos. They are
-//! deliberately library-level rather than binary-level: the defects live in
-//! [`mmm::organiser::execute_move`] and the private `cross_volume_move` below
-//! it, and driving them through the CLI would add a scan, a plan and a
-//! progress bar between the assertion and the thing being asserted.
+//! encodes a way `ThreeM` could lose someone's photos. They are deliberately
+//! library-level rather than binary-level: the defects live in
+//! [`mmm::organiser::execute_move`] and the copy path beneath it, and driving
+//! them through the CLI would add a scan, a plan and a progress bar between the
+//! assertion and the thing being asserted.
 //!
 //! ## The four defects
 //!
@@ -43,11 +43,16 @@
 //! error is deliberate rather than because a doomed copy happened to fail the
 //! same way.
 //!
-//! Defect 3 is still live, and the one test that fails is the one that
-//! describes it. The honest per-test record is in
-//! `.maestro/playbooks/Initiation/Phase-02-Destructive-Path-Hardening.md`;
-//! CI stays red until task 4 lands, which is the intended test-first posture
-//! of this phase.
+//! Defect 3 is fixed as of task 4: `cross_volume_move` is now a thin call to
+//! `copy_verify_delete`, which hashes the source as it streams it into the temp
+//! file, hashes the file that landed, and refuses to remove the source unless
+//! the two BLAKE3 digests agree. The copy step is a parameter, which is what
+//! lets the corruption test below inject damage at the one place a failing
+//! drive or cable would introduce it.
+//!
+//! Every test in this file passes as of task 4. The per-task record of what
+//! failed when, and why, is in
+//! `.maestro/playbooks/Initiation/Phase-02-Destructive-Path-Hardening.md`.
 
 #![allow(
     clippy::unwrap_used,
@@ -60,7 +65,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mmm::metadata::DateSource;
-use mmm::organiser::{execute_move, PlannedMove};
+use mmm::organiser::{copy_verify_delete, execute_move, PlannedMove};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -328,38 +333,37 @@ fn a_read_only_destination_errors_naming_the_destination_and_leaves_the_source()
 /// A cross-volume copy that lands the right number of bytes and the wrong
 /// bytes must be detected, and the source must survive.
 ///
-/// The scenario is built in full below — two files of identical length whose
-/// BLAKE3 digests differ — which is exactly the input that today's
-/// `src_size != tmp_size` check waves through before calling
-/// `fs::remove_file` on the original.
+/// The scenario is exactly the input that a `src_size != tmp_size` check waves
+/// through before calling `fs::remove_file` on the original: two byte-streams
+/// of identical length whose BLAKE3 digests differ.
 ///
 /// It cannot be driven through `execute_move`, because corrupting the copy
-/// requires substituting the copy step, and there is no seam to substitute it
-/// at: `cross_volume_move` is private and does its own `fs::copy`. Extracting
-/// a content-verifying `copy_verify_delete` is task 4 of this phase; this test
-/// binds to it then, and until it exists the test fails with the reason —
-/// which is the accurate record of the defect, not a green tick over a gap.
+/// means substituting the copy step, and a real cross-volume move needs a
+/// second mounted filesystem no test runner can be assumed to have. Task 4
+/// extracts `copy_verify_delete` with the copy step as a parameter, so the
+/// damage can be injected at the one place a bad drive, a bad cable or a bad
+/// filesystem would do it: between reading the source and writing the copy.
+///
+/// The injected step is honest about the source — it returns the true digest
+/// of the bytes it read — and dishonest only about what it wrote, which is the
+/// shape of real copy corruption. Nothing but a content comparison can catch it.
 #[test]
 fn a_same_size_but_corrupted_cross_volume_copy_must_not_delete_the_source() {
     let tmp = TempDir::new().unwrap();
-    let src = tmp.path().join("holiday.jpg");
-    let corrupt = tmp.path().join("corrupt-copy.jpg");
+    let src = tmp.path().join("input/holiday.jpg");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
 
-    // 128 KiB apiece: two full read buffers, so a streaming hash has to get
-    // past its first chunk to tell them apart.
+    // 128 KiB: two full read buffers, so a streaming hash has to get past its
+    // first chunk to tell the two apart.
     let original = vec![b'A'; 128 * 1024];
+    fs::write(&src, &original).unwrap();
+
+    let dest_dir = tmp.path().join("output/2024/01/15");
+    fs::create_dir_all(&dest_dir).unwrap();
+    let destination = dest_dir.join("2024-01-15-103000.jpg");
+
     let mut damaged = original.clone();
     damaged[64 * 1024] = b'B'; // one flipped byte, identical length
-
-    fs::write(&src, &original).unwrap();
-    fs::write(&corrupt, &damaged).unwrap();
-
-    let src_len = fs::metadata(&src).unwrap().len();
-    let corrupt_len = fs::metadata(&corrupt).unwrap().len();
-    assert_eq!(
-        src_len, corrupt_len,
-        "the fixture must defeat a size-only check to be worth anything"
-    );
 
     let src_digest = blake3::hash(&original).to_hex().to_string();
     let corrupt_digest = blake3::hash(&damaged).to_hex().to_string();
@@ -368,10 +372,87 @@ fn a_same_size_but_corrupted_cross_volume_copy_must_not_delete_the_source() {
         "a content check must be able to tell these apart"
     );
 
-    panic!(
-        "no content-verified copy seam exists: `cross_volume_move` is private and verifies with \
-         `metadata().len()` only, so a {src_len}-byte copy with digest {corrupt_digest} passes \
-         verification against a source with digest {src_digest} and the source is then deleted. \
-         Bind this test to the extracted `copy_verify_delete` in task 4 of Phase 02."
+    // The seam: reads the source truthfully, writes something else.
+    let corrupting_copy = |from: &Path, temp: &Path| -> anyhow::Result<String> {
+        let read = fs::read(from)?;
+        let digest = blake3::hash(&read).to_hex().to_string();
+        fs::write(temp, &damaged)?;
+        Ok(digest)
+    };
+
+    let err = copy_verify_delete(&src, &destination, corrupting_copy)
+        .expect_err("a copy whose contents differ from the source must not verify");
+    let message = format!("{err}");
+
+    assert!(
+        message.contains(&src_digest) && message.contains(&corrupt_digest),
+        "the error must state both digests; got: {message}"
+    );
+    assert_eq!(
+        fs::read(&src).unwrap(),
+        original,
+        "the source must be left byte-for-byte intact when verification fails"
+    );
+    assert!(
+        !destination.exists(),
+        "the unverified copy must not be promoted to {}",
+        destination.display()
+    );
+
+    let leftovers: Vec<String> = fs::read_dir(&dest_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the temp file must be cleaned up on the mismatch path; found {leftovers:?}"
+    );
+}
+
+/// The same seam on its success path: a copy that matches lands the bytes
+/// exactly and removes the source, and leaves no temp file behind.
+///
+/// This is the guarantee the verification exists to protect. Driven through
+/// `copy_verify_delete` with the real copy step, which is the code an actual
+/// cross-volume move runs — only the "different volume" part is simulated,
+/// because a second mount is not available to a test runner.
+#[test]
+fn a_verified_cross_volume_copy_preserves_content_and_removes_the_source() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("input/holiday.jpg");
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+
+    // Deliberately not a round number of buffers: the last read is short, which
+    // is where an off-by-one in the streaming loop would show.
+    let original: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    fs::write(&src, &original).unwrap();
+
+    let dest_dir = tmp.path().join("output/2024/01/15");
+    fs::create_dir_all(&dest_dir).unwrap();
+    let destination = dest_dir.join("2024-01-15-103000.jpg");
+
+    copy_verify_delete(&src, &destination, mmm::hasher::copy_hashing)
+        .expect("a copy that matches its source must verify");
+
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        original,
+        "the copy must be byte-for-byte identical to the source"
+    );
+    assert!(
+        !src.exists(),
+        "the source must be gone once the copy landed"
+    );
+
+    let leftovers: Vec<String> = fs::read_dir(&dest_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(".tmp-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the temp file must be gone on the success path; found {leftovers:?}"
     );
 }
