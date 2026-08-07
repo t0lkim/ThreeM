@@ -62,6 +62,12 @@ fn main() -> Result<()> {
         eprintln!("{notice}");
     }
 
+    // Before the banner, before the scan: a run that is going to be refused
+    // must not first tell the operator it is about to move their files.
+    if let Err(refusal) = config.validate() {
+        anyhow::bail!(refusal);
+    }
+
     // Say which posture we are in before doing any work, not after — a user
     // who expected a preview must not learn otherwise from the aftermath.
     reporter::print_mode_banner(config.is_dry_run());

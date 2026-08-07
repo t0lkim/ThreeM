@@ -1,8 +1,11 @@
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
+
+use crate::METADATA_DIR_NAME;
 
 /// Known image extensions (lowercase, no dot)
 const IMAGE_EXTENSIONS: &[&str] = &[
@@ -48,6 +51,28 @@ pub struct ScanResult {
     pub skipped: usize,
 }
 
+/// Whether the walk should refuse to descend into this entry.
+///
+/// `mmm` writes its journals into `<output>/.mmm/`, and organising a library
+/// in place makes that directory a subdirectory of an input tree. Descending
+/// into it would put the tool's own record of the run in front of the code
+/// that moves files around — the one directory a media organiser must never
+/// treat as media.
+///
+/// The test is on the directory's *name*, at any depth, rather than on one
+/// resolved path: a run with several input directories, or one organised into
+/// a tree it also scans, has more than one `.mmm/` to avoid.
+///
+/// A `.mmm` passed on the command line as a root is honoured. Naming it
+/// explicitly is a deliberate act, and the exclusion exists to stop the walk
+/// wandering into metadata it was never asked about, not to overrule the
+/// operator.
+fn is_excluded(entry: &DirEntry) -> bool {
+    entry.depth() > 0
+        && entry.file_type().is_dir()
+        && entry.file_name() == OsStr::new(METADATA_DIR_NAME)
+}
+
 /// Scan one or more directories recursively for media files.
 ///
 /// Infallible by construction. Every per-entry failure is a warning and a
@@ -67,7 +92,11 @@ pub fn scan_directories(dirs: &[PathBuf]) -> ScanResult {
             continue;
         }
 
-        for entry in WalkDir::new(dir).follow_links(false) {
+        for entry in WalkDir::new(dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !is_excluded(entry))
+        {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
@@ -209,6 +238,69 @@ mod tests {
 
         let scan = scan_directories(&[tmp.path().to_path_buf()]);
         assert_eq!(scan.files.len(), 2);
+    }
+
+    /// `mmm`'s own metadata directory is not media, however photo-shaped its
+    /// contents look. A run organising a library in place writes `.mmm/` into
+    /// the tree it is scanning; a scanner that walked back into it would offer
+    /// to organise the record of the run that made it.
+    #[test]
+    fn test_scan_skips_the_metadata_directory() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("real.jpg"), b"data").unwrap();
+
+        let journal = tmp.path().join(".mmm").join("journal");
+        fs::create_dir_all(&journal).unwrap();
+        fs::write(journal.join("20240315-103000-abc123.jsonl"), b"{}\n").unwrap();
+        // A media file *inside* .mmm is the case that matters — the extension
+        // filter alone would already have passed over the .jsonl.
+        fs::write(journal.join("thumbnail.jpg"), b"data").unwrap();
+
+        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+
+        assert_eq!(
+            scan.files.len(),
+            1,
+            "only the real photo should be found; got {:?}",
+            scan.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(scan.files[0].path.ends_with("real.jpg"));
+        assert_eq!(
+            scan.skipped, 0,
+            "an excluded directory is not an unreadable one, and must not inflate the \
+             count that tells the operator something could not be looked at"
+        );
+    }
+
+    /// The exclusion is by name at any depth, not by one precomputed path: a
+    /// library organised in place can carry `.mmm/` well below the roots given
+    /// on the command line.
+    #[test]
+    fn test_scan_skips_a_nested_metadata_directory() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("2024").join("holiday");
+        fs::create_dir_all(nested.join(".mmm").join("journal")).unwrap();
+        fs::write(nested.join("beach.jpg"), b"data").unwrap();
+        fs::write(nested.join(".mmm").join("journal").join("stale.png"), b"x").unwrap();
+
+        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+
+        assert_eq!(scan.files.len(), 1);
+        assert!(scan.files[0].path.ends_with("beach.jpg"));
+    }
+
+    /// Naming `.mmm` on the command line is a deliberate act. The exclusion
+    /// stops the walk *wandering* into metadata, and must not overrule an
+    /// operator who pointed at it on purpose.
+    #[test]
+    fn test_an_explicitly_named_metadata_directory_is_still_scanned() {
+        let tmp = TempDir::new().unwrap();
+        let meta = tmp.path().join(".mmm");
+        fs::create_dir(&meta).unwrap();
+        fs::write(meta.join("recovered.jpg"), b"data").unwrap();
+
+        let scan = scan_directories(&[meta]);
+        assert_eq!(scan.files.len(), 1);
     }
 
     /// One directory the walk cannot descend into must cost that directory

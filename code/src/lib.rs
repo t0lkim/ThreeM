@@ -4,6 +4,16 @@
 //! crate. Everything the CLI does lives here so integration tests under
 //! `tests/` can drive the same code paths the binary does.
 
+/// The directory `mmm` keeps its own metadata in, at the root of an output
+/// tree: run journals today, anything else the tool needs to remember later.
+///
+/// It lives here rather than in [`config`] or [`journal`] because two modules
+/// need to agree on it for opposite reasons — [`config`] writes into it, and
+/// [`scanner`] must refuse to look inside it. A tool that organised its own
+/// journal into a dated photo directory would eat the record of what it had
+/// just done.
+pub const METADATA_DIR_NAME: &str = ".mmm";
+
 pub mod config;
 pub mod error;
 pub mod geocoder;
