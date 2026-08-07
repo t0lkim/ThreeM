@@ -250,6 +250,77 @@ enum LinkStep {
     UnlinkSource,
 }
 
+/// What a failed `link(2)` says about the two paths.
+///
+/// The whole point of the split is that "the move failed" is not a reason to
+/// copy. Only one condition means "these paths cannot be linked, so the bytes
+/// have to travel"; everything else is a real problem the operator needs told
+/// about, and answering it with a full read-and-rewrite of the file both wastes
+/// the work and buries the actual cause under a temp-file error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkFailure {
+    /// `EEXIST` — something occupies `dst`. Not fatal: try the next candidate.
+    DestinationTaken,
+    /// `EXDEV` — source and destination live on different volumes. The only
+    /// condition that has ever justified the copy path.
+    DifferentVolume,
+    /// The destination filesystem has no hard links at all — exFAT and FAT32,
+    /// which is what most SD cards and external drives are formatted as. Same
+    /// volume, but `link` can never succeed here, so the copy path is the only
+    /// route and it is a legitimate one.
+    LinksUnsupported,
+    /// Anything else: a missing source, a denied write, a read-only mount, a
+    /// full disk. The move must fail and say so.
+    Fatal,
+}
+
+/// Errno values consulted directly because [`io::ErrorKind`] cannot tell the
+/// cases apart.
+///
+/// `EPERM` and `EACCES` both arrive as `PermissionDenied`, and the distinction
+/// between them is the whole question here: `link` answers `EPERM` when the
+/// filesystem has no hard links to give, and `EACCES` when the caller may not
+/// write to the directory. One is a copy, the other is a hard stop. `ENOTSUP`
+/// has no mapping at all and arrives as `Uncategorized`.
+///
+/// `EXDEV` is deliberately absent — `ErrorKind::CrossesDevices` is stable and
+/// std maps the errno to it, so a raw check would be a second spelling of the
+/// same test.
+#[cfg(unix)]
+mod errno {
+    /// "Operation not permitted": from `link(2)`, the filesystem has no hard
+    /// links. Distinct from `EACCES`, which is a permission denial.
+    pub const EPERM: i32 = 1;
+
+    /// `ENOTSUP` / `EOPNOTSUPP`, which some filesystems return in place of
+    /// `EPERM` for an unsupported `link`. macOS numbers the two separately;
+    /// Linux defines them as the same value.
+    #[cfg(target_os = "macos")]
+    pub const NOT_SUPPORTED: &[i32] = &[45, 102];
+    #[cfg(not(target_os = "macos"))]
+    pub const NOT_SUPPORTED: &[i32] = &[95];
+}
+
+/// Classify a failed `link(2)` into the one question the caller has to answer:
+/// try another name, copy the bytes, or stop.
+fn classify_link_failure(err: &io::Error) -> LinkFailure {
+    match err.kind() {
+        io::ErrorKind::AlreadyExists => return LinkFailure::DestinationTaken,
+        io::ErrorKind::CrossesDevices => return LinkFailure::DifferentVolume,
+        io::ErrorKind::Unsupported => return LinkFailure::LinksUnsupported,
+        _ => {}
+    }
+
+    #[cfg(unix)]
+    if let Some(raw) = err.raw_os_error() {
+        if raw == errno::EPERM || errno::NOT_SUPPORTED.contains(&raw) {
+            return LinkFailure::LinksUnsupported;
+        }
+    }
+
+    LinkFailure::Fatal
+}
+
 /// `link(src, dst)` then `unlink(src)` — a same-volume move that cannot
 /// overwrite `dst`.
 ///
@@ -287,16 +358,32 @@ fn move_no_clobber(src: &Path, dst: &Path) -> Result<MoveKind, MoveError> {
     match link_and_unlink(src, dst) {
         Ok(()) => Ok(MoveKind::Renamed),
 
-        Err((LinkStep::Link, e)) if e.kind() == io::ErrorKind::AlreadyExists => {
-            Err(MoveError::DestinationExists(dst.to_path_buf()))
-        }
+        Err((LinkStep::Link, e)) => {
+            let failure = classify_link_failure(&e);
+            match failure {
+                LinkFailure::DestinationTaken => {
+                    Err(MoveError::DestinationExists(dst.to_path_buf()))
+                }
 
-        // Any other link failure still falls through to the copy path, which
-        // is the misclassification task 3 of Phase 02 narrows to `EXDEV`
-        // alone. Note also that a filesystem without hard links (exFAT, FAT32)
-        // lands here and then fails again in the promotion below — safely, with
-        // the source intact, but it fails. That gap belongs to task 3 too.
-        Err((LinkStep::Link, _)) => cross_volume_move(src, dst).map(|()| MoveKind::CrossVolume),
+                LinkFailure::DifferentVolume | LinkFailure::LinksUnsupported => {
+                    debug!(
+                        src = %src.display(),
+                        dst = %dst.display(),
+                        reason = ?failure,
+                        "link is impossible between these paths, copying instead"
+                    );
+                    cross_volume_move(src, dst).map(|()| MoveKind::CrossVolume)
+                }
+
+                LinkFailure::Fatal => {
+                    Err(MoveError::Fatal(anyhow::Error::new(e).context(format!(
+                        "moving {} to {}",
+                        src.display(),
+                        dst.display()
+                    ))))
+                }
+            }
+        }
 
         Err((LinkStep::UnlinkSource, e)) => {
             Err(MoveError::Fatal(anyhow::Error::new(e).context(format!(
@@ -361,6 +448,80 @@ pub fn execute_move(planned: &PlannedMove) -> Result<MoveKind> {
     )
 }
 
+/// Claim `dst` with `O_CREAT | O_EXCL`, then rename `temp` over the placeholder
+/// we ourselves just created.
+///
+/// The fallback for filesystems with no hard links. `create_new` is the same
+/// question `link` answers with `EEXIST` — "is this name free?" — asked in a
+/// way exFAT and FAT32 can answer, and it is atomic against another writer
+/// claiming the name first. It also refuses a dangling symlink, because
+/// `O_CREAT | O_EXCL` fails `EEXIST` on a symlink whether or not its target
+/// exists, which is the behaviour that made `Path::exists()` unfit.
+///
+/// The `rename` here is the one overwrite in this module, and the thing it
+/// overwrites is the empty placeholder we hold.
+fn reserve_and_rename(temp: &Path, dst: &Path) -> Result<(), MoveError> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(MoveError::DestinationExists(dst.to_path_buf()))
+        }
+        Err(e) => {
+            return Err(MoveError::Fatal(
+                anyhow::Error::new(e).context(format!("claiming destination {}", dst.display())),
+            ))
+        }
+    }
+
+    fs::rename(temp, dst).map_err(|e| {
+        // Drop our placeholder — leaving an empty file where a photo was meant
+        // to go is worse than leaving nothing.
+        let _ = fs::remove_file(dst);
+        MoveError::Fatal(anyhow::Error::new(e).context(format!(
+            "renaming the verified copy {} into place at {}",
+            temp.display(),
+            dst.display()
+        )))
+    })
+}
+
+/// Move the verified temp file onto `dst`, failing rather than overwriting.
+fn promote_into_place(temp: &Path, dst: &Path) -> Result<(), MoveError> {
+    match link_and_unlink(temp, dst) {
+        Ok(()) => Ok(()),
+
+        Err((LinkStep::Link, e)) => match classify_link_failure(&e) {
+            LinkFailure::DestinationTaken => Err(MoveError::DestinationExists(dst.to_path_buf())),
+
+            LinkFailure::LinksUnsupported => reserve_and_rename(temp, dst),
+
+            // The temp file was written into the destination's own directory,
+            // so `EXDEV` here would mean the two are on different volumes while
+            // sharing a parent. Treat it as the anomaly it is rather than
+            // papering over it with another copy.
+            LinkFailure::DifferentVolume | LinkFailure::Fatal => {
+                Err(MoveError::Fatal(anyhow::Error::new(e).context(format!(
+                    "promoting the verified copy {} into place at {}",
+                    temp.display(),
+                    dst.display()
+                ))))
+            }
+        },
+
+        Err((LinkStep::UnlinkSource, e)) => {
+            Err(MoveError::Fatal(anyhow::Error::new(e).context(format!(
+                "removing the temp file {} after promoting it to {}",
+                temp.display(),
+                dst.display()
+            ))))
+        }
+    }
+}
+
 /// Safe cross-volume move: copy → verify → delete source
 fn cross_volume_move(src: &Path, dst: &Path) -> Result<(), MoveError> {
     let dst_dir = dst.parent().context("destination has no parent")?;
@@ -369,7 +530,14 @@ fn cross_volume_move(src: &Path, dst: &Path) -> Result<(), MoveError> {
     let temp_name = format!(".tmp-{}", chrono::Utc::now().timestamp_millis());
     let temp_path = dst_dir.join(temp_name);
 
-    fs::copy(src, &temp_path).with_context(|| format!("copying {} to temp file", src.display()))?;
+    fs::copy(src, &temp_path).with_context(|| {
+        format!(
+            "copying {} to {} via temp file {}",
+            src.display(),
+            dst.display(),
+            temp_path.display()
+        )
+    })?;
 
     // Verify the copy by comparing sizes
     let src_size = fs::metadata(src)
@@ -393,22 +561,19 @@ fn cross_volume_move(src: &Path, dst: &Path) -> Result<(), MoveError> {
     // Promote the temp file into place. Same directory, therefore same volume,
     // so this is the link path — and it refuses an occupied destination for
     // the same reason the first attempt did.
-    match link_and_unlink(&temp_path, dst) {
-        Ok(()) => {}
-        Err((LinkStep::Link, e)) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&temp_path);
-            return Err(MoveError::DestinationExists(dst.to_path_buf()));
-        }
-        Err((_, e)) => {
-            let _ = fs::remove_file(&temp_path);
-            return Err(MoveError::Fatal(
-                anyhow::Error::new(e).context(format!("promoting temp file to {}", dst.display())),
-            ));
-        }
+    if let Err(e) = promote_into_place(&temp_path, dst) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(e);
     }
 
     // Only now delete the source
-    fs::remove_file(src).with_context(|| format!("removing source file {}", src.display()))?;
+    fs::remove_file(src).with_context(|| {
+        format!(
+            "removing source file {} after copying it to {}",
+            src.display(),
+            dst.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -618,6 +783,295 @@ mod tests {
             dst.display()
         );
         assert_eq!(fs::read(&src).unwrap(), b"MOVED");
+    }
+
+    /// The copy path still moves the bytes and still drops the source last.
+    ///
+    /// Driven directly rather than through a second mounted volume, which no
+    /// test runner can be assumed to have. What it covers is the sequencing
+    /// this task rearranged — copy, promote, *then* remove the source — not the
+    /// content verification, which task 4 of the phase replaces.
+    #[test]
+    fn test_cross_volume_move_copies_then_removes_the_source() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("input/holiday.jpg");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        let dst = tmp.path().join("output/photo.jpg");
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&src, b"COPY ME").unwrap();
+
+        cross_volume_move(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"COPY ME");
+        assert!(
+            !src.exists(),
+            "the source must be gone once the copy landed"
+        );
+    }
+
+    /// An occupied destination stops the copy path too, and takes its temp
+    /// file with it — the caller retries under the next candidate name, and a
+    /// run must not leave `.tmp-*` litter behind in the output tree.
+    #[test]
+    fn test_cross_volume_move_refuses_an_occupied_destination() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("input/holiday.jpg");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        let dst_dir = tmp.path().join("output");
+        fs::create_dir_all(&dst_dir).unwrap();
+        let dst = dst_dir.join("photo.jpg");
+        fs::write(&src, b"COPY ME").unwrap();
+        fs::write(&dst, b"PRE-EXISTING").unwrap();
+
+        let err = cross_volume_move(&src, &dst).expect_err("an occupied destination must refuse");
+
+        assert!(
+            matches!(err, MoveError::DestinationExists(ref p) if p == &dst),
+            "got {err:?}"
+        );
+        assert_eq!(fs::read(&dst).unwrap(), b"PRE-EXISTING");
+        assert_eq!(fs::read(&src).unwrap(), b"COPY ME");
+
+        let leftovers: Vec<String> = fs::read_dir(&dst_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the temp file should have been cleaned up; found {leftovers:?}"
+        );
+    }
+
+    /// The classification table, stated as errnos.
+    ///
+    /// This is the whole of the defect in one assertion: `EACCES` and `ENOENT`
+    /// are `Fatal`, not "must be a different volume, copy it". `EPERM` sits
+    /// next to `EACCES` in the same `ErrorKind` and goes the other way, which
+    /// is why the raw errno is consulted at all.
+    #[cfg(unix)]
+    #[test]
+    fn test_classify_link_failure_routes_each_errno() {
+        const EEXIST: i32 = 17;
+        const ENOENT: i32 = 2;
+        const EACCES: i32 = 13;
+        const EXDEV: i32 = 18;
+        const EROFS: i32 = 30;
+        const ENOSPC: i32 = 28;
+
+        let cases: &[(i32, LinkFailure, &str)] = &[
+            (
+                EEXIST,
+                LinkFailure::DestinationTaken,
+                "occupied destination",
+            ),
+            (EXDEV, LinkFailure::DifferentVolume, "different volumes"),
+            (
+                errno::EPERM,
+                LinkFailure::LinksUnsupported,
+                "filesystem without hard links",
+            ),
+            (EACCES, LinkFailure::Fatal, "permission denied"),
+            (ENOENT, LinkFailure::Fatal, "missing source"),
+            (EROFS, LinkFailure::Fatal, "read-only filesystem"),
+            (ENOSPC, LinkFailure::Fatal, "full disk"),
+        ];
+
+        for &(raw, expected, what) in cases {
+            let err = io::Error::from_raw_os_error(raw);
+            assert_eq!(
+                classify_link_failure(&err),
+                expected,
+                "errno {raw} ({what}, kind {:?}) must classify as {expected:?}",
+                err.kind()
+            );
+        }
+
+        for &raw in errno::NOT_SUPPORTED {
+            let err = io::Error::from_raw_os_error(raw);
+            assert_eq!(
+                classify_link_failure(&err),
+                LinkFailure::LinksUnsupported,
+                "errno {raw} (link unsupported) must classify as LinksUnsupported"
+            );
+        }
+    }
+
+    /// The two kinds that carry no errno — as they arrive from a non-unix
+    /// target, or from any code constructing an error by kind.
+    #[test]
+    fn test_classify_link_failure_reads_the_kind_without_an_errno() {
+        assert_eq!(
+            classify_link_failure(&io::Error::from(io::ErrorKind::AlreadyExists)),
+            LinkFailure::DestinationTaken
+        );
+        assert_eq!(
+            classify_link_failure(&io::Error::from(io::ErrorKind::CrossesDevices)),
+            LinkFailure::DifferentVolume
+        );
+        assert_eq!(
+            classify_link_failure(&io::Error::from(io::ErrorKind::Unsupported)),
+            LinkFailure::LinksUnsupported
+        );
+        assert_eq!(
+            classify_link_failure(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            LinkFailure::Fatal,
+            "an errno-less permission denial must still be fatal"
+        );
+    }
+
+    /// The link-less promotion fallback: it moves the file, and it refuses an
+    /// occupied name rather than overwriting it.
+    #[test]
+    fn test_reserve_and_rename_moves_into_a_free_name() {
+        let tmp = TempDir::new().unwrap();
+        let temp_file = tmp.path().join(".tmp-1234");
+        let dst = tmp.path().join("photo.jpg");
+        fs::write(&temp_file, b"COPIED").unwrap();
+
+        reserve_and_rename(&temp_file, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"COPIED");
+        assert!(!temp_file.exists(), "the temp file should be gone");
+    }
+
+    #[test]
+    fn test_reserve_and_rename_refuses_an_occupied_destination() {
+        let tmp = TempDir::new().unwrap();
+        let temp_file = tmp.path().join(".tmp-1234");
+        let dst = tmp.path().join("photo.jpg");
+        fs::write(&temp_file, b"COPIED").unwrap();
+        fs::write(&dst, b"PRE-EXISTING").unwrap();
+
+        let err = reserve_and_rename(&temp_file, &dst).expect_err("an occupied name must refuse");
+
+        assert!(
+            matches!(err, MoveError::DestinationExists(ref p) if p == &dst),
+            "got {err:?}"
+        );
+        assert_eq!(fs::read(&dst).unwrap(), b"PRE-EXISTING");
+        assert_eq!(fs::read(&temp_file).unwrap(), b"COPIED");
+    }
+
+    /// `O_CREAT | O_EXCL` fails `EEXIST` on a symlink whether or not its
+    /// target exists — the same question `link(2)` answers, and the one
+    /// `Path::exists()` gets wrong.
+    #[cfg(unix)]
+    #[test]
+    fn test_reserve_and_rename_refuses_a_dangling_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let temp_file = tmp.path().join(".tmp-1234");
+        let dst = tmp.path().join("photo.jpg");
+        fs::write(&temp_file, b"COPIED").unwrap();
+        std::os::unix::fs::symlink("./nothing-here.jpg", &dst).unwrap();
+
+        let err =
+            reserve_and_rename(&temp_file, &dst).expect_err("a dangling symlink occupies the name");
+
+        assert!(
+            matches!(err, MoveError::DestinationExists(_)),
+            "got {err:?}"
+        );
+        assert!(fs::symlink_metadata(&dst).unwrap().is_symlink());
+    }
+
+    /// A destination directory that cannot be written must fail as the
+    /// permission problem it is — naming both paths — without a copy ever
+    /// being attempted.
+    ///
+    /// The copy path is not a fallback for "the move failed"; it is the answer
+    /// to exactly one question, "are these two paths on different volumes". A
+    /// permission denial answered with a copy attempt wastes a full read and
+    /// write of the file and then reports a temp file the operator never asked
+    /// about, which is the wrong error about the wrong thing.
+    ///
+    /// Skips itself with a printed reason where permission bits do not deny
+    /// writes (running as root, as some CI containers do).
+    #[cfg(unix)]
+    #[test]
+    fn test_a_read_only_destination_fails_without_attempting_a_copy() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("holiday.jpg");
+        let dst_dir = tmp.path().join("output");
+        fs::create_dir_all(&dst_dir).unwrap();
+        let dst = dst_dir.join("photo.jpg");
+        fs::write(&src, b"MOVED").unwrap();
+
+        let original = fs::metadata(&dst_dir).unwrap().permissions().mode();
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = execute_move(&plan(&src, &dst));
+        let writes_denied = fs::write(dst_dir.join(".probe"), b"p").is_err();
+        let leftovers: Vec<String> = fs::read_dir(&dst_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        // Restore before asserting, or `TempDir` cannot clean up after a panic.
+        fs::set_permissions(&dst_dir, fs::Permissions::from_mode(original)).unwrap();
+
+        if !writes_denied {
+            eprintln!(
+                "SKIPPED test_a_read_only_destination_fails_without_attempting_a_copy: writes to \
+                 a 0o555 directory succeeded, so this process ignores permission bits (running as \
+                 root?)"
+            );
+            return;
+        }
+
+        let err = outcome.expect_err("moving into an unwritable directory must not report success");
+        let chain = format!("{err:#}");
+
+        assert!(
+            chain.contains(&src.display().to_string())
+                && chain.contains(&dst.display().to_string()),
+            "the error must name both source and destination; got: {chain}"
+        );
+        assert!(
+            chain.contains("Permission denied"),
+            "a permission denial must surface as one; got: {chain}"
+        );
+        assert!(
+            !chain.contains("temp"),
+            "a permission denial must not be answered with a copy attempt; got: {chain}"
+        );
+        assert!(
+            leftovers.is_empty(),
+            "no temp file should have been written into the destination; found {leftovers:?}"
+        );
+        assert_eq!(fs::read(&src).unwrap(), b"MOVED", "the source must survive");
+    }
+
+    /// A source that has gone away between planning and execution must fail as
+    /// a missing-source error naming both paths, not as a failed copy.
+    #[test]
+    fn test_a_missing_source_fails_naming_both_paths() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("gone.jpg");
+        let dst = tmp.path().join("output/photo.jpg");
+
+        let err = execute_move(&plan(&src, &dst))
+            .expect_err("moving a source that does not exist must not report success");
+        let chain = format!("{err:#}");
+
+        assert!(
+            chain.contains(&src.display().to_string())
+                && chain.contains(&dst.display().to_string()),
+            "the error must name both source and destination; got: {chain}"
+        );
+        assert!(
+            !chain.contains("temp"),
+            "a missing source must not be answered with a copy attempt; got: {chain}"
+        );
+        assert!(
+            !dst.exists(),
+            "nothing should have been created at {}",
+            dst.display()
+        );
     }
 
     #[test]

@@ -36,11 +36,18 @@
 //! decide which one is free. Both no-clobber tests below pass on merit rather
 //! than on ordering luck.
 //!
-//! Defects 2, 3 and 4 are still live, and the two tests that fail are the
-//! ones that describe them. The honest per-test record is in
+//! Defects 2 and 4 are fixed as of task 3: a failed `link` is classified
+//! before it is acted on, and only `EXDEV` — or a destination filesystem with
+//! no hard links at all — reaches the copy path. Everything else propagates
+//! with both paths named, so the missing-source test now passes because the
+//! error is deliberate rather than because a doomed copy happened to fail the
+//! same way.
+//!
+//! Defect 3 is still live, and the one test that fails is the one that
+//! describes it. The honest per-test record is in
 //! `.maestro/playbooks/Initiation/Phase-02-Destructive-Path-Hardening.md`;
-//! CI stays red until tasks 3 and 4 land, which is the intended test-first
-//! posture of this phase.
+//! CI stays red until task 4 lands, which is the intended test-first posture
+//! of this phase.
 
 #![allow(
     clippy::unwrap_used,
@@ -231,6 +238,12 @@ fn a_dangling_symlink_at_the_destination_is_never_clobbered() {
 ///
 /// Plans are built during the scan and executed much later, so this is a real
 /// window in a long run over a large library, not a contrived one.
+///
+/// This passed before task 3 by accident: the rename failed `ENOENT`,
+/// `execute_move` read that as "different volume", and the copy failed for the
+/// same reason — the right outcome reached by the wrong route, and the error
+/// named a temp file rather than the missing photo. It now fails as a
+/// `NotFound` naming both paths, with no copy attempted.
 #[test]
 fn a_source_deleted_after_planning_returns_an_error() {
     let tmp = TempDir::new().unwrap();
@@ -266,11 +279,12 @@ fn a_source_deleted_after_planning_returns_an_error() {
 /// A move into a directory that cannot be written must fail with an error
 /// naming the destination, and must leave the source exactly where it was.
 ///
-/// Today the rename fails with `PermissionDenied`, `execute_move` reads that
-/// as "different volume", and the copy attempt fails for the same reason —
-/// so the operator is handed an error about a temp file they never asked for,
-/// naming only the source. The destination, which is the thing that is
-/// actually wrong, never appears.
+/// Before task 3 the link failed with `PermissionDenied`, `execute_move` read
+/// that as "different volume", and the copy attempt failed for the same reason
+/// — so the operator was handed an error about a temp file they never asked
+/// for, naming only the source. The destination, which is the thing that is
+/// actually wrong, never appeared. `EACCES` is now classified as fatal and the
+/// error names both paths.
 #[cfg(unix)]
 #[test]
 fn a_read_only_destination_errors_naming_the_destination_and_leaves_the_source() {
