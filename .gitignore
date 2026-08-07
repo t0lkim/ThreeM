@@ -1,2 +1,7 @@
 TIMECONFIG.json
 .DS_Store
+
+# Internal diagrams — not for public distribution
+diagrams/
+specs/
+SPECS/
