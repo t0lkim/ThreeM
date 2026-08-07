@@ -598,6 +598,112 @@ pub fn execute_move(planned: &PlannedMove) -> Result<MoveOutcome> {
     )
 }
 
+/// What the chunked move phase did.
+///
+/// Returned rather than acted upon, because the caller owes the operator a
+/// summary and a summary is only worth printing if it is complete. Every file
+/// handed to [`process_moves`] is accounted for in exactly one of these three
+/// counts: `moved + errors + unprocessed == planned.len()`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MoveRun {
+    /// Files that reached the output tree.
+    pub moved: usize,
+    /// Files whose move failed. Counted, logged, and stepped over.
+    pub errors: usize,
+    /// Files never attempted, because the operator stopped the run.
+    pub unprocessed: usize,
+    /// Whether the run ended at a chunk boundary rather than at the end.
+    pub stopped_early: bool,
+}
+
+/// How the caller observes and steers a chunked run.
+///
+/// The three concerns the old inline loop mixed together — progress display,
+/// asking the operator, and deciding whether to carry on — are the three
+/// methods here, and all of them belong to the *caller*. The library moves
+/// files; it does not own a terminal, and it must not end a process.
+///
+/// Every method has a default, so a caller that wants none of it (a test, a
+/// future non-interactive mode) implements the trait and writes nothing.
+pub trait ChunkController {
+    /// A chunk is about to be processed. `chunk_number` is 1-based.
+    fn chunk_started(&mut self, chunk_number: usize, chunks: usize) {
+        let _ = (chunk_number, chunks);
+    }
+
+    /// One file has been dealt with, successfully or not.
+    fn file_finished(&mut self) {}
+
+    /// Carry on to the next chunk? Asked only when files remain, so the last
+    /// chunk never prompts — there is nothing left to consent to.
+    fn should_continue(&mut self, chunk_number: usize, remaining: usize) -> bool {
+        let _ = (chunk_number, remaining);
+        true
+    }
+}
+
+/// Execute `planned` in chunks, stopping cleanly when the controller declines.
+///
+/// This is the whole of phase B, extracted so that stopping is a `break` with a
+/// value the summary can consume rather than a `std::process::exit(0)` fired
+/// from inside a progress-bar closure. That exit skipped the summary, skipped
+/// every destructor between it and `main`, and made the honest question — "what
+/// did the run manage before I stopped it?" — answerable only by inspecting the
+/// tree afterwards.
+///
+/// Infallible by signature: a failed move is counted and the next file is
+/// attempted, exactly as the scanner and the hashing passes treat an unreadable
+/// file. One photo that cannot move is not a reason to abandon the rest.
+pub fn process_moves(
+    planned: &[PlannedMove],
+    chunk_size: usize,
+    controller: &mut impl ChunkController,
+) -> MoveRun {
+    let total = planned.len();
+    // `slice::chunks` panics on a zero size, and `--chunk-size 0` is one
+    // keystroke away on the command line. Read as "do not chunk": one chunk
+    // holding everything, so the operator who asked for no chunking is not
+    // then prompted once per file.
+    let chunk_size = if chunk_size == 0 {
+        total.max(1)
+    } else {
+        chunk_size
+    };
+    let chunks: Vec<&[PlannedMove]> = planned.chunks(chunk_size).collect();
+    let chunk_count = chunks.len();
+
+    let mut run = MoveRun::default();
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        controller.chunk_started(i + 1, chunk_count);
+
+        for planned in *chunk {
+            match execute_move(planned) {
+                Ok(_) => run.moved += 1,
+                Err(e) => {
+                    error!(
+                        src = %planned.source.display(),
+                        dst = %planned.destination.display(),
+                        error = %format!("{e:#}"),
+                        "move failed"
+                    );
+                    run.errors += 1;
+                }
+            }
+            controller.file_finished();
+        }
+
+        let remaining = total - (run.moved + run.errors);
+        if remaining > 0 && !controller.should_continue(i + 1, remaining) {
+            run.stopped_early = true;
+            run.unprocessed = remaining;
+            break;
+        }
+    }
+
+    run
+}
+
 /// Claim `dst` with `O_CREAT | O_EXCL`, then rename `temp` over the placeholder
 /// we ourselves just created.
 ///
@@ -1614,6 +1720,160 @@ mod tests {
             )),
             "got: {text}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Chunked processing and the early stop
+    // -----------------------------------------------------------------
+
+    /// A controller that answers a fixed script and records what it was asked.
+    struct ScriptedController {
+        /// `should_continue` returns `answers[n]` for the nth question, and
+        /// `true` once the script runs out.
+        answers: Vec<bool>,
+        asked: Vec<(usize, usize)>,
+        chunks_started: Vec<(usize, usize)>,
+        files_finished: usize,
+    }
+
+    impl ScriptedController {
+        fn new(answers: &[bool]) -> Self {
+            Self {
+                answers: answers.to_vec(),
+                asked: Vec::new(),
+                chunks_started: Vec::new(),
+                files_finished: 0,
+            }
+        }
+    }
+
+    impl ChunkController for ScriptedController {
+        fn chunk_started(&mut self, chunk_number: usize, chunks: usize) {
+            self.chunks_started.push((chunk_number, chunks));
+        }
+
+        fn file_finished(&mut self) {
+            self.files_finished += 1;
+        }
+
+        fn should_continue(&mut self, chunk_number: usize, remaining: usize) -> bool {
+            self.asked.push((chunk_number, remaining));
+            self.answers
+                .get(self.asked.len() - 1)
+                .copied()
+                .unwrap_or(true)
+        }
+    }
+
+    /// Four sources in `input/`, planned into `output/`, in a stable order.
+    fn four_planned_moves(tmp: &Path) -> Vec<PlannedMove> {
+        let input = tmp.join("input");
+        let output = tmp.join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+
+        (0..4)
+            .map(|i| {
+                let src = input.join(format!("photo-{i}.jpg"));
+                fs::write(&src, format!("BODY {i}").as_bytes()).unwrap();
+                plan(&src, &output.join(format!("photo-{i}.jpg")))
+            })
+            .collect()
+    }
+
+    /// Declining at the first prompt stops the run and reports what was left,
+    /// rather than taking the process down with it.
+    #[test]
+    fn test_declining_at_a_chunk_boundary_stops_and_reports_the_remainder() {
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+        let mut controller = ScriptedController::new(&[false]);
+
+        let run = process_moves(&planned, 2, &mut controller);
+
+        assert_eq!(
+            (run.moved, run.errors, run.unprocessed, run.stopped_early),
+            (2, 0, 2, true),
+            "the first chunk should have moved and the second been left alone"
+        );
+
+        // The count is only as good as the files behind it.
+        for planned in &planned[..2] {
+            assert!(
+                !planned.source.exists(),
+                "the first chunk should have moved"
+            );
+            assert!(planned.destination.exists());
+        }
+        for planned in &planned[2..] {
+            assert!(
+                planned.source.exists(),
+                "a file the operator stopped before must still be where they left it"
+            );
+            assert!(!planned.destination.exists());
+        }
+
+        assert_eq!(controller.asked, vec![(1, 2)], "asked once, after chunk 1");
+        assert_eq!(controller.files_finished, 2);
+    }
+
+    /// Continuing through every chunk processes everything and asks nothing
+    /// after the last one — there is nothing left to consent to.
+    #[test]
+    fn test_continuing_processes_every_chunk_and_never_prompts_at_the_end() {
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+        let mut controller = ScriptedController::new(&[true, true, true]);
+
+        let run = process_moves(&planned, 2, &mut controller);
+
+        assert_eq!(
+            (run.moved, run.errors, run.unprocessed, run.stopped_early),
+            (4, 0, 0, false)
+        );
+        assert_eq!(
+            controller.asked,
+            vec![(1, 2)],
+            "the final chunk leaves nothing remaining, so it must not prompt"
+        );
+        assert_eq!(controller.chunks_started, vec![(1, 2), (2, 2)]);
+        assert_eq!(controller.files_finished, 4);
+    }
+
+    /// A single failed move is counted and the run carries on — the early stop
+    /// is the operator's decision, not a failure mode.
+    #[test]
+    fn test_a_failed_move_is_counted_without_stopping_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let mut planned = four_planned_moves(tmp.path());
+        fs::remove_file(&planned[1].source).unwrap();
+        let mut controller = ScriptedController::new(&[true, true, true]);
+
+        let run = process_moves(&planned, 2, &mut controller);
+
+        assert_eq!(
+            (run.moved, run.errors, run.unprocessed, run.stopped_early),
+            (3, 1, 0, false)
+        );
+        planned.remove(1);
+        for planned in &planned {
+            assert!(planned.destination.exists());
+        }
+    }
+
+    /// `--chunk-size 0` is reachable from the command line, and `chunks(0)`
+    /// panics. A crate that bans `unwrap` in the move path must not take the
+    /// process down over an argument value either.
+    #[test]
+    fn test_a_zero_chunk_size_processes_everything_instead_of_panicking() {
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+        let mut controller = ScriptedController::new(&[]);
+
+        let run = process_moves(&planned, 0, &mut controller);
+
+        assert_eq!((run.moved, run.errors, run.unprocessed), (4, 0, 0));
+        assert!(controller.asked.is_empty(), "one chunk asks nothing");
     }
 
     #[test]

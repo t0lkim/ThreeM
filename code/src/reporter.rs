@@ -117,6 +117,9 @@ pub struct RunSummary {
     /// Files excluded from duplicate detection because they could not be
     /// hashed — see [`crate::hasher::DedupResult`].
     pub hash_skipped: usize,
+    /// Files planned but never attempted, because the operator stopped the run
+    /// at a chunk prompt — see [`crate::organiser::MoveRun`].
+    pub unprocessed: usize,
     pub errors: usize,
 }
 
@@ -129,6 +132,9 @@ pub const SCAN_SKIPPED_LABEL: &str = "Unreadable (scan):";
 
 /// Label for files dropped from duplicate detection.
 pub const HASH_SKIPPED_LABEL: &str = "Unhashable (dedup):";
+
+/// Label for files the run never got to because it was stopped.
+pub const UNPROCESSED_LABEL: &str = "Not processed:";
 
 /// Print the final summary after processing.
 ///
@@ -162,6 +168,9 @@ pub fn print_summary(summary: &RunSummary) {
             "  {HASH_SKIPPED_LABEL:<LABEL_WIDTH$}{}",
             summary.hash_skipped
         );
+    }
+    if summary.unprocessed > 0 {
+        println!("  {UNPROCESSED_LABEL:<LABEL_WIDTH$}{}", summary.unprocessed);
     }
     if summary.errors > 0 {
         println!("  {:<LABEL_WIDTH$}{}", "Errors:", summary.errors);

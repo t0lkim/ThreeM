@@ -42,10 +42,10 @@ The system uses a **two-pass architecture**:
 | `hasher.rs` | Three-phase dedup cascade, BLAKE3 hashing, skip-and-count on unhashable files |
 | `metadata.rs` | EXIF extraction (images), container metadata (video), filesystem fallback |
 | `geocoder.rs` | Offline reverse geocoding via GeoNames k-d tree |
-| `organiser.rs` | Target path computation, atomic file moves, duplicate movement |
+| `organiser.rs` | Target path computation, atomic file moves, duplicate movement, chunked execution |
 | `reporter.rs` | Dry-run output, duplicate listing, summary reports, chunk prompts |
 | `error.rs` | Typed error definitions (thiserror) |
-| `main.rs` | Orchestration, progress bars, chunked execution loop |
+| `main.rs` | Orchestration, progress bars, terminal prompting via `ChunkController` |
 | `bin/dedup_verifier.rs` | Independent verification binary |
 
 ---
@@ -145,6 +145,26 @@ A photo library is a live filesystem. Files are locked, deleted and rewritten un
 ```
 
 That is the point of the counters: a summary that silently omitted files would be indistinguishable from a clean run over a library that was only partly processed. Each skipped entry also logs a `warn!` naming the path and the underlying error, which is visible at the default log level.
+
+---
+
+## Stopping a run part-way
+
+Phase B is `organiser::process_moves(planned, chunk_size, controller)`. It walks the planned moves in chunks and returns a `MoveRun`; every planned file is accounted for in exactly one of its three counts:
+
+```
+moved + errors + unprocessed == planned.len()
+```
+
+Interaction is inverted out of the library through the `ChunkController` trait, which has three methods and a default for each: `chunk_started`, `file_finished`, and `should_continue`. `main` implements it over the progress bar and the `[Y/n]` prompt; a test implements it with a fixed script. The library moves files — it does not own a terminal, and **it does not end the process**.
+
+Declining at a chunk boundary sets `stopped_early`, records the untouched remainder in `unprocessed`, and breaks the loop. The closing summary is then printed on the way out, gaining one line:
+
+```
+  Not processed:      412
+```
+
+Earlier versions called `std::process::exit(0)` from inside the progress bar's `suspend` closure. The process died where it stood: no summary, no destructors between that closure and `main`, and no answer to the only question an operator who has just stopped a run actually has — how much of it happened. `--chunk-size 0` is also read as "do not chunk" rather than passed to `slice::chunks`, which panics on a zero size.
 
 ---
 

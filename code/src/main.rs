@@ -7,6 +7,41 @@ use mmm::{hasher, organiser, reporter, scanner};
 
 use mmm::config::Config;
 use mmm::geocoder::GeoLookup;
+use mmm::organiser::ChunkController;
+
+/// Drives the chunked move phase from the terminal: the progress bar, and the
+/// operator's answer at each chunk boundary.
+///
+/// Everything interactive lives here rather than in the library. The library's
+/// job is to hand back what happened; deciding what that looks like on a
+/// terminal — and whether to ask at all — is `main`'s.
+struct CliController<'a> {
+    bar: &'a ProgressBar,
+    /// Whether to ask at chunk boundaries. `--no-prompt` answers yes silently.
+    prompt: bool,
+}
+
+impl ChunkController for CliController<'_> {
+    fn chunk_started(&mut self, chunk_number: usize, chunks: usize) {
+        self.bar
+            .set_message(format!("chunk {chunk_number}/{chunks}"));
+    }
+
+    fn file_finished(&mut self) {
+        self.bar.inc(1);
+    }
+
+    fn should_continue(&mut self, chunk_number: usize, remaining: usize) -> bool {
+        if !self.prompt {
+            return true;
+        }
+        // `suspend` clears the bar for the duration of the prompt; the answer
+        // travels back out as a value, which is the whole point — the old code
+        // exited the process from inside this closure.
+        self.bar
+            .suspend(|| reporter::prompt_continue(chunk_number, remaining))
+    }
+}
 
 fn main() -> Result<()> {
     let config = Config::parse();
@@ -124,6 +159,7 @@ fn main() -> Result<()> {
         duplicate_files: total_duplicate_files,
         scan_skipped,
         hash_skipped: dedup_result.skipped,
+        unprocessed: 0,
         errors: plan_errors,
     };
 
@@ -147,52 +183,39 @@ fn main() -> Result<()> {
 
     // === PHASE B: PROCESS (chunked) ===
     println!("\nOrganising files...");
-    let total = planned_moves.len();
-    let chunks: Vec<&[organiser::PlannedMove]> = planned_moves.chunks(config.chunk_size).collect();
-    let mut moved = 0;
-    let mut move_errors = 0;
 
-    let move_pb = ProgressBar::new(total as u64);
+    let move_pb = ProgressBar::new(planned_moves.len() as u64);
     move_pb.set_style(hasher::styled_bar(
         "[{elapsed_precise}] {bar:40.yellow/white} {pos}/{len} {msg}",
     ));
 
-    for (i, chunk) in chunks.iter().enumerate() {
-        move_pb.set_message(format!("chunk {}/{}", i + 1, chunks.len()));
+    let mut controller = CliController {
+        bar: &move_pb,
+        prompt: !config.no_prompt,
+    };
+    let run = organiser::process_moves(&planned_moves, config.chunk_size, &mut controller);
 
-        for planned in *chunk {
-            match organiser::execute_move(planned) {
-                Ok(_) => moved += 1,
-                Err(e) => {
-                    error!(
-                        src = %planned.source.display(),
-                        dst = %planned.destination.display(),
-                        error = %e,
-                        "move failed"
-                    );
-                    move_errors += 1;
-                }
-            }
-            move_pb.inc(1);
-        }
-
-        // Prompt to continue (unless last chunk, no-prompt mode, or only one chunk)
-        let remaining = total - (moved + move_errors);
-        if remaining > 0 && !config.no_prompt && chunks.len() > 1 {
-            move_pb.suspend(|| {
-                if !reporter::prompt_continue(i + 1, remaining) {
-                    println!("Stopped by user. {moved} files processed so far.");
-                    std::process::exit(0);
-                }
-            });
-        }
+    // A run the operator stopped did not complete, and the bar must not claim
+    // it did.
+    if run.stopped_early {
+        move_pb.abandon_with_message("stopped by user");
+        println!(
+            "\nStopped by user. {} file{} organised, {} left untouched.",
+            run.moved,
+            if run.moved == 1 { "" } else { "s" },
+            run.unprocessed
+        );
+    } else {
+        move_pb.finish_with_message("organisation complete");
     }
 
-    move_pb.finish_with_message("organisation complete");
-
+    // Printed on every path out of the move phase, including the early stop —
+    // the operator who just interrupted a run is precisely the one who needs
+    // to be told what it managed first.
     reporter::print_summary(&reporter::RunSummary {
-        organised: moved,
-        errors: plan_errors + move_errors + dup_errors,
+        organised: run.moved,
+        unprocessed: run.unprocessed,
+        errors: plan_errors + run.errors + dup_errors,
         ..summary
     });
 

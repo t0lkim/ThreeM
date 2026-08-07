@@ -147,7 +147,7 @@ The `[EXIF]`, `[FS]`, and `[NO DATE]` tags tell you where the date came from.
 - **Filename collisions are resolved.** If the target filename already exists, a numeric suffix (`-1`, `-2`, etc.) is appended.
 - **One unreadable file costs one file.** A directory that cannot be read, or a photo that cannot be opened, is skipped with a warning — the rest of the library is still organised. Nothing is skipped silently: the closing summary reports `Unreadable (scan):` and `Unhashable (dedup):` counts, and each skipped path is named in a warning.
 - **A file that cannot be read is never moved.** If its contents could not be established, it stays exactly where you put it.
-- **You can stop at any chunk.** Between chunks, the tool asks whether to continue. Answering `n` stops immediately; files already moved stay moved, nothing else is touched.
+- **You can stop at any chunk.** Between chunks, the tool asks whether to continue. Answering `n` stops before the next chunk; files already moved stay moved, nothing else is touched. The run then finishes properly — it prints the same closing summary a completed run does, with a `Not processed:` line counting the files it never got to, so you always know what a stopped run managed.
 
 ---
 

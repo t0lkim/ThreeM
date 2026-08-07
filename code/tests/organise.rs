@@ -41,7 +41,9 @@ use common::{file_contents_by_marker, naive, snapshot_tree, snapshot_tree_hashed
 use mmm::geocoder::GeoLookup;
 use mmm::metadata::{DateSource, FileMetadata};
 use mmm::organiser::build_target_path;
-use mmm::reporter::{COMMIT_BANNER, DRY_RUN_BANNER, HASH_SKIPPED_LABEL, SCAN_SKIPPED_LABEL};
+use mmm::reporter::{
+    COMMIT_BANNER, DRY_RUN_BANNER, HASH_SKIPPED_LABEL, SCAN_SKIPPED_LABEL, UNPROCESSED_LABEL,
+};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -58,6 +60,25 @@ fn run_preview(input: &Path) -> std::process::Output {
         .arg(input)
         .output()
         .expect("running mmm in preview mode")
+}
+
+/// Run `mmm --commit` one file per chunk, answering `replies` at the prompts.
+///
+/// Deliberately does *not* pass `--no-prompt`: the point is to reach the chunk
+/// boundary and decline there, which is the only way to observe what the run
+/// does when the operator stops it part-way through.
+fn run_commit_answering(input: &Path, output: &Path, replies: &str) -> std::process::Output {
+    Command::cargo_bin("mmm")
+        .unwrap()
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .arg("--commit")
+        .arg("--chunk-size")
+        .arg("1")
+        .write_stdin(replies.to_string())
+        .output()
+        .expect("running mmm in commit mode with a scripted prompt")
 }
 
 /// Run `mmm --commit` against `input`, organising into `output`.
@@ -530,6 +551,84 @@ fn a_directory_holding_only_non_media_is_treated_as_empty() {
         snapshot_tree_hashed(tree.path()),
         before,
         "a non-media-only input tree was modified"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stopping part-way through
+// ---------------------------------------------------------------------------
+
+/// Declining at the first chunk prompt must still produce a summary.
+///
+/// Before this, the prompt branch called `std::process::exit(0)` from inside a
+/// progress-bar `suspend` closure: the process died where it stood, so the run
+/// that had just moved files reported nothing about what it had done. The
+/// operator was left to work out from the tree itself which photos had already
+/// been relocated.
+#[test]
+fn stopping_at_a_chunk_prompt_still_prints_an_accurate_summary() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_with_exif("b.jpg", naive(2024, 2, 16, 15, 31, 0), None)
+        .jpeg_with_exif("c.jpg", naive(2024, 3, 17, 16, 32, 0), None);
+
+    let (_scratch, out_dir) = scratch_output();
+
+    // One file per chunk, and "no" at the first prompt.
+    let out = run_commit_answering(tree.path(), &out_dir, "n\n");
+    assert_ok(&out, "commit run stopped at the first chunk prompt");
+    let stdout = stdout_of(&out);
+
+    assert_eq!(
+        summary_figure(&stdout, "Files scanned:"),
+        Some(3),
+        "the summary must be printed even though the run was cut short\n{stdout}"
+    );
+    assert_eq!(
+        summary_figure(&stdout, "Files organised:"),
+        Some(1),
+        "exactly the first chunk should have been organised\n{stdout}"
+    );
+
+    assert_eq!(
+        summary_figure(&stdout, UNPROCESSED_LABEL),
+        Some(2),
+        "files the run never got to must be reported, not silently omitted\n{stdout}"
+    );
+
+    // What it says, against what it did.
+    let landed = file_contents_by_marker(&out_dir);
+    assert_eq!(
+        landed.len(),
+        1,
+        "exactly one file should have reached the output tree, got {landed:?}"
+    );
+    let remaining = snapshot_tree(tree.path());
+    assert_eq!(
+        remaining.len(),
+        2,
+        "the two files the operator stopped before must still be in the input tree, got {remaining:?}"
+    );
+}
+
+/// The counterpart: a run that finished must not invite the operator to look
+/// for files it left behind, because there are none.
+#[test]
+fn a_run_that_finishes_reports_nothing_unprocessed() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_with_exif("b.jpg", naive(2024, 2, 16, 15, 31, 0), None);
+
+    let (_scratch, out_dir) = scratch_output();
+    let out = run_commit(tree.path(), &out_dir);
+    assert_ok(&out, "commit run to completion");
+    let stdout = stdout_of(&out);
+
+    assert_eq!(summary_figure(&stdout, "Files organised:"), Some(2));
+    assert_eq!(
+        summary_figure(&stdout, UNPROCESSED_LABEL),
+        None,
+        "the line belongs only to a run that left something\n{stdout}"
     );
 }
 
