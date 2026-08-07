@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a1b2de66694675e9cedfc59f15d712f0ba39d02eb169263ca4e6338e62ee832d # shrinks to dt = 0000-01-01T00:00:00Z, ext = "jpg", gps = None
+cc d79ac5db76a6c33b517aa5daaac083034014604025ae73e0d37f8af786327cca # shrinks to dt = -0002-01-01T00:00:00Z, ext = "jpg", gps = None
+cc 8a8e801e221e6d631e25a80cec33a7016d9eed1c0cf5f7222186c5bf5e5f90f1 # shrinks to dt = 0000-01-01T00:00:00Z, raw = "/", gps = None
+cc 9b763af1c0b31abb93d079e5b1ef28e7d276c12d504ec39a23bbfb6f3c71222d # shrinks to dt = None, ext = "/", gps = None
+cc 2ef6991fc27209824974e18b27dfb5386119bed609814e67ed78865ac93b0d98 # shrinks to output = "/photos", dt = None, ext = "../..", gps = None

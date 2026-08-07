@@ -3,7 +3,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use nom_exif::{parse_exif, parse_metadata, EntryValue, Exif, ExifTag};
 use tracing::{debug, warn};
 
@@ -174,12 +174,31 @@ fn extract_filesystem_metadata(path: &Path) -> Result<FileMetadata> {
 }
 
 /// Convert an `EntryValue` to a `DateTime`<Utc>
+///
+/// A date whose year cannot be written in four digits is treated as no date at
+/// all, so the caller falls through to the filesystem timestamp. `chrono` will
+/// parse `-0044:03:15 10:00:00` out of an EXIF `DateTimeOriginal` without
+/// complaint, and a photograph is better filed under the date its file was
+/// written than under a year that is not a date. The alternative — letting it
+/// through for [`crate::organiser::build_target_path`] to route to `unsorted/` —
+/// is correct but lossy: everything in `unsorted/` is named `unknown.jpg` and
+/// the file's own name is gone.
 fn entry_to_datetime(value: &EntryValue) -> Option<DateTime<Utc>> {
-    match value {
+    let dt = match value {
         EntryValue::Time(dt) => Some(dt.with_timezone(&Utc)),
         EntryValue::Text(s) => parse_date_string(s),
         _ => None,
+    }?;
+
+    if !crate::naming::year_is_representable(dt.year()) {
+        warn!(
+            year = dt.year(),
+            "ignoring a metadata date whose year cannot be written in four digits"
+        );
+        return None;
     }
+
+    Some(dt)
 }
 
 /// Parse various date string formats
@@ -282,6 +301,39 @@ mod tests {
         let (lat, lon) = parse_iso6709("-33.8688+151.2093/").unwrap();
         assert!((lat - (-33.8688)).abs() < 0.001);
         assert!((lon - 151.2093).abs() < 0.001);
+    }
+
+    /// `chrono` accepts these; the naming scheme cannot spell them.
+    ///
+    /// A year outside four digits has to be rejected *here* rather than left to
+    /// the organiser, because `extract_metadata` only falls back to the
+    /// filesystem timestamp when the EXIF date is `None`. Letting a year-44 date
+    /// through means the file reaches `unsorted/` as `unknown.jpg` with its own
+    /// name discarded, when a perfectly good filesystem date was available.
+    #[test]
+    fn test_an_unspellable_year_is_treated_as_no_date() {
+        for s in ["-0044:03:15 10:00:00", "-0001-01-01T00:00:00"] {
+            let value = EntryValue::Text(s.to_string());
+            assert!(
+                entry_to_datetime(&value).is_none(),
+                "{s} parses to a year that cannot be written in four digits, \
+                 so it must not be offered as a date"
+            );
+        }
+    }
+
+    /// The other side of that line — the ones it must keep. Year 0 and year 44
+    /// are a flat camera battery, not a missing date, and `0000/01/01` says so
+    /// where `unsorted/unknown.jpg` would not.
+    #[test]
+    fn test_a_low_but_spellable_year_is_kept() {
+        for s in ["0000:01:01 00:00:00", "0044:03:15 10:00:00"] {
+            let value = EntryValue::Text(s.to_string());
+            assert!(
+                entry_to_datetime(&value).is_some(),
+                "{s} is spellable in four digits and must be kept"
+            );
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod error;
 pub mod geocoder;
 pub mod hasher;
 pub mod metadata;
+pub mod naming;
 pub mod organiser;
 pub mod reporter;
 pub mod scanner;

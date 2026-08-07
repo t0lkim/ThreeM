@@ -42,6 +42,7 @@ The system uses a **two-pass architecture**:
 | `hasher.rs` | Three-phase dedup cascade, BLAKE3 hashing, skip-and-count on unhashable files |
 | `metadata.rs` | EXIF extraction (images), container metadata (video), filesystem fallback |
 | `geocoder.rs` | Offline reverse geocoding via GeoNames k-d tree |
+| `naming.rs` | How names are spelled: filename sanitising, the four-digit year range |
 | `organiser.rs` | Target path computation, atomic file moves, duplicate movement, chunked execution |
 | `reporter.rs` | Dry-run output, duplicate listing, summary reports, chunk prompts |
 | `error.rs` | Typed error definitions (thiserror) |
@@ -281,6 +282,24 @@ The metadata module handles multiple date formats:
 | `YYYY-MM-DDTHH:MM:SS` | ISO 8601 | `2024-01-15T14:30:00` |
 | RFC 3339 with timezone | nom-exif Time variant | `2024-02-02T08:09:57+00:00` |
 | `EntryValue::Time` | nom-exif parsed DateTime | (native chrono DateTime) |
+
+**A parsed date whose year will not fit in four digits is treated as no date at all**, and the file falls through to its filesystem timestamp. `chrono` accepts `-0044:03:15 10:00:00` from an EXIF `DateTimeOriginal` without complaint; filing it produced a directory named `-44` and a filename opening with `-`, which every command-line tool reads as a flag. Years `0000`–`9999` are kept and zero-padded — `0000:01:01` is what a camera with a flat battery writes, and `0000/01/01/` says so where `unsorted/unknown.jpg` would discard the file's own name.
+
+---
+
+## Path Derivation
+
+The target path is `<output>/YYYY/MM/DD/YYYY-MM-DD-HHMMSS[-location].ext`, and three invariants hold over it for *any* input, not merely for the inputs the CLI happens to produce:
+
+| Invariant | Why it is not obvious |
+|---|---|
+| The derived directory is either four-two-two ASCII digits or exactly `unsorted` | The year came from `{}`, not `{:04}`, so years under 1000 produced `44/03/15` and negative years `-44/03/15`. |
+| The derived filename is a single ordinary path component — no `/`, no `\`, no `\0`, no leading `.` | The location suffix was sanitised; the extension was pasted in verbatim. |
+| The destination is strictly inside the output directory | Follows from the two above. `build_target_path` is public and its extension argument is arbitrary text: `"../../etc/passwd"` used to land the file outside the output tree entirely. |
+
+Both text inputs — the geocoded location and the extension — go through `naming::sanitise_for_filename`, which maps one character to one character (spaces to `-`, anything not alphanumeric/`-`/`_` to `_`). The one-for-one part matters: dropping characters instead could reduce a location name to the empty string in the middle of assembling a filename.
+
+These are asserted as property tests in `code/tests/path_properties.rs` rather than as examples, because every example is a place somebody thought to look. The counterexamples that first broke them are checked in alongside as `path_properties.proptest-regressions` and re-run before any new case is generated.
 
 ---
 

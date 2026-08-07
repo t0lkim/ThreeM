@@ -10,6 +10,7 @@ use tracing::{debug, error, info};
 use crate::geocoder::GeoLookup;
 use crate::hasher::DuplicateGroup;
 use crate::metadata::{self, DateSource, FileMetadata};
+use crate::naming::{sanitise_for_filename, year_is_representable};
 use crate::scanner::ScannedFile;
 
 /// A planned file operation (computed during scan, executed during process)
@@ -41,25 +42,61 @@ pub fn plan_move(file: &ScannedFile, output_dir: &Path, geo: &GeoLookup) -> Resu
 }
 
 /// Build the directory path (YYYY/MM/DD) and filename (YYYY-MM-DD-HHMMSS[-location].ext)
+///
+/// Total by construction: the directory it returns is either `YYYY/MM/DD` in
+/// four-two-two ASCII digits or exactly `unsorted`, and the filename is always
+/// a single ordinary path component. `tests/path_properties.rs` asserts both
+/// over generated input, which is what closed the three holes described below.
+///
+/// **The extension is sanitised.** It arrives here as arbitrary text — this
+/// function is `pub`, and nothing in its signature stops a caller passing
+/// `"../../etc/passwd"`, which used to be pasted in verbatim and produced a
+/// destination outside the output tree entirely. Today's only caller is the
+/// scanner, which admits none but its own known-media extensions, so this was
+/// not reachable from the CLI; it is fixed because the invariant belongs to the
+/// function rather than to the discipline of one caller.
+///
+/// **A year outside four digits goes to `unsorted`.** See
+/// [`crate::naming::year_is_representable`] — printing it produced directories
+/// like `44/03/15` and, for the negative years `chrono` will parse out of an
+/// EXIF string, `-44/03/15` plus a filename beginning with `-`.
 // exposed for integration tests
 pub fn build_target_path(
     meta: &FileMetadata,
     extension: &str,
     geo: &GeoLookup,
 ) -> (PathBuf, String) {
-    if let Some(dt) = meta.date {
-        let dir = date_directory(&dt);
-        let filename = date_filename(&dt, meta, extension, geo);
-        (dir, filename)
-    } else {
-        let dir = PathBuf::from("unsorted");
-        let filename = format!("unknown.{extension}");
-        (dir, filename)
+    let extension = sanitise_for_filename(extension);
+
+    match meta.date {
+        Some(dt) if year_is_representable(dt.year()) => {
+            let dir = date_directory(&dt);
+            let filename = date_filename(&dt, meta, &extension, geo);
+            (dir, filename)
+        }
+        _ => {
+            let dir = PathBuf::from("unsorted");
+            let filename = format!("unknown.{extension}");
+            (dir, filename)
+        }
     }
 }
 
+/// `YYYY/MM/DD`, zero-padded.
+///
+/// The year is `{:04}` and not `{}` because a photograph dated 44 AD — which is
+/// what a camera with a flat battery writes, and what `chrono` parses without
+/// complaint out of `0044:03:15 10:00:00` — was filed under a directory called
+/// `44`, sitting at the top of the output tree beside `2024` and matching none
+/// of the conventions the tool promises. Callers guarantee the year is
+/// representable; [`build_target_path`] is the only one, and it checks.
 fn date_directory(dt: &DateTime<Utc>) -> PathBuf {
-    PathBuf::from(format!("{}/{:02}/{:02}", dt.year(), dt.month(), dt.day()))
+    PathBuf::from(format!(
+        "{:04}/{:02}/{:02}",
+        dt.year(),
+        dt.month(),
+        dt.day()
+    ))
 }
 
 fn date_filename(
@@ -69,7 +106,7 @@ fn date_filename(
     geo: &GeoLookup,
 ) -> String {
     let base = format!(
-        "{}-{:02}-{:02}-{:02}{:02}{:02}",
+        "{:04}-{:02}-{:02}-{:02}{:02}{:02}",
         dt.year(),
         dt.month(),
         dt.day(),
@@ -948,6 +985,54 @@ mod tests {
             .unwrap()
             .and_utc();
         assert_eq!(date_directory(&dt), PathBuf::from("2024/03/15"));
+    }
+
+    fn at(year: i32, month: u32, day: u32) -> FileMetadata {
+        FileMetadata {
+            date: Some(
+                chrono::NaiveDate::from_ymd_opt(year, month, day)
+                    .unwrap()
+                    .and_hms_opt(10, 30, 0)
+                    .unwrap()
+                    .and_utc(),
+            ),
+            latitude: None,
+            longitude: None,
+            date_source: DateSource::Exif,
+        }
+    }
+
+    /// A year under 1000 is still four digits wide. Without the padding it was
+    /// filed under `44/`, which sorts, reads and globs as nothing the tool
+    /// documents.
+    #[test]
+    fn test_a_low_year_is_padded_to_four_digits() {
+        let (dir, filename) = build_target_path(&at(44, 3, 15), "jpg", &GeoLookup::new());
+        assert_eq!(dir, PathBuf::from("0044/03/15"));
+        assert_eq!(filename, "0044-03-15-103000.jpg");
+    }
+
+    /// And one that is not four digits wide at all goes to `unsorted/` rather
+    /// than to a directory called `-44` holding a file called `-44-…jpg`, which
+    /// every command-line tool that met it would read as a flag.
+    #[test]
+    fn test_a_year_outside_four_digits_goes_to_unsorted() {
+        let (dir, filename) = build_target_path(&at(-44, 3, 15), "jpg", &GeoLookup::new());
+        assert_eq!(dir, PathBuf::from("unsorted"));
+        assert_eq!(filename, "unknown.jpg");
+    }
+
+    /// `build_target_path` is public and its extension argument is arbitrary
+    /// text. Today's only caller is the scanner, which admits nothing but its
+    /// own known-media list — this asserts the function's own invariant rather
+    /// than that caller's discipline.
+    #[test]
+    fn test_a_hostile_extension_cannot_add_path_separators() {
+        let (dir, filename) =
+            build_target_path(&at(2024, 3, 15), "../../etc/passwd", &GeoLookup::new());
+        assert_eq!(dir, PathBuf::from("2024/03/15"));
+        assert_eq!(filename, "2024-03-15-103000.______etc_passwd");
+        assert!(!filename.contains('/'));
     }
 
     /// A planned move with the metadata fields pinned inert — nothing in the

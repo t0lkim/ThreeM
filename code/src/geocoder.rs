@@ -1,6 +1,8 @@
 use reverse_geocoder::{ReverseGeocoder, SearchResult};
 use tracing::debug;
 
+use crate::naming::sanitise_for_filename;
+
 /// Wrapper around the reverse geocoder with a pre-loaded k-d tree
 pub struct GeoLookup {
     geocoder: ReverseGeocoder,
@@ -48,20 +50,6 @@ pub struct LocationInfo {
     pub filename_part: String,
 }
 
-fn sanitise_for_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else if c == ' ' {
-                '-'
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -70,12 +58,6 @@ fn sanitise_for_filename(s: &str) -> String {
 )]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_sanitise_for_filename() {
-        assert_eq!(sanitise_for_filename("New York-US"), "New-York-US");
-        assert_eq!(sanitise_for_filename("São Paulo/BR"), "São-Paulo_BR");
-    }
 
     #[test]
     fn test_lookup_known_location() {
