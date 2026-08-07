@@ -35,7 +35,8 @@ pub fn plan_move(file: &ScannedFile, output_dir: &Path, geo: &GeoLookup) -> Resu
 }
 
 /// Build the directory path (YYYY/MM/DD) and filename (YYYY-MM-DD-HHMMSS[-location].ext)
-fn build_target_path(meta: &FileMetadata, extension: &str, geo: &GeoLookup) -> (PathBuf, String) {
+// exposed for integration tests
+pub fn build_target_path(meta: &FileMetadata, extension: &str, geo: &GeoLookup) -> (PathBuf, String) {
     match meta.date {
         Some(dt) => {
             let dir = date_directory(&dt);

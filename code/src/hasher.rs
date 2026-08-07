@@ -100,7 +100,8 @@ pub fn find_duplicates(files: Vec<ScannedFile>, progress: &ProgressBar) -> Resul
     })
 }
 
-fn group_by_size(files: &[ScannedFile]) -> HashMap<u64, Vec<ScannedFile>> {
+// exposed for integration tests
+pub fn group_by_size(files: &[ScannedFile]) -> HashMap<u64, Vec<ScannedFile>> {
     let mut groups: HashMap<u64, Vec<ScannedFile>> = HashMap::new();
     for file in files {
         groups.entry(file.size).or_default().push(file.clone());
@@ -108,7 +109,8 @@ fn group_by_size(files: &[ScannedFile]) -> HashMap<u64, Vec<ScannedFile>> {
     groups
 }
 
-fn group_by_partial_hash<'a>(
+// exposed for integration tests
+pub fn group_by_partial_hash<'a>(
     files: &[&'a ScannedFile],
 ) -> Result<HashMap<String, Vec<&'a ScannedFile>>> {
     let mut groups: HashMap<String, Vec<&'a ScannedFile>> = HashMap::new();
@@ -119,7 +121,8 @@ fn group_by_partial_hash<'a>(
     Ok(groups)
 }
 
-fn group_by_full_hash<'a>(
+// exposed for integration tests
+pub fn group_by_full_hash<'a>(
     files: &[&'a ScannedFile],
 ) -> Result<HashMap<String, Vec<&'a ScannedFile>>> {
     let mut groups: HashMap<String, Vec<&'a ScannedFile>> = HashMap::new();

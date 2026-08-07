@@ -22,6 +22,10 @@ walkdir = "2"
 [dev-dependencies]
 tempfile = "3"
 
+[lib]
+name = "mmm"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mmm"
 path = "src/main.rs"

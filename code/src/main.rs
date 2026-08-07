@@ -1,19 +1,12 @@
-mod config;
-mod error;
-mod geocoder;
-mod hasher;
-mod metadata;
-mod organiser;
-mod reporter;
-mod scanner;
-
 use anyhow::Result;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{error, info};
 
-use crate::config::Config;
-use crate::geocoder::GeoLookup;
+use mmm::{hasher, organiser, reporter, scanner};
+
+use mmm::config::Config;
+use mmm::geocoder::GeoLookup;
 
 fn main() -> Result<()> {
     let config = Config::parse();
