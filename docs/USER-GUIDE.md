@@ -6,20 +6,28 @@
 
 Both binaries are installed at `~/bin/`.
 
+> **`mmm` is safe by default.** Every run is a preview until you pass `--commit`. Without it, `mmm` scans, plans, prints and exits without touching a single file. Note that when no `--output` is given, output defaults to the *first input directory* — so `mmm ~/Photos --commit` reorganises `~/Photos` in place.
+
 ---
 
 ## Quick Start
 
-Preview what would happen (no files are modified):
+Preview what would happen — this is the default, no files are modified:
 
 ```bash
-mmm ~/Photos --dry-run
+mmm ~/Photos
+```
+
+Read the plan. If it looks right, re-run the same command with `--commit` to apply it:
+
+```bash
+mmm ~/Photos --commit
 ```
 
 Organise files from multiple sources into a single output directory:
 
 ```bash
-mmm ~/Photos ~/Camera/DCIM -o ~/Organised
+mmm ~/Photos ~/Camera/DCIM -o ~/Organised --commit
 ```
 
 After organising, verify the duplicates directory:
@@ -49,26 +57,33 @@ mmm [OPTIONS] <DIRECTORIES>...
 | Flag | Short | Default | Description |
 |---|---|---|---|
 | `--output <DIR>` | `-o` | First input directory | Where organised files and the `duplicates/` directory are written |
-| `--dry-run` | `-d` | off | Show what would happen without moving any files |
+| `--commit` | | off | **Actually move files.** Without this, `mmm` only prints the plan and exits |
 | `--chunk-size <N>` | `-c` | 100 | Number of files to process before pausing for confirmation |
 | `--no-prompt` | | off | Skip confirmation prompts between chunks |
 | `--verbose` | `-v` | warn | Increase log verbosity (`-v` info, `-vv` debug, `-vvv` trace) |
 | `--help` | `-h` | | Print help |
 | `--version` | `-V` | | Print version |
 
+#### Deprecated
+
+| Flag | Short | Description |
+|---|---|---|
+| `--dry-run` | `-d` | **No-op.** Previewing is now the default, so this flag does nothing. It stays accepted, hidden from `--help`, so scripts written against the old CLI keep running; passing it prints a deprecation notice to stderr. If combined with `--commit`, the explicit `--commit` wins and files are moved. |
+
 ### What It Does
 
-1. **Scans** all input directories recursively for media files.
-2. **Deduplicates** using a three-phase hash cascade (see Technical Documentation).
-3. **Extracts metadata** — creation date and GPS coordinates from EXIF (images) or container atoms (video). Falls back to filesystem creation date when metadata is absent.
-4. **Plans renames** — each unique file is assigned a target path: `<output>/YYYY/MM/DD/YYYY-MM-DD-HHMMSS[-location].ext`.
-5. **Reports** — in dry-run mode, prints the full plan and duplicate list, then exits.
-6. **Moves duplicates** — in live mode, duplicate files are moved to `<output>/duplicates/000/`, `001/`, etc. Each group directory includes a `manifest.txt` recording the BLAKE3 hash and original file path.
-7. **Organises** — unique files are renamed and moved into the date-based hierarchy, pausing every `--chunk-size` files for confirmation.
+1. **Announces the mode** — `DRY RUN — no files will be modified. Re-run with --commit to apply.` or `COMMIT MODE — files will be moved.`, printed before anything is scanned.
+2. **Scans** all input directories recursively for media files.
+3. **Deduplicates** using a three-phase hash cascade (see Technical Documentation).
+4. **Extracts metadata** — creation date and GPS coordinates from EXIF (images) or container atoms (video). Falls back to filesystem creation date when metadata is absent.
+5. **Plans renames** — each unique file is assigned a target path: `<output>/YYYY/MM/DD/YYYY-MM-DD-HHMMSS[-location].ext`.
+6. **Reports** — without `--commit`, prints the full plan and duplicate list, then exits. Nothing is created, moved or deleted.
+7. **Moves duplicates** — with `--commit`, duplicate files are moved to `<output>/duplicates/000/`, `001/`, etc. Each group directory includes a `manifest.txt` recording the BLAKE3 hash and original file path.
+8. **Organises** — with `--commit`, unique files are renamed and moved into the date-based hierarchy, pausing every `--chunk-size` files for confirmation.
 
-### Dry Run Output
+### Preview Output
 
-A dry run produces two reports:
+A preview run (no `--commit`) produces two reports:
 
 **Duplicate Groups** — lists every group of identical files with their BLAKE3 hash:
 
@@ -125,7 +140,7 @@ The `[EXIF]`, `[FS]`, and `[NO DATE]` tags tell you where the date came from.
 
 ### Safety Guarantees
 
-- **Dry run modifies nothing.** Not a single file is created, moved, or deleted.
+- **Safe by default.** Without `--commit`, not a single file is created, moved, or deleted — including the `duplicates/` directory, which is not created at all during a preview.
 - **Originals are never deleted during dedup.** The first file in each group is kept; only copies are moved to `duplicates/`.
 - **Atomic moves on the same volume.** Uses `rename()` which is an atomic filesystem operation.
 - **Cross-volume moves use copy-verify-delete.** The file is copied to a temp file on the target volume, the temp file's size is verified against the source, then it is atomically renamed to the final name. Only after verification succeeds is the source deleted.
@@ -188,11 +203,11 @@ WARNING: 1 groups have hash mismatches — review before deleting!
 ### Recommended Workflow
 
 ```bash
-# 1. Dry run to review the plan
-mmm ~/Photos --dry-run
-
-# 2. Run for real
+# 1. Preview to review the plan (default — nothing is modified)
 mmm ~/Photos -o ~/Organised
+
+# 2. Same command, plus --commit, to run it for real
+mmm ~/Photos -o ~/Organised --commit
 
 # 3. Verify duplicates independently
 mmm-dedup-verifier ~/Organised/duplicates/

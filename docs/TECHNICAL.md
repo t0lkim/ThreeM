@@ -4,7 +4,7 @@
 
 The system uses a **two-pass architecture**:
 
-- **Phase A (Scan):** Walk directories, discover media files, build the dedup table, extract metadata, plan all moves. This phase is entirely read-only. In `--dry-run` mode, execution stops here.
+- **Phase A (Scan):** Walk directories, discover media files, build the dedup table, extract metadata, plan all moves. This phase is entirely read-only. Without `--commit`, execution stops here — that is the default posture (see [ADR-001](decisions/adr-001-dry-run-by-default.md)).
 - **Phase B (Process):** Move duplicates to the `duplicates/` directory, then rename and move unique files into the date hierarchy. Chunked with user confirmation between batches.
 
 ```
@@ -16,10 +16,10 @@ The system uses a **two-pass architecture**:
 │  3. metadata.rs   → EXIF/video metadata extraction      │
 │  4. geocoder.rs   → Reverse geocode GPS coordinates     │
 │  5. organiser.rs  → Plan target paths for each file     │
-│  6. reporter.rs   → Print dry-run report (if --dry-run) │
+│  6. reporter.rs   → Print the plan (if no --commit)     │
 └─────────────────────────────────────────────────────────┘
                           │
-                    (--dry-run stops here)
+                 (without --commit, stops here)
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────┐
