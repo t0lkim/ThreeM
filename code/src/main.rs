@@ -4,9 +4,9 @@ use anyhow::{Context as _, Result};
 use chrono::Utc;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
-use mmm::{hasher, journal, organiser, reporter, scanner, undo};
+use mmm::{hasher, journal, organiser, reporter, scanner, settings, undo};
 
 use mmm::config::{Cli, Command, Config, JournalAction, UndoArgs};
 use mmm::geocoder::GeoLookup;
@@ -270,6 +270,15 @@ fn main() -> Result<()> {
         .with_env_filter(filter)
         .with_target(false)
         .init();
+
+    // Read before any work starts, and for every subcommand: a config that
+    // cannot be understood has to stop the run here rather than be discovered
+    // halfway through moving somebody's library. `--no-config` is the way past a
+    // file that is in the way.
+    let loaded = settings::load(&cli.load_options())?;
+    for layer in &loaded.layers {
+        debug!(source = %layer.source, "read config layer");
+    }
 
     match cli.resolve() {
         Command::Organise(config) => run_organise(&config),

@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+use crate::settings::LoadOptions;
 use crate::METADATA_DIR_NAME;
 
 /// The journal directory, below [`METADATA_DIR_NAME`] in the output tree.
@@ -72,6 +73,22 @@ pub struct Cli {
     /// the flag goes is not what they need at that moment.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
+
+    /// Read this config file instead of searching for one
+    ///
+    /// Replaces discovery rather than adding to it: a file named here is the
+    /// answer to "what settings is this run using?", and one that still
+    /// inherited from $HOME would not be. A path that does not exist is an
+    /// error, not a fall back to the defaults.
+    #[arg(long, value_name = "PATH", global = true, conflicts_with = "no_config")]
+    pub config: Option<PathBuf>,
+
+    /// Ignore every config file (MMM_ environment variables still apply)
+    ///
+    /// The environment belongs to this invocation the way a flag does; skipping
+    /// files is a statement about files.
+    #[arg(long, global = true)]
+    pub no_config: bool,
 }
 
 impl Cli {
@@ -83,6 +100,14 @@ impl Cli {
     pub fn resolve(self) -> Command {
         self.command
             .unwrap_or(Command::Organise(Box::new(self.organise)))
+    }
+
+    /// What the settings loader is allowed to look at for this invocation.
+    ///
+    /// Taken before [`Cli::resolve`] consumes the parse, because `--config` and
+    /// `--no-config` are global: they describe the run, not the subcommand.
+    pub fn load_options(&self) -> LoadOptions {
+        LoadOptions::from_process(self.config.clone(), self.no_config)
     }
 }
 
@@ -699,6 +724,66 @@ mod tests {
             Cli::try_parse_from(["mmm", "undo", "-vv"]).unwrap().verbose,
             2
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Which config files a run reads
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn config_names_an_explicit_file() {
+        let cli = Cli::try_parse_from(["mmm", "/photos", "--config", "/etc/mmm.toml"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/etc/mmm.toml")));
+        assert!(!cli.no_config);
+    }
+
+    #[test]
+    fn no_config_is_a_plain_switch() {
+        let cli = Cli::try_parse_from(["mmm", "/photos", "--no-config"]).unwrap();
+        assert!(cli.no_config);
+        assert_eq!(cli.config, None);
+    }
+
+    /// Naming a file to read and asking for none are contradictory, and clap is
+    /// the right place to say so — before anything opens a file.
+    #[test]
+    fn config_and_no_config_together_are_refused() {
+        assert!(Cli::try_parse_from([
+            "mmm",
+            "/photos",
+            "--config",
+            "/etc/mmm.toml",
+            "--no-config"
+        ])
+        .is_err());
+    }
+
+    /// Both are global, so they mean the same thing wherever they are typed —
+    /// including on a subcommand that reads journals rather than settings.
+    #[test]
+    fn the_config_flags_are_accepted_before_or_after_a_subcommand() {
+        assert!(
+            Cli::try_parse_from(["mmm", "undo", "--no-config"])
+                .unwrap()
+                .no_config
+        );
+        assert_eq!(
+            Cli::try_parse_from(["mmm", "--config", "/etc/mmm.toml", "undo"])
+                .unwrap()
+                .config,
+            Some(PathBuf::from("/etc/mmm.toml"))
+        );
+    }
+
+    #[test]
+    fn the_load_options_carry_the_flags_through() {
+        let cli = Cli::try_parse_from(["mmm", "/photos", "--config", "/etc/mmm.toml"]).unwrap();
+        let options = cli.load_options();
+        assert_eq!(options.explicit, Some(PathBuf::from("/etc/mmm.toml")));
+        assert!(!options.no_config);
+
+        let cli = Cli::try_parse_from(["mmm", "/photos", "--no-config"]).unwrap();
+        assert!(cli.load_options().no_config);
     }
 
     #[test]
