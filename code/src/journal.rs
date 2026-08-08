@@ -1021,6 +1021,13 @@ mod tests {
             !text.contains(&long),
             "the whole 500-byte line must not be quoted back"
         );
+        // The prefix is the whole reason for quoting anything: an operator
+        // cannot find the offending line in a journal from a byte count. An
+        // elision that kept *nothing* would satisfy both assertions above.
+        assert!(
+            text.contains(&format!("{}…", "x".repeat(160))),
+            "the first 160 bytes of the line must survive the elision: {text}"
+        );
     }
 
     /// The other side of the same boundary: a line short enough to read in full

@@ -361,6 +361,34 @@ pub fn find_duplicates(
     progress: &ProgressBar,
     pool: &HashPool,
 ) -> DedupResult {
+    find_duplicates_with(files, progress, pool, full_hash)
+}
+
+/// The cascade, with phase 3's read supplied by the caller.
+///
+/// The seam exists for one reason: a file that phase 2 could read and phase 3
+/// could not is a file deleted, truncated or locked *between* the two reads, and
+/// no test can produce that race against a real filesystem. It is also the only
+/// way [`DedupResult::skipped`] ever gains a count after phase 2 — so without a
+/// seam here, the line that adds phase 3's skips to phase 2's is executed only
+/// ever with a zero on one side, and "the operator is told how many files were
+/// dropped from the plan" ships unproven.
+///
+/// A parameter rather than a `#[cfg(test)]` global, following the injected
+/// `copy` on [`crate::organiser`]'s cross-volume move: the production path
+/// passes [`full_hash`] and carries no test scaffolding at all, and two tests
+/// injecting two different failures cannot reach each other. A thread-local
+/// would not work here in any case — the read happens on `pool`'s workers, not
+/// on the thread that armed it.
+fn find_duplicates_with<F>(
+    files: &[ScannedFile],
+    progress: &ProgressBar,
+    pool: &HashPool,
+    full_hash_of: F,
+) -> DedupResult
+where
+    F: Fn(&Path) -> Result<String> + Sync,
+{
     progress.set_message(PHASE_1_MESSAGE);
     let size_groups = group_by_size(files);
 
@@ -459,7 +487,16 @@ pub fn find_duplicates(
     progress.set_message(PHASE_3_MESSAGE);
     let mut duplicate_groups: Vec<DuplicateGroup> = Vec::new();
 
-    let full = group_by_full_hash(&phase3_candidates, progress, pool);
+    let full = {
+        let (groups, skipped) = group_by_key(
+            &phase3_candidates,
+            |file| full_hash_of(&file.path),
+            |_, digest| digest,
+            progress,
+            pool,
+        );
+        HashGroups { groups, skipped }
+    };
     skipped += full.skipped;
 
     // The groups phase 2 settled join the ones phase 3 confirmed, on equal
@@ -508,6 +545,10 @@ pub fn find_duplicates(
     // their content hash — the one property of a group that is derived from
     // nothing but its contents — with the retained original's path as a
     // tie-break, so the order is total even if two groups ever shared a digest.
+    // The tie-break is unreachable and deliberately kept: the groups were the
+    // keys of a `HashMap`, so no two of them share a digest and `then_with`
+    // never runs. It states the total order the sort would need if that ever
+    // stopped being true — which is why deleting its arm changes no test.
     duplicate_groups.sort_by(|a, b| {
         a.hash
             .cmp(&b.hash)
@@ -1911,6 +1952,13 @@ mod tests {
 
     /// The default is bounded by the ceiling rather than by the core count
     /// alone — the whole point of the setting existing.
+    ///
+    /// Both halves, because the ceiling on its own is satisfied by a default of
+    /// one and that would be a different bug: it would cost every machine its
+    /// parallelism while still passing a test named after the ceiling. The
+    /// second assertion pins the rule the doc comment states — `min(cores,
+    /// ceiling)` — so a default that stopped tracking the machine is a failure
+    /// rather than a silent single-threaded run.
     #[test]
     fn test_the_default_thread_count_respects_the_ceiling() {
         let threads = default_hash_threads().get();
@@ -1918,6 +1966,14 @@ mod tests {
             threads <= DEFAULT_HASH_THREAD_CEILING,
             "{threads} threads is past the {DEFAULT_HASH_THREAD_CEILING}-thread ceiling — an \
              unbounded default is what this setting exists to prevent"
+        );
+
+        let expected = available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .min(DEFAULT_HASH_THREAD_CEILING);
+        assert_eq!(
+            threads, expected,
+            "the default is this machine's parallelism capped at the ceiling, not a constant"
         );
     }
 
@@ -2354,5 +2410,71 @@ mod tests {
         let mut sorted = paths.clone();
         sorted.sort_by(|a, b| by_depth_then_path(a, b));
         assert_eq!(paths, sorted);
+    }
+
+    /// A file that phase 2 read and phase 3 could not is counted as skipped —
+    /// *added* to whatever phase 2 already skipped, and left out of `unique`.
+    ///
+    /// The race is real and untestable against a real filesystem: the file has
+    /// to survive the partial read and be gone by the full one. Injected at the
+    /// phase-3 read for exactly that reason — see [`find_duplicates_with`].
+    ///
+    /// The two skips are made to happen in different phases on purpose. Phase 2
+    /// skips `vanished.jpg` (its length no longer matches the scan), phase 3
+    /// skips `locked-b.jpg`, and the expected total is the sum. A single skip in
+    /// one phase would be counted the same by any arithmetic at all.
+    #[test]
+    fn test_a_file_lost_between_the_two_reads_is_counted_with_the_earlier_skips() {
+        let tmp = TempDir::new().unwrap();
+
+        // Over 128 KB, so the partial hash is a head and a tail and phase 2
+        // cannot settle the group on its own — these have to reach phase 3.
+        let body = vec![7u8; 200_000];
+        let a = tmp.path().join("locked-a.jpg");
+        let b = tmp.path().join("locked-b.jpg");
+        fs::write(&a, &body).unwrap();
+        fs::write(&b, &body).unwrap();
+
+        // Phase 2's own skip: two files agreeing on a size that neither of them
+        // is any more, so both are refused before a digest is computed.
+        let stale = tmp.path().join("vanished.jpg");
+        let stale_twin = tmp.path().join("vanished-twin.jpg");
+        fs::write(&stale, b"nine byte").unwrap();
+        fs::write(&stale_twin, b"nine byte").unwrap();
+
+        let size = body.len() as u64;
+        let files = vec![
+            make_scanned(a, size),
+            make_scanned(b.clone(), size),
+            make_scanned(stale, 4096),
+            make_scanned(stale_twin, 4096),
+        ];
+
+        let result = find_duplicates_with(&files, &ProgressBar::hidden(), &pool(), |path| {
+            if path == b {
+                anyhow::bail!("{} went away between the two reads", path.display());
+            }
+            full_hash(path)
+        });
+
+        assert_eq!(
+            result.skipped, 3,
+            "two files phase 2 refused plus one phase 3 could not read"
+        );
+
+        let survivors: Vec<&Path> = result
+            .unique
+            .iter()
+            .map(|u| u.file.path.as_path())
+            .collect();
+        assert_eq!(
+            survivors,
+            vec![tmp.path().join("locked-a.jpg").as_path()],
+            "a file excluded from the analysis is excluded from the plan too"
+        );
+        assert!(
+            result.duplicate_groups.is_empty(),
+            "one readable file is not a duplicate group"
+        );
     }
 }

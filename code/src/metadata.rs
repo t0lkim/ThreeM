@@ -532,6 +532,16 @@ fn extract_video_metadata(path: &Path, tz: &TimezonePolicy) -> Result<Extracted>
                     recorded = entry_to_reading(value);
                 }
             }
+            // Defensive, and unexercised: `nom-exif` 1.x normalises every date
+            // it finds in a video container — including the `mvhd` creation
+            // time — onto the Apple key above, and refuses outright any file
+            // that is not a container it supports, so neither of these spellings
+            // has ever been observed arriving here. Deleting the arm changes no
+            // test, which is how mutation testing found it (see
+            // `docs/research/mutation-testing.md`). It stays because the key
+            // names are the parser's, not ours: a version that started reporting
+            // `CreateDate` verbatim would otherwise send every affected video to
+            // its filesystem timestamp in silence.
             "CreateDate" | "DateTimeOriginal" => {
                 saw_a_date_key = true;
                 if container.is_none() {
@@ -1011,5 +1021,142 @@ mod tests {
 
         let undated = FileMetadata::undated(DateSource::None);
         assert!(undated.date.is_none() && undated.timezone_source.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // The predicates and readers the rest of the module is built from
+    // -----------------------------------------------------------------
+    //
+    // Each of these was reachable only through a file on disk, which meant a
+    // whole class of change to them — a predicate that answers the same thing
+    // for every input, a match arm deleted — passed the suite untouched. They
+    // are pinned directly here.
+
+    /// The two questions [`DateSource`] answers, over every variant.
+    ///
+    /// Both predicates are total and neither is constant, which is the property
+    /// that matters: `--require-exif` and the fallback tally are two different
+    /// partitions of the same five variants, and a predicate that collapsed to
+    /// `true` or `false` would quietly refuse every file or accept every one.
+    #[test]
+    fn the_date_source_predicates_partition_the_variants() {
+        let recorded = [DateSource::Exif, DateSource::Sidecar];
+        let filesystem = [
+            DateSource::Filesystem,
+            DateSource::Unreadable,
+            DateSource::Unsupported,
+        ];
+
+        for source in recorded {
+            assert!(
+                source.is_recorded(),
+                "{source:?} was written down by somebody"
+            );
+            assert!(
+                !source.is_filesystem(),
+                "{source:?} did not come from the filesystem"
+            );
+        }
+        for source in filesystem {
+            assert!(
+                source.is_filesystem(),
+                "{source:?} is a filesystem fallback"
+            );
+            assert!(!source.is_recorded(), "{source:?} is not a recorded date");
+        }
+
+        // Neither, deliberately: a file with no date at all was not given a
+        // filesystem date, and counting it among the fallbacks would inflate
+        // the figure the run reports.
+        assert!(!DateSource::None.is_recorded());
+        assert!(!DateSource::None.is_filesystem());
+    }
+
+    /// The year the spellability check is applied to is the reading's own,
+    /// whichever of the three kinds it is.
+    ///
+    /// A constant here would let the negative year `chrono` will happily parse
+    /// out of a corrupt EXIF string through to [`crate::naming`], which is the
+    /// exact failure `spellable` exists to prevent — and it would do so
+    /// identically for every file, so nothing downstream would look wrong until
+    /// a directory called `-44-03-15` appeared at the top of somebody's photo
+    /// library.
+    #[test]
+    fn a_readings_year_is_read_from_the_reading() {
+        let naive = chrono::NaiveDate::from_ymd_opt(-44, 3, 15)
+            .and_then(|date| date.and_hms_opt(10, 0, 0))
+            .expect("a fixed literal is a valid datetime");
+        let offset = FixedOffset::east_opt(8 * 3600).expect("+08:00 is a valid offset");
+
+        assert_eq!(reading_year(Reading::WallClock(naive)), -44);
+        assert_eq!(
+            reading_year(Reading::Zoned(attach_offset(naive, offset))),
+            -44
+        );
+        assert_eq!(
+            reading_year(Reading::Instant(DateTime::from_naive_utc_and_offset(
+                naive, Utc
+            ))),
+            -44
+        );
+
+        assert!(
+            !spellable(-44),
+            "a negative year has no four-digit spelling"
+        );
+        assert!(spellable(2024));
+    }
+
+    /// A camera that wrote its `DateTimeOriginal` as text is read, not ignored.
+    ///
+    /// `nom-exif` hands most files over as an already-parsed
+    /// [`EntryValue::Time`], so the text arm only fires for the cameras that
+    /// spell the tag their own way — which is precisely why nothing on disk in
+    /// the fixture tree exercises it, and why losing it would show up as those
+    /// cameras' photographs silently filing under their filesystem timestamps.
+    #[test]
+    fn an_exif_datetime_written_as_text_is_read_as_a_wall_clock() {
+        let text = EntryValue::Text("2024:03:15 23:30:00".to_string());
+        let naive = entry_to_wall_clock(&text).expect("an EXIF-spelled datetime is a wall clock");
+        assert_eq!(
+            naive.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-03-15 23:30:00"
+        );
+
+        assert!(
+            entry_to_wall_clock(&EntryValue::Text("not a date".to_string())).is_none(),
+            "text that is not a datetime is not one"
+        );
+        assert!(
+            entry_to_wall_clock(&EntryValue::U32(7)).is_none(),
+            "a number is not a datetime either"
+        );
+    }
+
+    /// The same arm on the video side, where the offset in the text is the
+    /// whole point: a string carrying `+08:00` is the file's own testimony and
+    /// must come back as [`Reading::Zoned`], not as an instant.
+    #[test]
+    fn a_video_datetime_written_as_text_keeps_any_offset_it_carried() {
+        let zoned = entry_to_reading(&EntryValue::Text("2024-03-15T23:30:00+08:00".to_string()))
+            .expect("an Apple creationdate string is a reading");
+        match zoned {
+            Reading::Zoned(dt) => {
+                assert_eq!(
+                    dt.format("%Y-%m-%d %H:%M:%S%:z").to_string(),
+                    "2024-03-15 23:30:00+08:00"
+                );
+            }
+            other => panic!("a string with an offset is the file's own testimony, got {other:?}"),
+        }
+
+        let bare = entry_to_reading(&EntryValue::Text("2024-03-15T23:30:00".to_string()))
+            .expect("a string without an offset is still a reading");
+        assert!(
+            matches!(bare, Reading::WallClock(_)),
+            "a string with no offset stays a bare wall clock, got {bare:?}"
+        );
+
+        assert!(entry_to_reading(&EntryValue::Text("not a date".to_string())).is_none());
     }
 }

@@ -257,8 +257,37 @@ impl MediaTree {
         let spec = ExifSpec {
             datetime: naive(2024, 3, 15, 23, 30, 0),
             datetime_text: Some(text),
+            omit_datetime: false,
             offset: Some("+00:00"),
             gps: None,
+        };
+        let bytes = synth_jpeg(&JpegExif::Present(spec), rel);
+        self.write(rel, &bytes)
+    }
+
+    /// A byte-valid JPEG with a well-formed EXIF block that holds no datetime
+    /// entry at all — a camera that wrote its `ExifVersion` and nothing else, an
+    /// editor that stripped the timestamps and left the rest.
+    ///
+    /// The fourth fixture in the family, and the one that separates *no date*
+    /// from *unreadable date* on the path where the difference is actually
+    /// decided. [`Self::jpeg_without_exif`] never reaches that decision: with no
+    /// `APP1` segment the parser returns before the datetime entry is looked
+    /// for. Only a file whose EXIF parses and simply has no date in it can prove
+    /// the tool answers "your photograph does not record when it was taken"
+    /// rather than "we could not read what it recorded".
+    ///
+    /// `gps` is here because a file can perfectly well know where it was and not
+    /// when — a location-tagged export with its timestamps stripped is the
+    /// ordinary case — and because it gives the EXIF block something to hold
+    /// besides the version tag.
+    pub fn jpeg_with_exif_but_no_date(self, rel: &str, gps: Option<(f64, f64)>) -> Self {
+        let spec = ExifSpec {
+            datetime: naive(2024, 3, 15, 23, 30, 0),
+            datetime_text: None,
+            omit_datetime: true,
+            offset: None,
+            gps,
         };
         let bytes = synth_jpeg(&JpegExif::Present(spec), rel);
         self.write(rel, &bytes)
@@ -698,6 +727,17 @@ struct ExifSpec<'a> {
     /// disagreed with its payload would be testing the parser's tolerance of a
     /// malformed IFD rather than its handling of an unreadable date.
     datetime_text: Option<&'a str>,
+    /// Leave `DateTimeOriginal` (0x9003) out of the Exif `SubIFD` entirely.
+    ///
+    /// The fourth state, and the one that separates *this file records no date*
+    /// from *this file records a date we could not read*: the container parses,
+    /// the EXIF block parses, and there is simply no datetime entry in it. Both
+    /// land the file on its filesystem timestamp and the run is required to
+    /// report them differently, so both need a fixture — see
+    /// [`MediaTree::jpeg_with_exif_but_no_date`].
+    ///
+    /// `datetime` and `datetime_text` are ignored when this is set.
+    omit_datetime: bool,
     /// Written verbatim into `OffsetTimeOriginal`; the tag is omitted when
     /// `None`.
     offset: Option<&'a str>,
@@ -710,6 +750,7 @@ impl<'a> ExifSpec<'a> {
         Self {
             datetime,
             datetime_text: None,
+            omit_datetime: false,
             offset,
             gps,
         }
@@ -837,7 +878,12 @@ const TY_UNDEFINED: u16 = 7;
 /// else. `signature` is the only thing a standalone RAW adds — see
 /// [`MediaTree::tiff_raw`].
 fn build_tiff(spec: &ExifSpec<'_>, signature: Option<&[u8; 4]>) -> Vec<u8> {
-    let ExifSpec { offset, gps, .. } = *spec;
+    let ExifSpec {
+        offset,
+        gps,
+        omit_datetime,
+        ..
+    } = *spec;
     let mut t: Vec<u8> = Vec::new();
 
     // --- TIFF header: little-endian, magic 42, then IFD0 ---
@@ -870,11 +916,14 @@ fn build_tiff(spec: &ExifSpec<'_>, signature: Option<&[u8; 4]>) -> Vec<u8> {
 
     // Entries within an IFD are written in ascending tag order, as the TIFF
     // specification requires: 0x9000, 0x9003, then 0x9011 when it is present.
-    let exif_entries: u16 = if offset.is_some() { 3 } else { 2 };
+    let exif_entries: u16 = 1 + u16::from(!omit_datetime) + u16::from(offset.is_some());
     t.extend_from_slice(&exif_entries.to_le_bytes());
     push_entry(&mut t, 0x9000, TY_UNDEFINED, 4, *b"0231"); // ExifVersion 2.31
-    let datetime_ptr_at = t.len() + 8;
-    push_entry(&mut t, 0x9003, TY_ASCII, 20, [0; 4]); // DateTimeOriginal
+    let datetime_ptr_at = (!omit_datetime).then(|| {
+        let at = t.len() + 8;
+        push_entry(&mut t, 0x9003, TY_ASCII, 20, [0; 4]); // DateTimeOriginal
+        at
+    });
     let offset_ptr_at = offset.map(|text| {
         let at = t.len() + 8;
         let count = u32::try_from(text.len() + 1).expect("an offset tag is a handful of bytes");
@@ -906,18 +955,20 @@ fn build_tiff(spec: &ExifSpec<'_>, signature: Option<&[u8; 4]>) -> Vec<u8> {
     }
 
     // --- Data area ---
-    let datetime_off = u32::try_from(t.len()).unwrap();
-    patch_u32(&mut t, datetime_ptr_at, datetime_off);
-    let stamp = spec.stamp();
-    // A real assertion rather than a `debug_assert`, because the text can now
-    // come from a caller: see [`ExifSpec::datetime_text`].
-    assert_eq!(
-        stamp.len(),
-        19,
-        "EXIF datetime is a fixed 19 chars + NUL; {stamp:?} is not"
-    );
-    t.extend_from_slice(stamp.as_bytes());
-    t.push(0); // NUL terminator -> 20 bytes, keeping the next offset even
+    if let Some(datetime_ptr_at) = datetime_ptr_at {
+        let datetime_off = u32::try_from(t.len()).unwrap();
+        patch_u32(&mut t, datetime_ptr_at, datetime_off);
+        let stamp = spec.stamp();
+        // A real assertion rather than a `debug_assert`, because the text can
+        // now come from a caller: see [`ExifSpec::datetime_text`].
+        assert_eq!(
+            stamp.len(),
+            19,
+            "EXIF datetime is a fixed 19 chars + NUL; {stamp:?} is not"
+        );
+        t.extend_from_slice(stamp.as_bytes());
+        t.push(0); // NUL terminator -> 20 bytes, keeping the next offset even
+    }
 
     // OffsetTimeOriginal, when the caller asked for one, pins the naive stamp
     // above to a zone. The default fixture writes `+00:00`, without which

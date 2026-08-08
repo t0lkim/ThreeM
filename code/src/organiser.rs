@@ -141,6 +141,11 @@ pub fn plan_move(
         destination,
         date_source: meta.date_source,
         timezone_source: meta.timezone_source,
+        // `&&` rather than `||` is unreachable today and stays on purpose: the
+        // EXIF and ISO 6709 extractors both set the two coordinates together or
+        // set neither, so no metadata this can be handed has one without the
+        // other. A half-located file would be one this code cannot place, and
+        // reporting it as located would be the wrong half of the guess.
         has_location: meta.latitude.is_some() && meta.longitude.is_some(),
         known_hash,
         sidecars: companions.to_vec(),

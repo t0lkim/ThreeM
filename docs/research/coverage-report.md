@@ -7,6 +7,7 @@ tags:
   - coverage
   - quality
 related:
+  - '[[mutation-testing]]'
   - '[[hashing-baseline]]'
   - '[[journal-format]]'
   - '[[adr-003-atomic-move-semantics]]'

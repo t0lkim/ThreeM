@@ -1,1 +1,7 @@
 /target
+
+# `cargo mutants` scratch output — a fresh copy of the tree per mutant, plus the
+# run's own logs. The figures that matter are transcribed into
+# `docs/research/mutation-testing.md` by hand so they are reviewable in the diff.
+/mutants.out
+/mutants.out.old

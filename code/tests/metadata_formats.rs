@@ -786,6 +786,7 @@ fn the_three_ways_of_falling_back_to_the_filesystem_are_told_apart() {
     let tree = MediaTree::new()
         .jpeg_with_exif("dated.jpg", naive(2024, 3, 15, 23, 30, 0), None)
         .jpeg_without_exif("scan.jpg")
+        .jpeg_with_exif_but_no_date("stripped.jpg", Some((48.8577, 2.295)))
         .jpeg_with_unreadable_date("garbled.jpg", "NOT-A-DATE-AT-ALL!!")
         .jpeg_with_corrupt_exif("corrupt.jpg")
         .tiff_raw(
@@ -800,6 +801,12 @@ fn the_three_ways_of_falling_back_to_the_filesystem_are_told_apart() {
         ("dated.jpg", DateSource::Exif),
         // A real JPEG with nothing in it to read. Nothing is wrong here.
         ("scan.jpg", DateSource::Filesystem),
+        // A real JPEG with a real EXIF block that records no date. The same
+        // answer as `scan.jpg` and it must be reached deliberately rather than
+        // by the parser bailing out first: this is the file that reaches the
+        // datetime-entry question and finds no entry, so it is the only one
+        // that can prove the question is being asked correctly.
+        ("stripped.jpg", DateSource::Filesystem),
         // The tag is present and its value is not a datetime.
         ("garbled.jpg", DateSource::Unreadable),
         // The EXIF block itself will not parse — the same admission, reached
@@ -844,6 +851,53 @@ fn the_unreadable_fixtures_are_real_jpegs_carrying_a_real_datetime_entry() {
     assert!(
         garbled.windows(19).any(|w| w == b"NOT-A-DATE-AT-ALL!!"),
         "the unreadable stamp is not in the file, so its unreadability proves nothing"
+    );
+}
+
+/// The control for the *other* new fixture, and it is the same argument the
+/// other way round.
+///
+/// `stripped.jpg` claims to be a JPEG whose EXIF parses and contains no datetime
+/// entry, and its whole value is that it reaches the question
+/// `date_entry_is_unreadable` answers. A fixture whose EXIF block silently
+/// failed to parse would classify as `Filesystem` too — by returning before the
+/// question is ever asked — and the test above would pass while proving nothing
+/// about the distinction it is named after.
+///
+/// Asked of the parser directly, because the tool's own answer cannot
+/// distinguish the two: a file whose EXIF failed to parse and a file whose EXIF
+/// holds no date both arrive at a filesystem timestamp, and the coordinates that
+/// would otherwise prove the block was read are dropped along with the undated
+/// arm. So the fixture is put to `nom-exif` itself — the block yields entries,
+/// and none of them is a datetime.
+#[test]
+fn the_dateless_exif_fixture_really_does_have_a_parseable_exif_block() {
+    use nom_exif::ExifTag;
+
+    let tree = MediaTree::new().jpeg_with_exif_but_no_date("stripped.jpg", Some((48.8577, 2.295)));
+    let meta = read_image(&tree, "stripped.jpg");
+    assert_eq!(
+        meta.date_source,
+        DateSource::Filesystem,
+        "a file whose EXIF records no date is not a file whose date could not be read"
+    );
+
+    let file = std::fs::File::open(tree.join("stripped.jpg")).expect("reading the fixture");
+    let iter = nom_exif::parse_exif(std::io::BufReader::new(file), None)
+        .expect("the fixture's EXIF block must parse")
+        .expect("the fixture must carry an EXIF block at all");
+    let tags: Vec<ExifTag> = iter.filter_map(|entry| entry.tag()).collect();
+
+    assert!(
+        tags.contains(&ExifTag::GPSLatitude),
+        "the parser did not reach the GPS sub-IFD, so it did not walk the chain the \
+         datetime entry would have been on: {tags:?}"
+    );
+    assert!(
+        !tags
+            .iter()
+            .any(|tag| matches!(tag, ExifTag::DateTimeOriginal | ExifTag::CreateDate)),
+        "the fixture is supposed to have no datetime entry, and it has one: {tags:?}"
     );
 }
 
