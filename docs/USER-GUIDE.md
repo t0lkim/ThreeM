@@ -2,7 +2,7 @@
 
 ## Overview
 
-`mmm` scans one or more directories for images and videos, detects duplicates, renames files by date and location, and sorts them into a `Year/Month/Day` directory hierarchy. A companion tool, `mmm-dedup-verifier`, independently verifies that flagged duplicates are genuine before you delete them.
+`mmm` scans one or more directories for images and videos, detects duplicates, renames files by date and location, and sorts them into one directory per day (`YYYY-MM-DD/`). Both the directory layout and the filenames are configurable — see [Configuration](#configuration). A companion tool, `mmm-dedup-verifier`, independently verifies that flagged duplicates are genuine before you delete them.
 
 Both binaries are installed at `~/bin/`.
 
@@ -47,6 +47,10 @@ mmm [OPTIONS] <DIRECTORIES>...      # organise (the default)
 mmm undo [LIBRARY] [OPTIONS]        # put a recorded run back
 mmm journal list [LIBRARY]          # what has been run against this library
 mmm journal show <RUN_ID> [LIBRARY] # one run in full
+mmm config show                     # the settings this run resolved to, and why
+mmm config path                     # where config files were looked for
+mmm config init [--user|--project]  # write a starter config
+mmm config validate [PATH]          # parse a config, run nothing
 ```
 
 `mmm ~/Photos` still means "organise `~/Photos`" — the subcommands are additions, not a change. Writing `mmm organise ~/Photos` says the same thing explicitly, which is how you organise a directory that happens to be named `undo` or `journal`.
@@ -64,7 +68,9 @@ mmm journal show <RUN_ID> [LIBRARY] # one run in full
 | `--output <DIR>` | `-o` | First input directory | Where organised files and the `duplicates/` directory are written |
 | `--commit` | | off | **Actually move files.** Without this, `mmm` only prints the plan and exits |
 | `--chunk-size <N>` | `-c` | 100 | Number of files to process before pausing for confirmation |
-| `--no-prompt` | | off | Skip confirmation prompts between chunks |
+| `--no-prompt[=<BOOL>]` | | off | Skip confirmation prompts between chunks. `--no-prompt=false` keeps them, which is how to answer a `no_prompt = true` written in a config file |
+| `--config <PATH>` | | discovery | Read this config file instead of searching for one. A path that does not exist is an error |
+| `--no-config` | | off | Ignore every config file. `MMM_` environment variables still apply |
 | `--journal-dir <PATH>` | | `<output>/.mmm/journal` | Write the run journal somewhere else — useful when the output tree is read-only, or when journals for several libraries are collected in one place |
 | `--no-journal` | | off | **Unsafe.** Do not record this run, so it cannot be undone. Refused together with `--commit` unless `--i-know-what-im-doing` is also passed |
 | `--i-know-what-im-doing` | | off | Acknowledge an unsafe flag combination (currently only `--no-journal --commit`) |
@@ -110,8 +116,8 @@ Group 1 (3 files, 4521984 bytes each, hash: 7a3b1c4d5e6f7890…):
 ```
 ═══ Dry Run — Planned Operations ═══
 
-  [EXIF] ~/Photos/IMG_0001.jpg → ~/Organised/2024/03/15/2024-03-15-143022-London-GB.jpg
-  [FS]   ~/Photos/screenshot.png → ~/Organised/2026/01/02/2026-01-02-091500.png
+  [EXIF] ~/Photos/IMG_0001.jpg → ~/Organised/2024-03-15/2024-03-15-143022-London-GB.jpg
+  [FS]   ~/Photos/screenshot.png → ~/Organised/2026-01-02/2026-01-02-091500.png
   [NO DATE] ~/Photos/unknown.bmp → ~/Organised/unsorted/unknown.bmp
 ```
 
@@ -130,15 +136,11 @@ The `[EXIF]`, `[FS]`, and `[NO DATE]` tags tell you where the date came from.
 ├── .mmm/
 │   └── journal/
 │       └── 20260808-005652-z2a3m1.jsonl
-├── 2024/
-│   ├── 01/
-│   │   ├── 15/
-│   │   │   ├── 2024-01-15-143022-London-GB.jpg
-│   │   │   └── 2024-01-15-143025-London-GB.jpg
-│   │   └── 20/
-│   │       └── 2024-01-20-091500.mp4
-│   └── 03/
-│       └── ...
+├── 2024-01-15/
+│   ├── 2024-01-15-143022-London-GB.jpg
+│   └── 2024-01-15-143025-London-GB.jpg
+├── 2024-01-20/
+│   └── 2024-01-20-091500.mp4
 ├── unsorted/
 │   └── unknown.bmp
 └── duplicates/
@@ -149,6 +151,8 @@ The `[EXIF]`, `[FS]`, and `[NO DATE]` tags tell you where the date came from.
         ├── manifest.txt
         └── clip.mov
 ```
+
+Every name in that tree is a default, not a fixture: `date_directory_format`, `filename_format`, `duplicates_dir` and `unsorted_dir` change it, and `extensions` decides which files are scanned at all. See [Configuration](#configuration).
 
 ### Safety Guarantees
 
@@ -284,6 +288,68 @@ A committing undo writes its own journal, so it shows up in `mmm journal list` l
 `--no-journal` disables journalling. Combined with `--commit` it is refused unless `--i-know-what-im-doing` is also passed, because it means "move this library and keep no record of where anything came from" — reasonable on a scratch tree, catastrophic by accident. A run that used it says so in its summary rather than printing nothing.
 
 The format is documented at [`docs/architecture/journal-format.md`](architecture/journal-format.md), and the reasoning behind it at [`docs/decisions/adr-004-journal-design.md`](decisions/adr-004-journal-design.md).
+
+---
+
+## Configuration
+
+Flags you type every run can be written down instead. `mmm` reads a TOML config file, and settings resolve through four layers — **user config, then project config, then `MMM_` environment variables, then the command line** — each overriding the one before it, key by key.
+
+Start with a commented template:
+
+```bash
+mmm config init            # ~/.config/mmm/config.toml (~/Library/Application Support/mmm/ on macOS)
+mmm config init --project  # mmm.toml in the working directory
+```
+
+Then uncomment what you want:
+
+```toml
+output_dir = "/Volumes/Photos/Organised"
+chunk_size = 25
+date_directory_format = "%Y/%m/%d"                       # nested tree instead of one dir per day
+filename_format = "{original_stem}-{date}-{time}.{ext}"  # keep the original name
+skip_patterns = ["*.tmp", ".thumbnails", "raw/**"]
+
+[extensions]
+image = ["jpg", "heic", "dng"]                           # replaces the built-in list
+```
+
+A project `mmm.toml` is found by walking up from the working directory, so a library can carry its own layout. The nearest one wins.
+
+### Answering "why did it do that?"
+
+```bash
+mmm config show      # every resolved setting, each naming the layer that decided it
+mmm config path      # every location searched, and whether it was there
+mmm config validate  # parse the config, report problems, run nothing
+```
+
+```
+$ mmm config show
+chunk_size = 25  # from: project config (/Volumes/Photos/mmm.toml)
+date_directory_format = "%Y-%m-%d"  # from: built-in defaults
+```
+
+The output is itself a valid config file, so `mmm config show > mmm.toml` pins a run's settings.
+
+### What a config file may not do
+
+`commit`, `no_journal` and `i_know_what_im_doing` cannot be set in a file or in the environment, and writing one is an error rather than a silent no-op. Moving files stays opt-in at the command line: a run must not become destructive because of a file written months ago, or one that arrived with a copied directory.
+
+### Failing loudly
+
+A config that cannot be read never falls back to the defaults. A mistyped key, a wrong type, malformed TOML, an invalid format string or glob, an unrecognised `MMM_` variable, and a `--config` path that does not exist all stop the run with the file, the line and the column:
+
+```
+$ mmm ~/Photos
+Error: /Volumes/Photos/mmm.toml:3:1: unknown field `chunck_size`, expected one of `output_dir`,
+`chunk_size`, `no_prompt`, `verbose`, `journal_dir`, …
+```
+
+This applies to every subcommand, `mmm undo` included — `journal_dir` decides where undo *reads* journals, so proceeding on the defaults would search the wrong place. `--no-config` is the way past a broken file; `--config <PATH>` reads one named file instead of searching.
+
+The full key table, the environment variable names and a worked precedence example are in [`docs/reference/configuration.md`](reference/configuration.md); the reasoning behind the layer order in [`docs/decisions/adr-005-configuration-precedence.md`](decisions/adr-005-configuration-precedence.md).
 
 ---
 
