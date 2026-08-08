@@ -21,6 +21,13 @@ pub struct PlannedMove {
     pub destination: PathBuf,
     pub date_source: DateSource,
     pub has_location: bool,
+    /// The source's full BLAKE3 digest, when the dedup cascade already
+    /// established one (see [`crate::hasher::UniqueFile`]).
+    ///
+    /// Journalled so `undo` can refuse a file whose contents changed since the
+    /// run — a check size alone cannot make, because a same-length edit passes
+    /// it. `None` where no digest was paid for; undo then falls back to size.
+    pub known_hash: Option<String>,
 }
 
 /// Build the target path for a file based on its metadata
@@ -28,7 +35,12 @@ pub struct PlannedMove {
 /// # Errors
 ///
 /// Returns an error if the file's metadata cannot be extracted.
-pub fn plan_move(file: &ScannedFile, output_dir: &Path, geo: &GeoLookup) -> Result<PlannedMove> {
+pub fn plan_move(
+    file: &ScannedFile,
+    output_dir: &Path,
+    geo: &GeoLookup,
+    known_hash: Option<String>,
+) -> Result<PlannedMove> {
     let meta = metadata::extract_metadata(&file.path, file.is_video)?;
 
     let (date_dir, filename) = build_target_path(&meta, &file.extension, geo);
@@ -39,6 +51,7 @@ pub fn plan_move(file: &ScannedFile, output_dir: &Path, geo: &GeoLookup) -> Resu
         destination,
         date_source: meta.date_source,
         has_location: meta.latitude.is_some() && meta.longitude.is_some(),
+        known_hash,
     })
 }
 
@@ -272,13 +285,15 @@ impl GroupManifest {
 /// The two move passes differ in exactly this and nothing else, so it is the
 /// only thing [`recorded_move`] takes beyond the move itself. A duplicate's
 /// record carries the group it belongs to, because `duplicates/007/photo.jpg`
-/// is meaningless without it, and its BLAKE3 digest, which the dedup cascade
-/// has already computed — the organise pass has no equivalent, since a unique
-/// file is never fully hashed.
+/// is meaningless without it, and its BLAKE3 digest.
+///
+/// An organise move carries a digest only when the cascade reached phase 3 for
+/// that file and therefore already paid for one — never by hashing on purpose.
+/// See [`crate::hasher::UniqueFile`].
 #[derive(Debug, Clone, Copy)]
 pub enum MovePurpose<'a> {
     /// A media file moving into the dated output tree.
-    Organise,
+    Organise { hash: Option<&'a str> },
     /// A duplicate moving into `duplicates/<group>/`.
     Duplicate { group: usize, hash: &'a str },
     /// `mmm undo` putting a file back where a previous run found it.
@@ -293,7 +308,7 @@ pub enum MovePurpose<'a> {
 impl MovePurpose<'_> {
     fn intent_kind(self) -> IntentKind {
         match self {
-            Self::Organise => IntentKind::Organise,
+            Self::Organise { .. } => IntentKind::Organise,
             Self::Duplicate { .. } => IntentKind::Duplicate,
             Self::Restore { .. } => IntentKind::Restore,
         }
@@ -301,9 +316,8 @@ impl MovePurpose<'_> {
 
     fn source_hash(self) -> Option<String> {
         match self {
-            Self::Organise => None,
             Self::Duplicate { hash, .. } => Some(hash.to_string()),
-            Self::Restore { hash } => hash.map(ToString::to_string),
+            Self::Organise { hash } | Self::Restore { hash } => hash.map(ToString::to_string),
         }
     }
 }
@@ -410,11 +424,13 @@ impl<'a> MoveRecorder<'a> {
             // concerned — its *reason* is already on the intent line, and
             // giving it a record type of its own would mean a third thing
             // `undo` has to recognise to reverse an undo.
-            MovePurpose::Organise | MovePurpose::Restore { .. } => JournalEntry::MoveCommitted {
-                seq,
-                final_destination: outcome.destination.clone(),
-                move_kind: outcome.kind,
-            },
+            MovePurpose::Organise { .. } | MovePurpose::Restore { .. } => {
+                JournalEntry::MoveCommitted {
+                    seq,
+                    final_destination: outcome.destination.clone(),
+                    move_kind: outcome.kind,
+                }
+            }
             MovePurpose::Duplicate { group, .. } => JournalEntry::DuplicateMoved {
                 seq,
                 group,
@@ -550,6 +566,9 @@ pub fn move_duplicates(
                 destination: dest,
                 date_source: DateSource::None,
                 has_location: false,
+                // The duplicate pass carries its digest on the purpose, which
+                // is where the journal reads it from for this kind of move.
+                known_hash: None,
             };
 
             let purpose = MovePurpose::Duplicate {
@@ -989,7 +1008,10 @@ pub fn process_moves(
         controller.chunk_started(i + 1, chunk_count);
 
         for planned in *chunk {
-            match recorded_move(recorder, planned, MovePurpose::Organise) {
+            let purpose = MovePurpose::Organise {
+                hash: planned.known_hash.as_deref(),
+            };
+            match recorded_move(recorder, planned, purpose) {
                 Ok(_) => run.moved += 1,
                 Err(RecordedMoveError::Move(e)) => {
                     error!(
@@ -1341,6 +1363,7 @@ mod tests {
             destination: dst.to_path_buf(),
             date_source: DateSource::None,
             has_location: false,
+            known_hash: None,
         }
     }
 

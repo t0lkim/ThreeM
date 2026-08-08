@@ -923,6 +923,23 @@ fn duplicate_relocations_are_journalled_with_their_group() {
         )),
         "a duplicate's intent carries the digest the dedup pass already computed: {entries:?}"
     );
+
+    // The retained original of that group was fully hashed to *prove* it was a
+    // duplicate. Its organise move used to be journalled with `source_hash:
+    // null` anyway, throwing away a digest already paid for — which left undo
+    // with only size to go on, and a same-length edit passes a size check.
+    assert!(
+        entries.iter().any(|e| matches!(
+            e,
+            JournalEntry::MoveIntent {
+                kind: IntentKind::Organise,
+                source_hash: Some(_),
+                ..
+            }
+        )),
+        "the retained original's organise intent must carry the digest phase 3 \
+         already computed for it: {entries:?}"
+    );
 }
 
 /// A run the operator stops part-way through still closes its journal — an

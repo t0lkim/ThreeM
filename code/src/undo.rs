@@ -530,6 +530,8 @@ pub fn execute_restore(plan: &RestorePlan, recorder: &mut MoveRecorder<'_>) -> R
             destination: step.original.clone(),
             date_source: DateSource::None,
             has_location: false,
+            // A restore carries its digest on the purpose, below.
+            known_hash: None,
         };
         let purpose = MovePurpose::Restore {
             hash: step.source_hash.as_deref(),

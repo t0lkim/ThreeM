@@ -86,7 +86,7 @@ Written and **synced before the move is attempted**.
 | `source` | path | Where the file is now. This is the path undo restores to. |
 | `destination` | path | Where the run intends to put it. Not necessarily where it lands — see `move_committed`. |
 | `source_size` | `u64` | Size stat-ed immediately before the move, not carried from the scan. Undo compares it against the file it finds. A failed stat records `0` and lets the move report the real cause. |
-| `source_hash` | `string \| null` | BLAKE3 digest, when the run already had one. `null` for ordinary organise moves — the dedup cascade never fully hashes a unique file, and paying for a hash just to record it would be a cost on every file for a check size already mostly answers. |
+| `source_hash` | `string \| null` | BLAKE3 digest, whenever the run already had one — never computed for the journal's sake. Always present for duplicates and restores. Present for an organise move when the dedup cascade reached phase 3 for that file and therefore fully hashed it anyway (the retained original of a duplicate group, or a file that only phase 3 could prove unique). `null` for a file eliminated in phase 1 or 2, where establishing a digest would mean a full read of every file in the library — the cost the cascade exists to avoid. Where it is `null`, undo falls back to size alone, and a same-length edit passes that check. |
 | `kind` | `organise \| duplicate \| restore` | *Why* the file is moving. On the disk rather than inferred from the destination's shape, because undo treats the three differently and a duplicate goes back to a path the organiser never planned. |
 
 ### `move_committed`
@@ -136,13 +136,15 @@ The last line of a journal whose run reached an exit path — including the user
 
 A three-file run: one duplicate relocated, two files organised, the second of which hit a name collision and landed with a `-1` suffix. Paths abbreviated.
 
+Note the two organise moves differ in `source_hash`. `b.png` had a unique size and left the cascade at phase 1, so no digest was ever computed for it. `a-copy.png` is the retained original of the duplicate group — phase 3 hashed it to establish that, so the digest was already paid for and is recorded. It is the same digest the duplicate line carries, because they are the same bytes.
+
 ```json
 {"schema_version":1,"run_id":"20260808-005652-z2a3m1","started_at":"2026-08-08T00:56:52.294581Z","mmm_version":"0.1.0","output_dir":"…/out","argv":["mmm","…/in","-o","…/out","--commit","--no-prompt"]}
 {"type":"move_intent","seq":0,"source":"…/in/a.png","destination":"…/out/duplicates/000/a.png","source_size":22,"source_hash":"3388ab0f3875332f05d292112d28c3864632a11eedcb35588464d311f0473d17","kind":"duplicate"}
 {"type":"duplicate_moved","seq":0,"group":0,"source":"…/in/a.png","destination":"…/out/duplicates/000/a.png"}
 {"type":"move_intent","seq":1,"source":"…/in/holiday/b.png","destination":"…/out/2026-08-08/2026-08-08-005651.png","source_size":21,"source_hash":null,"kind":"organise"}
 {"type":"move_committed","seq":1,"final_destination":"…/out/2026-08-08/2026-08-08-005651.png","move_kind":"renamed"}
-{"type":"move_intent","seq":2,"source":"…/in/holiday/a-copy.png","destination":"…/out/2026-08-08/2026-08-08-005651.png","source_size":22,"source_hash":null,"kind":"organise"}
+{"type":"move_intent","seq":2,"source":"…/in/holiday/a-copy.png","destination":"…/out/2026-08-08/2026-08-08-005651.png","source_size":22,"source_hash":"3388ab0f3875332f05d292112d28c3864632a11eedcb35588464d311f0473d17","kind":"organise"}
 {"type":"move_committed","seq":2,"final_destination":"…/out/2026-08-08/2026-08-08-005651-1.png","move_kind":"renamed"}
 {"type":"run_completed","moved":3,"failed":0,"skipped":0,"ended_at":"2026-08-08T00:56:52.408554Z"}
 ```

@@ -88,6 +88,7 @@ fn plan(source: &Path, destination: &Path) -> PlannedMove {
         destination: destination.to_path_buf(),
         date_source: DateSource::None,
         has_location: false,
+        known_hash: None,
     }
 }
 

@@ -366,11 +366,11 @@ fn run_organise(config: &Config) -> Result<()> {
     let mut planned_moves = Vec::new();
     let mut plan_errors = 0;
 
-    for file in &dedup_result.unique {
-        match organiser::plan_move(file, output_dir, &geo) {
+    for unique in &dedup_result.unique {
+        match organiser::plan_move(&unique.file, output_dir, &geo, unique.known_hash.clone()) {
             Ok(planned) => planned_moves.push(planned),
             Err(e) => {
-                error!(path = %file.path.display(), error = %e, "failed to plan move");
+                error!(path = %unique.file.path.display(), error = %e, "failed to plan move");
                 plan_errors += 1;
             }
         }

@@ -375,7 +375,7 @@ proptest! {
             source.display()
         );
 
-        let planned = mmm::organiser::plan_move(&scan.files[0], &output, geo())
+        let planned = mmm::organiser::plan_move(&scan.files[0], &output, geo(), None)
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
 
         prop_assert!(
@@ -470,6 +470,7 @@ proptest! {
                 destination: destination.clone(),
                 date_source: DateSource::None,
                 has_location: false,
+                known_hash: None,
             })
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
 

@@ -397,6 +397,66 @@ fn undo_skips_a_file_that_changed_after_the_run_and_reports_it() {
     );
 }
 
+/// The size check cannot see an edit that keeps the length, so a file the
+/// cascade fully hashed must be journalled with that digest — otherwise undo
+/// happily moves back something whose contents are no longer what it recorded.
+///
+/// The fixture has a duplicate pair deliberately: that is what drives the
+/// retained original through phase 3, which is the only place an organise move
+/// acquires a digest without paying for one on purpose.
+#[test]
+fn undo_refuses_a_same_size_edit_to_a_file_the_cascade_hashed() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("beach.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("holiday/beach-copy.jpg", "beach.jpg");
+    let (_scratch, out_dir) = scratch_output();
+
+    assert_ok(&organise_commit(tree.path(), &out_dir), "commit run");
+
+    let organised = out_dir.join("2024-01-15/2024-01-15-143000.jpg");
+    assert!(
+        organised.is_file(),
+        "expected the retained original at {}: {:?}",
+        organised.display(),
+        snapshot_tree(&out_dir)
+    );
+
+    // Same length, different bytes — invisible to a size check, and the whole
+    // reason the digest has to be recorded.
+    let original = fs::read(&organised).expect("reading the organised file");
+    let mut edited = original.clone();
+    let last = edited.len() - 1;
+    edited[last] ^= 0xFF;
+    assert_eq!(
+        edited.len(),
+        original.len(),
+        "the edit must not change size"
+    );
+    fs::write(&organised, &edited).expect("editing the organised file");
+
+    let undone = undo(&out_dir, &["--commit"]);
+    assert_failed(&undone, "undo over a same-size edit");
+    let stdout = stdout_of(&undone);
+
+    assert!(
+        stdout.contains(SKIPPED_MODIFIED_LABEL),
+        "the same-size edit must be refused, not silently restored:\n{stdout}"
+    );
+    // Still where the run left it, with the edit intact. Which of the pair was
+    // retained as the original is not asserted: the group's membership order is
+    // not a promise, so the other file may legitimately have been restored from
+    // `duplicates/` — what matters is that *this* one was refused.
+    assert!(
+        organised.is_file(),
+        "the refused file must stay where the run put it"
+    );
+    assert_eq!(
+        fs::read(&organised).expect("reading the edited file back"),
+        edited,
+        "the edited file was moved despite its contents having changed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The interrupted run
 // ---------------------------------------------------------------------------

@@ -19,11 +19,27 @@ const PARTIAL_HASH_BYTES: u64 = 64 * 1024; // 64KB
 /// verifies it can never disagree about how they walk a file.
 const STREAM_BUFFER_BYTES: usize = 128 * 1024;
 
+/// A file the cascade is passing through to be organised, and the digest it
+/// happens to already know for it.
+///
+/// The hash is carried rather than recomputed because it is *free*: a file that
+/// reached phase 3 was fully hashed to decide whether it was a duplicate, and
+/// throwing that digest away only to have the journal want it later would mean
+/// reading every such file twice. A file eliminated in phase 1 or 2 has no
+/// digest and gets `None` — establishing one would mean a full read of every
+/// file in the library, which is the cost the cascade exists to avoid.
+#[derive(Debug, Clone)]
+pub struct UniqueFile {
+    pub file: ScannedFile,
+    /// The full BLAKE3 digest, when phase 3 already computed one.
+    pub known_hash: Option<String>,
+}
+
 /// Result of the three-phase dedup analysis
 #[derive(Debug)]
 pub struct DedupResult {
     /// Files that are unique (no duplicates found)
-    pub unique: Vec<ScannedFile>,
+    pub unique: Vec<UniqueFile>,
     /// Groups of duplicate files (each group shares identical content)
     pub duplicate_groups: Vec<DuplicateGroup>,
     /// Files excluded from the analysis because their contents could not be
@@ -71,12 +87,15 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
     let size_groups = group_by_size(files);
 
     // Files with unique sizes are immediately unique
-    let mut unique: Vec<ScannedFile> = Vec::new();
+    let mut unique: Vec<UniqueFile> = Vec::new();
     let mut candidates: Vec<Vec<&ScannedFile>> = Vec::new();
 
     for group in size_groups.values() {
         if group.len() == 1 {
-            unique.push(group[0].clone());
+            unique.push(UniqueFile {
+                file: group[0].clone(),
+                known_hash: None,
+            });
         } else {
             candidates.push(group.iter().collect());
         }
@@ -98,7 +117,14 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
         skipped += partial.skipped;
         for (_hash, pgroup) in partial.groups {
             if pgroup.len() == 1 {
-                unique.push(pgroup[0].clone());
+                // A *partial* hash is head-plus-tail, not the whole file — it
+                // is not the digest the journal would need, so this one stays
+                // unhashed rather than recording something that only looks like
+                // a full digest.
+                unique.push(UniqueFile {
+                    file: pgroup[0].clone(),
+                    known_hash: None,
+                });
             } else {
                 phase3_candidates.push(pgroup);
             }
@@ -117,15 +143,24 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
         skipped += full.skipped;
         for (hash, fgroup) in full.groups {
             if fgroup.len() == 1 {
-                unique.push(fgroup[0].clone());
+                // Fully hashed to prove it was not a duplicate; the digest is
+                // already paid for, so the journal gets it.
+                unique.push(UniqueFile {
+                    file: fgroup[0].clone(),
+                    known_hash: Some(hash),
+                });
             } else {
+                // Keep the first file as the "original", rest are duplicates.
+                // It carries the group's digest for the same reason.
+                unique.push(UniqueFile {
+                    file: fgroup[0].clone(),
+                    known_hash: Some(hash.clone()),
+                });
                 duplicate_groups.push(DuplicateGroup {
                     hash,
                     size: fgroup[0].size,
                     files: fgroup.iter().map(|f| f.path.clone()).collect(),
                 });
-                // Keep the first file as the "original", rest are duplicates
-                unique.push(fgroup[0].clone());
             }
         }
         progress.inc(group.len() as u64);
@@ -565,7 +600,11 @@ mod tests {
 
         assert_eq!(result.skipped, 1, "the unreadable file must be counted");
         assert_eq!(
-            result.unique.iter().map(|f| &f.path).collect::<Vec<_>>(),
+            result
+                .unique
+                .iter()
+                .map(|u| &u.file.path)
+                .collect::<Vec<_>>(),
             vec![&readable],
             "the readable file must survive, and the unreadable one must not be \
              offered to the organiser as though its content were known"
