@@ -5,7 +5,7 @@ use crate::hasher::DuplicateGroup;
 use crate::journal::{JournalEntry, RunHeader};
 use crate::metadata::DateSource;
 use crate::organiser::PlannedMove;
-use crate::undo::{RestoreOutcome, RestorePlan, RestoreRun, RunRow};
+use crate::undo::{RestoreOutcome, RestorePlan, RestoreRun, RunRow, Verification};
 
 /// Print the duplicate groups found during scanning
 pub fn print_duplicates(groups: &[DuplicateGroup]) {
@@ -127,6 +127,9 @@ pub struct RunSummary {
 }
 
 /// Column width of the summary labels, so every figure lines up.
+///
+/// Every label must be shorter than this, not merely no longer: one exactly
+/// this wide gets no padding at all and runs straight into its own figure.
 const LABEL_WIDTH: usize = 20;
 
 /// Label for entries the scan passed over. Exported so the integration suite
@@ -238,8 +241,17 @@ pub const INTERRUPTED_RUN_NOTICE: &str =
     "warning: this run never finished — it was interrupted, so its journal records only the \
      moves it managed. Anything it was part-way through is not listed below.";
 
+/// Printed in a preview beside a file the undo would refuse to move.
+pub const WILL_SKIP_PREFIX: &str = "will be skipped";
+
 /// Announce which run is about to be reversed, and how.
-pub fn print_restore_plan(plan: &RestorePlan) {
+///
+/// `checks` is the verification pass over the same steps, when one has been
+/// run. A preview that listed a file the commit will refuse to touch would be a
+/// preview of the wrong run, so the flags come from
+/// [`crate::undo::verify_step`] — the identical function the restore itself
+/// consults — rather than from a second opinion that could drift from it.
+pub fn print_restore_plan(plan: &RestorePlan, checks: Option<&[Verification]>) {
     println!("\n═══ Undo — Run {} ═══", plan.header.run_id);
     println!("  {:<LABEL_WIDTH$}{}", "Started:", plan.header.started_at);
     println!(
@@ -264,13 +276,49 @@ pub fn print_restore_plan(plan: &RestorePlan) {
     }
 
     println!();
-    for step in &plan.steps {
-        println!("  {} → {}", step.current.display(), step.original.display());
+    let mut refused = 0;
+    for (index, step) in plan.steps.iter().enumerate() {
+        let note = match checks.and_then(|checks| checks.get(index)) {
+            None | Some(Verification::Intact) => String::new(),
+            Some(Verification::Missing) => {
+                refused += 1;
+                format!("  [{WILL_SKIP_PREFIX}: it is no longer there]")
+            }
+            // Both already carry their own reason, and both mean the same thing
+            // to the operator reading a preview: this one will not be moved.
+            Some(Verification::Modified { detail } | Verification::Unverifiable { detail }) => {
+                refused += 1;
+                format!("  [{WILL_SKIP_PREFIX}: {detail}]")
+            }
+        };
+        println!(
+            "  {} → {}{note}",
+            step.current.display(),
+            step.original.display()
+        );
+    }
+
+    // Stated as a figure as well as per-file, because the per-file flags are
+    // buried in a list that can be thousands of lines long.
+    if refused > 0 {
+        println!(
+            "\n{refused} of these no longer match{} what the run recorded and will not be moved.",
+            if refused == 1 { "es" } else { "" }
+        );
     }
 }
 
 /// Label for files that went back where they came from.
 pub const RESTORED_LABEL: &str = "Restored:";
+
+/// Label for files put back beside an occupant of their original path.
+pub const CONFLICTED_LABEL: &str = "Conflicted:";
+
+/// Label for files that were no longer where the run recorded leaving them.
+pub const SKIPPED_MISSING_LABEL: &str = "Skipped (missing):";
+
+/// Label for files that were still there but were no longer the same file.
+pub const SKIPPED_MODIFIED_LABEL: &str = "Skipped (modified):";
 
 /// Label for files that could not be put back.
 pub const RESTORE_FAILED_LABEL: &str = "Could not restore:";
@@ -279,7 +327,12 @@ pub const RESTORE_FAILED_LABEL: &str = "Could not restore:";
 pub const RESTORE_UNPROCESSED_LABEL: &str = "Not attempted:";
 
 /// Label for the directories a restore emptied and removed.
-pub const PRUNED_LABEL: &str = "Directories removed:";
+///
+/// "Empty dirs" rather than "Directories" because the longer wording is exactly
+/// [`LABEL_WIDTH`] and so printed with no space before its own figure — and
+/// because only empty directories are ever removed, which is the guarantee
+/// worth putting in the label.
+pub const PRUNED_LABEL: &str = "Empty dirs removed:";
 
 /// Print what the undo actually did, file by file and then in total.
 ///
@@ -295,22 +348,29 @@ pub fn print_restore_summary(plan: &RestorePlan, run: &RestoreRun, journal: Jour
             };
             match outcome {
                 RestoreOutcome::Restored { at, .. } => {
-                    if at == &step.original {
-                        println!("  restored   {}", at.display());
-                    } else {
-                        // The source path was taken, so the file went back
-                        // beside its occupant rather than through it. Saying
-                        // where matters more than saying it worked.
-                        println!(
-                            "  restored   {}  (source path was occupied; original name was {})",
-                            at.display(),
-                            step.original.display()
-                        );
-                    }
+                    println!("  restored   {}", at.display());
                 }
+                // The original path was taken, so the file went back beside its
+                // occupant rather than through it. Saying where matters more
+                // than saying it worked.
+                RestoreOutcome::Conflicted { at, .. } => println!(
+                    "  CONFLICT   {}  (its original path {} is occupied by another file, which \
+                     was left untouched)",
+                    at.display(),
+                    step.original.display()
+                ),
                 RestoreOutcome::RestoredUnrecorded => println!(
                     "  restored   {}  (NOT recorded — this undo cannot itself be undone)",
                     step.original.display()
+                ),
+                RestoreOutcome::SkippedMissing => println!(
+                    "  skipped    {}  (nothing is there — it has been moved or deleted since the \
+                     run)",
+                    step.current.display()
+                ),
+                RestoreOutcome::SkippedModified { reason } => println!(
+                    "  skipped    {}  (not the file the run moved: {reason})",
+                    step.current.display()
                 ),
                 RestoreOutcome::Failed { reason } => {
                     println!("  FAILED     {}: {reason}", step.current.display());
@@ -321,6 +381,23 @@ pub fn print_restore_summary(plan: &RestorePlan, run: &RestoreRun, journal: Jour
 
     println!("\n═══ Undo Complete ═══");
     println!("  {RESTORED_LABEL:<LABEL_WIDTH$}{}", run.restored);
+    // Each of these appears only when it happened: a clean undo should not
+    // invite the operator to go looking for problems it did not have.
+    if run.conflicted > 0 {
+        println!("  {CONFLICTED_LABEL:<LABEL_WIDTH$}{}", run.conflicted);
+    }
+    if run.skipped_missing > 0 {
+        println!(
+            "  {SKIPPED_MISSING_LABEL:<LABEL_WIDTH$}{}",
+            run.skipped_missing
+        );
+    }
+    if run.skipped_modified > 0 {
+        println!(
+            "  {SKIPPED_MODIFIED_LABEL:<LABEL_WIDTH$}{}",
+            run.skipped_modified
+        );
+    }
     if run.failed > 0 {
         println!("  {RESTORE_FAILED_LABEL:<LABEL_WIDTH$}{}", run.failed);
     }

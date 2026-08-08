@@ -166,7 +166,13 @@ fn run_undo(args: &UndoArgs) -> Result<()> {
     let plan = undo::plan_restore(&journal_path)?;
 
     reporter::print_mode_banner(args.is_dry_run());
-    reporter::print_restore_plan(&plan);
+
+    // Verified only for the preview. The restore verifies each file again at
+    // the moment it moves it — which it must, since the restores run in reverse
+    // and can change what a later step finds — so doing it here as well on the
+    // committing path would be work whose answer is discarded.
+    let checks = args.is_dry_run().then(|| undo::verify_plan(&plan));
+    reporter::print_restore_plan(&plan, checks.as_deref());
 
     if args.is_dry_run() {
         println!("\n{}", reporter::DRY_RUN_BANNER);
@@ -185,12 +191,7 @@ fn run_undo(args: &UndoArgs) -> Result<()> {
     let mut recorder = MoveRecorder::new(Some(&mut journal));
     let run = undo::execute_restore(&plan, &mut recorder);
 
-    finish_journal(
-        Some(&mut journal),
-        run.restored,
-        run.failed,
-        run.unprocessed,
-    );
+    finish_journal(Some(&mut journal), run.moved(), run.failed, run.skipped());
     reporter::print_restore_summary(&plan, &run, JournalStatus::At(&journal_path));
 
     // A partial undo has to be detectable by a script, which cannot read the
@@ -199,16 +200,20 @@ fn run_undo(args: &UndoArgs) -> Result<()> {
         anyhow::bail!(
             "the undo journal could not be written, so the undo stopped after {} file{} — see \
              the errors above. Nothing further was moved.",
-            run.restored,
-            if run.restored == 1 { "" } else { "s" }
+            run.moved(),
+            if run.moved() == 1 { "" } else { "s" }
         );
     }
-    if run.failed > 0 {
+    // Anything short of "every file is back where it came from" is a partial
+    // undo, including files restored under a collision suffix: the library is
+    // not as it was, and a script that treats a zero exit as "the undo worked"
+    // must not be told that it did.
+    if let Some(shortfall) = run.shortfall() {
         anyhow::bail!(
-            "{} file{} could not be put back — see the results above. The rest of the run has \
-             been restored.",
-            run.failed,
-            if run.failed == 1 { "" } else { "s" }
+            "this run was not fully put back — {shortfall} — see the results above. The other {} \
+             file{} restored.",
+            run.restored,
+            if run.restored == 1 { " was" } else { "s were" }
         );
     }
 

@@ -20,6 +20,11 @@
 //! * **Nothing is overwritten.** The restore uses the same no-clobber move as
 //!   the organiser, so a source path that is occupied again yields a
 //!   collision-suffixed name rather than destroying whatever is sitting there.
+//! * **Ambiguity is refused, not resolved.** A journal describes the library as
+//!   the run left it. If the file at a recorded destination is gone, or is no
+//!   longer the file that was put there, the world has moved on since and
+//!   nothing in the journal says how — so that file is reported and left alone.
+//!   See [`verify_step`].
 
 use std::collections::HashMap;
 use std::fs;
@@ -30,6 +35,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use tracing::{debug, error, warn};
 
+use crate::hasher;
 use crate::journal::{self, IntentKind, Journal, JournalEntry, RunHeader};
 use crate::metadata::DateSource;
 use crate::organiser::{
@@ -189,32 +195,162 @@ pub fn build_plan(journal: PathBuf, header: RunHeader, entries: &[JournalEntry])
 }
 
 // ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+/// What is actually sitting at a step's recorded destination.
+///
+/// A journal describes the library as one run left it, which may have been
+/// weeks ago. Between then and now a file can be deleted, edited, or replaced
+/// by something else under the same name, and no amount of reading the journal
+/// will reveal it — only looking will.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verification {
+    /// The file is where the run left it, and is still the file the run moved.
+    Intact,
+    /// Nothing is at the recorded destination.
+    Missing,
+    /// Something is there, but it is not what the run put there.
+    Modified { detail: String },
+    /// The check itself could not be made, so nothing is known either way.
+    /// Treated exactly like a refusal: an unanswered question is not a yes.
+    Unverifiable { detail: String },
+}
+
+impl Verification {
+    /// Whether the step may proceed. Only [`Intact`](Self::Intact) may.
+    #[must_use]
+    pub fn is_intact(&self) -> bool {
+        matches!(self, Self::Intact)
+    }
+}
+
+/// The first few characters of a digest, for a message a person will read.
+///
+/// Takes characters rather than slicing bytes: a journal is a text file an
+/// operator can edit, and a `source_hash` that is not the 64 hex characters it
+/// should be must produce a bad message, never a panic.
+fn abbreviate(hash: &str) -> String {
+    hash.chars().take(12).collect()
+}
+
+/// Look at what is at `step.current` and decide whether it is safe to move.
+///
+/// The checks run cheapest-first and stop at the first answer: existence, then
+/// file-ness, then size, then — only when the run recorded one — the digest.
+/// Every one of them can only ever *refuse*; none of them can turn an absent
+/// or altered file into a restorable one.
+///
+/// A hash is recorded for duplicates and for restores, never for uniquely
+/// organised files (the dedup cascade never fully hashes those), so the
+/// expensive check costs nothing on the common path.
+#[must_use]
+pub fn verify_step(step: &RestoreStep) -> Verification {
+    // `symlink_metadata`, not `metadata`: a symlink left where the file was is
+    // a replacement, and following it would verify some other file entirely
+    // and then move the link.
+    let meta = match fs::symlink_metadata(&step.current) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Verification::Missing,
+        Err(e) => {
+            return Verification::Unverifiable {
+                detail: format!("it could not be inspected: {e}"),
+            }
+        }
+    };
+
+    if !meta.is_file() {
+        return Verification::Modified {
+            detail: "a directory or link now occupies this path".to_string(),
+        };
+    }
+
+    if let Some(expected) = step.source_size {
+        if meta.len() != expected {
+            return Verification::Modified {
+                detail: format!(
+                    "it is now {} bytes, and the run recorded {expected}",
+                    meta.len()
+                ),
+            };
+        }
+    }
+
+    if let Some(expected) = &step.source_hash {
+        match hasher::full_hash(&step.current) {
+            Ok(actual) if &actual == expected => {}
+            Ok(actual) => {
+                return Verification::Modified {
+                    detail: format!(
+                        "its contents have changed (now {}…, the run recorded {}…)",
+                        abbreviate(&actual),
+                        abbreviate(expected)
+                    ),
+                }
+            }
+            Err(e) => {
+                return Verification::Unverifiable {
+                    detail: format!("its contents could not be read: {e:#}"),
+                }
+            }
+        }
+    }
+
+    Verification::Intact
+}
+
+/// Check every step of a plan, in order, without touching anything.
+///
+/// Used by the preview: an operator deciding whether to commit needs to know
+/// which files will be refused *before* they commit, not from the aftermath.
+#[must_use]
+pub fn verify_plan(plan: &RestorePlan) -> Vec<Verification> {
+    plan.steps.iter().map(verify_step).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
 
 /// What became of one [`RestoreStep`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreOutcome {
-    /// Put back. `at` is where it actually landed, which is not always
-    /// `original`: the restore refuses to overwrite, so an occupied source path
-    /// yields a collision-suffixed name instead.
+    /// Put back where it came from, under its original name.
     Restored { at: PathBuf, kind: MoveKind },
+    /// Put back, but something else now occupies the original path, so the file
+    /// landed beside it under a collision-suffixed name. Nothing was
+    /// overwritten, and the library is not quite as it was.
+    Conflicted { at: PathBuf, kind: MoveKind },
     /// Moved back, but the journal line recording it could not be written, so
     /// this undo is not itself fully reversible. The run stops here.
     RestoredUnrecorded,
-    /// The move back did not happen. The file is still where the run left it.
+    /// Nothing is at the recorded destination, so there is nothing to put back.
+    SkippedMissing,
+    /// Something is at the recorded destination, but it is not the file the run
+    /// moved there. Left exactly where it is.
+    SkippedModified { reason: String },
+    /// The move back was attempted and did not happen, or could not be
+    /// attempted safely. The file is still where the run left it.
     Failed { reason: String },
 }
 
 /// What an undo run did.
 ///
 /// Every step is accounted for exactly once:
-/// `restored + failed + unprocessed == plan.steps.len()`.
+/// `restored + conflicted + skipped_missing + skipped_modified + failed +
+/// unprocessed == plan.steps.len()`.
 #[derive(Debug, Default, Clone)]
 pub struct RestoreRun {
-    /// One entry per attempted step, indexed into [`RestorePlan::steps`].
+    /// One entry per considered step, indexed into [`RestorePlan::steps`].
     pub outcomes: Vec<(usize, RestoreOutcome)>,
+    /// Files put back under their original name.
     pub restored: usize,
+    /// Files put back beside an occupant of their original path.
+    pub conflicted: usize,
+    /// Files that were no longer at the destination the run recorded.
+    pub skipped_missing: usize,
+    /// Files that were still there but were no longer the same file.
+    pub skipped_modified: usize,
     pub failed: usize,
     /// Steps never attempted, because the run stopped before reaching them.
     pub unprocessed: usize,
@@ -222,6 +358,50 @@ pub struct RestoreRun {
     pub journal_failed: bool,
     /// Directories the restore emptied and then removed.
     pub pruned_dirs: usize,
+}
+
+impl RestoreRun {
+    /// Files this undo moved: back to their own name, or beside it.
+    ///
+    /// A conflicted file did leave the library, so the run's journal has to
+    /// count it as moved even though the tree is not quite as it was.
+    #[must_use]
+    pub fn moved(&self) -> usize {
+        self.restored + self.conflicted
+    }
+
+    /// Files this undo deliberately left alone, plus those it never reached.
+    #[must_use]
+    pub fn skipped(&self) -> usize {
+        self.skipped_missing + self.skipped_modified + self.unprocessed
+    }
+
+    /// Why this undo did not put the run back exactly as it was, in the words
+    /// the operator gets — or `None` when it did.
+    ///
+    /// Returned rather than printed so the exit-code decision is one testable
+    /// value, and so `main` cannot exit zero on a run whose table said
+    /// otherwise. A conflicted file counts: it was restored, but not to the
+    /// path it came from, and a script that deletes the library on a clean undo
+    /// would be wrong to treat that as clean.
+    #[must_use]
+    pub fn shortfall(&self) -> Option<String> {
+        let parts = [
+            (self.failed, "could not be restored"),
+            (self.skipped_missing, "skipped (missing)"),
+            (self.skipped_modified, "skipped (modified)"),
+            (self.conflicted, "restored under a different name"),
+            (self.unprocessed, "never attempted"),
+        ];
+
+        let described: Vec<String> = parts
+            .iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, label)| format!("{count} {label}"))
+            .collect();
+
+        (!described.is_empty()).then(|| described.join(", "))
+    }
 }
 
 /// Put every file in `plan` back, recording the restore as it goes.
@@ -236,6 +416,50 @@ pub fn execute_restore(plan: &RestorePlan, recorder: &mut MoveRecorder<'_>) -> R
     let mut vacated: Vec<PathBuf> = Vec::new();
 
     for (index, step) in plan.steps.iter().enumerate() {
+        // Checked here, immediately before the move, rather than once up front:
+        // the restores run in reverse and can themselves change what is at a
+        // later step's destination, so a verdict from the top of the loop would
+        // already be stale by the time it was used.
+        match verify_step(step) {
+            Verification::Intact => {}
+            Verification::Missing => {
+                warn!(
+                    seq = step.seq,
+                    at = %step.current.display(),
+                    "nothing is where the run left this file, so there is nothing to put back"
+                );
+                run.skipped_missing += 1;
+                run.outcomes.push((index, RestoreOutcome::SkippedMissing));
+                continue;
+            }
+            Verification::Modified { detail } => {
+                warn!(
+                    seq = step.seq,
+                    at = %step.current.display(),
+                    detail,
+                    "this is no longer the file the run moved, so it has been left alone"
+                );
+                run.skipped_modified += 1;
+                run.outcomes
+                    .push((index, RestoreOutcome::SkippedModified { reason: detail }));
+                continue;
+            }
+            // Not knowing is not the same as knowing it is fine, and undo does
+            // not act on the difference.
+            Verification::Unverifiable { detail } => {
+                error!(
+                    seq = step.seq,
+                    at = %step.current.display(),
+                    detail,
+                    "this file could not be checked, so it has not been moved"
+                );
+                run.failed += 1;
+                run.outcomes
+                    .push((index, RestoreOutcome::Failed { reason: detail }));
+                continue;
+            }
+        }
+
         let planned = PlannedMove {
             source: step.current.clone(),
             destination: step.original.clone(),
@@ -254,11 +478,31 @@ pub fn execute_restore(plan: &RestorePlan, recorder: &mut MoveRecorder<'_>) -> R
                     to = %outcome.destination.display(),
                     "restored"
                 );
-                run.restored += 1;
                 note_vacated(&mut vacated, &step.current);
-                RestoreOutcome::Restored {
-                    at: outcome.destination,
-                    kind: outcome.kind,
+                // The move is the authority on whether the original path was
+                // taken: `execute_move` walks the collision candidates and only
+                // ever lands somewhere else when the name it wanted was held.
+                // Deciding from the result rather than from a pre-flight
+                // `exists()` means the report cannot disagree with the disk.
+                if outcome.destination == step.original {
+                    run.restored += 1;
+                    RestoreOutcome::Restored {
+                        at: outcome.destination,
+                        kind: outcome.kind,
+                    }
+                } else {
+                    warn!(
+                        seq = step.seq,
+                        original = %step.original.display(),
+                        at = %outcome.destination.display(),
+                        "the original path is occupied by another file, so this one was restored \
+                         beside it rather than over it"
+                    );
+                    run.conflicted += 1;
+                    RestoreOutcome::Conflicted {
+                        at: outcome.destination,
+                        kind: outcome.kind,
+                    }
                 }
             }
             Err(RecordedMoveError::Move(e)) => {
@@ -765,16 +1009,21 @@ mod tests {
 
         let run = execute_restore(&plan, &mut MoveRecorder::disabled());
 
-        assert_eq!(run.restored, 1);
+        assert_eq!(run.conflicted, 1, "restored, but not to its own name");
+        assert_eq!(run.restored, 0);
         assert_eq!(
             fs::read(root.join("in/first.jpg")).unwrap(),
             b"something else entirely",
             "the file that was already there must survive untouched"
         );
-        let RestoreOutcome::Restored { at, .. } = &run.outcomes[0].1 else {
-            panic!("expected a restore, got {:?}", run.outcomes[0].1);
+        let RestoreOutcome::Conflicted { at, .. } = &run.outcomes[0].1 else {
+            panic!("expected a conflict, got {:?}", run.outcomes[0].1);
         };
         assert_eq!(at, &root.join("in/first-1.jpg"));
+        assert!(
+            run.shortfall().is_some(),
+            "a library that is not as it was must not report a clean undo"
+        );
     }
 
     /// One file that cannot be put back is not a reason to abandon the rest.
@@ -812,9 +1061,10 @@ mod tests {
         let run = execute_restore(&plan, &mut MoveRecorder::disabled());
 
         assert_eq!(run.restored, 1);
-        assert_eq!(run.failed, 1);
+        assert_eq!(run.skipped_missing, 1);
+        assert_eq!(run.failed, 0, "an absent file is a skip, not a failure");
         assert!(root.join("in/b.jpg").exists());
-        assert!(matches!(run.outcomes[0].1, RestoreOutcome::Failed { .. }));
+        assert!(matches!(run.outcomes[0].1, RestoreOutcome::SkippedMissing));
     }
 
     /// An undo is a run like any other, and its journal has to describe it well
@@ -869,6 +1119,314 @@ mod tests {
             )),
             "a restore must be recorded as one: {entries:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Verification
+    // -----------------------------------------------------------------
+
+    /// A step pointing at `path`, claiming the file there is `size` bytes and,
+    /// when given, hashes to `hash`.
+    fn step_for(path: &Path, size: Option<u64>, hash: Option<&str>) -> RestoreStep {
+        RestoreStep {
+            seq: 0,
+            current: path.to_path_buf(),
+            original: path.with_file_name("original.jpg"),
+            source_size: size,
+            source_hash: hash.map(ToString::to_string),
+            kind: IntentKind::Organise,
+        }
+    }
+
+    #[test]
+    fn a_file_matching_what_the_run_recorded_verifies_intact() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a.jpg");
+        fs::write(&file, b"photo").unwrap();
+        let hash = crate::hasher::full_hash(&file).unwrap();
+
+        assert_eq!(
+            verify_step(&step_for(&file, Some(5), Some(&hash))),
+            Verification::Intact
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_no_longer_there_verifies_missing() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            verify_step(&step_for(&tmp.path().join("gone.jpg"), Some(5), None)),
+            Verification::Missing
+        );
+    }
+
+    /// The cheap check, and the one that catches an edit in place.
+    #[test]
+    fn a_file_of_a_different_size_verifies_modified() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a.jpg");
+        fs::write(&file, b"a much longer photo than before").unwrap();
+
+        let Verification::Modified { detail } = verify_step(&step_for(&file, Some(5), None)) else {
+            panic!("a file that grew must not verify as intact");
+        };
+        assert!(
+            detail.contains('5'),
+            "the recorded size belongs in the reason: {detail}"
+        );
+    }
+
+    /// The check that catches a replacement of exactly the same length — the
+    /// case size alone cannot see.
+    #[test]
+    fn a_file_of_the_same_size_but_different_contents_verifies_modified() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a.jpg");
+        fs::write(&file, b"first").unwrap();
+        let hash = crate::hasher::full_hash(&file).unwrap();
+        fs::write(&file, b"other").unwrap();
+
+        assert!(
+            matches!(
+                verify_step(&step_for(&file, Some(5), Some(&hash))),
+                Verification::Modified { .. }
+            ),
+            "same length, different bytes — only the digest can tell"
+        );
+    }
+
+    /// A run records no digest for a uniquely organised file, so the only
+    /// evidence available is existence and size. That is not a reason to refuse.
+    #[test]
+    fn a_step_with_no_recorded_evidence_verifies_on_existence_alone() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("a.jpg");
+        fs::write(&file, b"anything at all").unwrap();
+
+        assert_eq!(
+            verify_step(&step_for(&file, None, None)),
+            Verification::Intact
+        );
+    }
+
+    /// A directory standing where the file was is a replacement, not a file to
+    /// move — and moving it would take its contents with it.
+    #[test]
+    fn a_directory_where_the_file_was_verifies_modified() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("a.jpg");
+        fs::create_dir(&path).unwrap();
+
+        assert!(matches!(
+            verify_step(&step_for(&path, None, None)),
+            Verification::Modified { .. }
+        ));
+    }
+
+    /// Verification uses `symlink_metadata`, so a link left in the file's place
+    /// is judged as the link it is rather than as whatever it points at.
+    #[test]
+    fn a_symlink_where_the_file_was_verifies_modified() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("elsewhere.jpg");
+        fs::write(&target, b"photo").unwrap();
+        let link = tmp.path().join("a.jpg");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            matches!(
+                verify_step(&step_for(&link, Some(5), None)),
+                Verification::Modified { .. }
+            ),
+            "following the link would verify one file and then move another"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Refusing rather than guessing
+    // -----------------------------------------------------------------
+
+    /// The headline behaviour: a file that has changed since the run is left
+    /// exactly where it is, and said so.
+    #[test]
+    fn a_modified_file_is_reported_and_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("2024-03-15")).unwrap();
+        let organised = root.join("2024-03-15/a.jpg");
+        fs::write(&organised, b"edited since the run").unwrap();
+
+        let plan = RestorePlan {
+            journal: root.join("journal.jsonl"),
+            header: RunHeader::new("20240315-103000-abc123", root, vec![]),
+            steps: vec![RestoreStep {
+                seq: 0,
+                current: organised.clone(),
+                original: root.join("in/a.jpg"),
+                source_size: Some(5),
+                source_hash: None,
+                kind: IntentKind::Organise,
+            }],
+            interrupted: false,
+        };
+
+        let run = execute_restore(&plan, &mut MoveRecorder::disabled());
+
+        assert_eq!(run.skipped_modified, 1);
+        assert_eq!(run.restored, 0);
+        assert!(organised.exists(), "the file must not have been moved");
+        assert!(!root.join("in/a.jpg").exists());
+        assert!(matches!(
+            run.outcomes[0].1,
+            RestoreOutcome::SkippedModified { .. }
+        ));
+    }
+
+    /// A skipped file writes no journal line at all: nothing happened to it, so
+    /// an undo of this undo has nothing to reverse.
+    #[test]
+    fn a_skipped_file_is_never_recorded_as_moved() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("2024-03-15")).unwrap();
+        fs::write(root.join("2024-03-15/a.jpg"), b"edited since the run").unwrap();
+
+        let mut journal = Journal::create(
+            &root.join(".mmm/journal"),
+            &RunHeader::new("20240315-110000-undo01", root, vec![]),
+        )
+        .unwrap();
+
+        let plan = RestorePlan {
+            journal: root.join("journal.jsonl"),
+            header: RunHeader::new("20240315-103000-abc123", root, vec![]),
+            steps: vec![RestoreStep {
+                seq: 0,
+                current: root.join("2024-03-15/a.jpg"),
+                original: root.join("in/a.jpg"),
+                source_size: Some(5),
+                source_hash: None,
+                kind: IntentKind::Organise,
+            }],
+            interrupted: false,
+        };
+
+        let run = execute_restore(&plan, &mut MoveRecorder::new(Some(&mut journal)));
+        assert_eq!(run.skipped_modified, 1);
+
+        let path = journal.path().to_path_buf();
+        drop(journal);
+        let (_, entries) = Journal::read(&path).unwrap();
+        assert!(
+            entries.is_empty(),
+            "a file that was never touched must leave no trace: {entries:?}"
+        );
+    }
+
+    /// One ambiguous file does not stop the ones either side of it.
+    #[test]
+    fn every_step_gets_its_own_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let day = root.join("2024-03-15");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(root.join("in")).unwrap();
+        fs::write(day.join("good.jpg"), b"photo").unwrap();
+        fs::write(day.join("changed.jpg"), b"no longer five").unwrap();
+        fs::write(day.join("conflicted.jpg"), b"photo").unwrap();
+        // Something has taken the path this last one came from.
+        fs::write(root.join("in/conflicted.jpg"), b"a newer file").unwrap();
+
+        let step = |name: &str| RestoreStep {
+            seq: 0,
+            current: day.join(name),
+            original: root.join("in").join(name),
+            source_size: Some(5),
+            source_hash: None,
+            kind: IntentKind::Organise,
+        };
+
+        let plan = RestorePlan {
+            journal: root.join("journal.jsonl"),
+            header: RunHeader::new("20240315-103000-abc123", root, vec![]),
+            steps: vec![
+                step("good.jpg"),
+                step("changed.jpg"),
+                step("conflicted.jpg"),
+                step("vanished.jpg"),
+            ],
+            interrupted: false,
+        };
+
+        let run = execute_restore(&plan, &mut MoveRecorder::disabled());
+
+        assert_eq!(run.restored, 1);
+        assert_eq!(run.skipped_modified, 1);
+        assert_eq!(run.conflicted, 1);
+        assert_eq!(run.skipped_missing, 1);
+        assert_eq!(run.failed, 0);
+        assert_eq!(
+            run.outcomes.len(),
+            4,
+            "every step is accounted for exactly once"
+        );
+        assert_eq!(
+            fs::read(root.join("in/conflicted.jpg")).unwrap(),
+            b"a newer file",
+            "the occupant of a conflicted path is never overwritten"
+        );
+        assert!(root.join("in/conflicted-1.jpg").exists());
+    }
+
+    /// The exit-code decision, as one value. Anything short of "every file is
+    /// back under its own name" has to be visible to a script.
+    #[test]
+    fn a_clean_undo_reports_no_shortfall_and_anything_else_does() {
+        let clean = RestoreRun {
+            restored: 3,
+            ..RestoreRun::default()
+        };
+        assert!(clean.shortfall().is_none());
+
+        let messy = RestoreRun {
+            restored: 1,
+            conflicted: 1,
+            skipped_missing: 2,
+            ..RestoreRun::default()
+        };
+        let shortfall = messy.shortfall().expect("this undo was not clean");
+        assert!(shortfall.contains("2 skipped (missing)"), "{shortfall}");
+        assert!(shortfall.contains('1'), "{shortfall}");
+    }
+
+    /// A conflicted file did leave the library, so the undo's own journal has to
+    /// count it as moved — otherwise its `RunCompleted` line disagrees with the
+    /// commit records above it.
+    #[test]
+    fn the_counts_a_journal_records_add_up_to_every_step() {
+        let run = RestoreRun {
+            outcomes: Vec::new(),
+            restored: 2,
+            conflicted: 1,
+            skipped_missing: 3,
+            skipped_modified: 4,
+            failed: 5,
+            unprocessed: 6,
+            journal_failed: false,
+            pruned_dirs: 0,
+        };
+
+        assert_eq!(run.moved(), 3);
+        assert_eq!(run.skipped(), 13);
+        assert_eq!(run.moved() + run.skipped() + run.failed, 21);
+    }
+
+    /// A hand-edited journal must produce a bad message, never a panic.
+    #[test]
+    fn abbreviating_a_hash_shorter_than_the_abbreviation_is_not_a_panic() {
+        assert_eq!(abbreviate("abc"), "abc");
+        assert_eq!(abbreviate(""), "");
+        assert_eq!(abbreviate("0123456789abcdef"), "0123456789ab");
     }
 
     // -----------------------------------------------------------------
