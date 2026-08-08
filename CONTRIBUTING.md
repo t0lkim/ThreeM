@@ -149,7 +149,11 @@ pull request as the fix.
   Changelog heading — Added, Changed, Deprecated, Removed, Fixed, Security.
 - **A breaking change says so.** Prefix the entry `**BREAKING — …**` and state
   what an existing user's library or scripts will *do* on upgrade, not merely
-  what changed.
+  what changed. When a version is cut, those entries are collected into a
+  `### Breaking` section at the head of the release — ahead of Added and
+  Changed, because it is the part a user upgrading has to read — and the now
+  redundant prefix comes off. That heading is the one addition to the Keep a
+  Changelog set; everything else keeps its name.
 - **State the limits of a fix.** If it is partial, the entry names the cases
   still uncovered. An entry that overclaims is worse than no entry.
 - Purely internal changes — repository hygiene, ignore rules, tooling — need no

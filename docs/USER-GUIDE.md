@@ -40,6 +40,74 @@ mmm-dedup-verifier ~/Organised/duplicates/
 
 ---
 
+## Upgrading from 0.1.0
+
+0.1.0 was never tagged or published as a binary, so this concerns you only if you built `mmm` from source and ran it before this release. Two changes alter what the tool does with your files, and a third alters the shape of the tree it writes.
+
+### `--commit` is now required to move anything
+
+`mmm ~/Photos` used to move files. It now scans, plans, prints and exits, having touched nothing. `--commit` is the only thing that moves a file, and the run says which posture it is in before it starts:
+
+```
+DRY RUN — no files will be modified. Re-run with --commit to apply.
+```
+
+**A script written against 0.1.0 now does nothing and reports success.** It exits 0 with a plan on stdout and no files moved — which is the failure mode this change deliberately accepts, having chosen it over the previous one, where the shortest possible invocation rewrote a photo library in place with no confirmation and no way back. Add `--commit` to any script that is meant to move files.
+
+`--dry-run` still parses, so a script passing it does not fail on an unknown argument, but it is now a no-op: it prints a deprecation notice to stderr and changes nothing. `--dry-run --commit` commits. Drop the flag.
+
+### Dates now come from the camera's own wall clock
+
+`DateTimeOriginal` is a reading off the camera's clock with no timezone in it. 0.1.0 read it as UTC and derived the directory and the filename from that instant, so a photograph taken at 23:30 in Singapore was filed under the *next* day and stamped with a time it was not taken at:
+
+| | 0.1.0 | 0.2.0 |
+|---|---|---|
+| Taken `2024:03:15 23:30:00`, organised in Singapore | `2024-03-16/2024-03-16-153000.jpg` | `2024-03-15/2024-03-15-233000.jpg` |
+
+Affected: any file whose date came from a naive EXIF timestamp, from the filesystem, or from an MP4 container clock, organised on a machine that was not on UTC — plus `.mov` and `.mp4` files carrying an Apple `creationdate`, whose own recorded offset 0.1.0 discarded in favour of the machine's.
+
+Unaffected: runs made on a machine set to UTC, and files carrying an `OffsetTimeOriginal` tag, which were already read correctly.
+
+Which wall clock is used for a file that states no offset is now yours to set — see [Timezones](#timezones).
+
+### The date tree is one directory per day
+
+`2024/03/15/` is now `2024-03-15/`. To keep the old three-level layout, set it in a config file:
+
+```toml
+date_directory_format = "%Y/%m/%d"
+```
+
+That restores the layout. It does not restore the dates — the correction above applies whichever layout you choose.
+
+### What to do about a library 0.1.0 already organised
+
+**Nothing migrates on its own.** Running 0.2.0 over a tree 0.1.0 organised does not move, merge or rename anything that is already there; it treats the tree as an ordinary input library. Left alone, a library that has had both versions run over it ends up split across two layouts, with some files under the day after the one they were taken on.
+
+**`mmm undo` cannot reverse a 0.1.0 run.** The journal is new in this release. There is no record of what 0.1.0 did, so there is nothing to replay — the options below are the ones that remain.
+
+Three of them, in the order most people should consider them:
+
+1. **Leave it, and pin the layout.** Set `date_directory_format = "%Y/%m/%d"` so that new runs match the tree you already have. The dates stay as 0.1.0 wrote them. Reasonable if the library is large and being off by a day at the edges does not bother you.
+
+2. **Reorganise from the originals**, if you still have the cards or the import folder. This is the only option that owes nothing to what the previous run did, and the output is journalled, so `mmm undo` reverses it.
+
+3. **Reorganise the organised tree into a new directory.** The first run renamed and moved files; it did not alter the metadata inside them, so a second pass reads the same EXIF and derives the corrected path from it:
+
+   ```bash
+   # Preview. Nothing is modified — read the plan before going further.
+   mmm ~/Organised -o ~/Reorganised
+
+   # Apply. Journalled, so `mmm undo ~/Reorganised --last --commit` reverses it.
+   mmm ~/Organised -o ~/Reorganised --commit
+   ```
+
+   Two things to know before you do. Files 0.1.0 dated from the *filesystem* rather than from EXIF are dated from the filesystem again, and a cross-volume move does not preserve a modification time — so if the first run copied them between disks, their date is already the date of that copy and this run cannot recover it. And a 0.1.0 `duplicates/` directory is scanned like any other input, so its contents are re-examined as ordinary files; move it aside first if you want it left alone.
+
+   Preview first in every case. The plan names every destination, and it is cheaper to read than to undo.
+
+---
+
 ## mmm
 
 ### Usage
