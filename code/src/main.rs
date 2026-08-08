@@ -386,7 +386,8 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     // last line of defence rather than the first, and it belongs before the
     // banner so that a run which cannot name its files never announces that it
     // is about to move them.
-    let scheme = settings.naming_scheme()?;
+    let layout = settings.layout()?;
+    let filter = settings.scan_filter()?;
 
     // Say which posture we are in before doing any work, not after — a user
     // who expected a preview must not learn otherwise from the aftermath.
@@ -418,8 +419,19 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     let scanner::ScanResult {
         files,
         skipped: scan_skipped,
-    } = scanner::scan_directories(&config.directories);
+        excluded,
+    } = scanner::scan_directories(&config.directories, &filter);
     scan_spinner.finish_with_message(format!("found {} media files", files.len()));
+
+    // Printed rather than logged: a `skip_patterns` entry that is quietly
+    // excluding half a library should be visible to the operator, not inferred
+    // from a file count that came out lower than they expected.
+    if excluded > 0 {
+        println!(
+            "  {excluded} entr{} excluded by skip_patterns",
+            if excluded == 1 { "y" } else { "ies" }
+        );
+    }
 
     if files.is_empty() {
         println!("No media files found in the specified directories.");
@@ -469,7 +481,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
             &unique.file,
             output_dir,
             &geo,
-            &scheme,
+            &layout,
             unique.known_hash.clone(),
         ) {
             Ok(planned) => planned_moves.push(planned),
@@ -517,10 +529,17 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     let (dup_moved, dup_errors) = if dedup_result.duplicate_groups.is_empty() {
         (0, 0)
     } else {
-        println!("\nMoving duplicates to duplicates/ directory...");
+        println!(
+            "\nMoving duplicates to {}/ directory...",
+            layout.duplicates().display()
+        );
         let mut recorder = MoveRecorder::new(journal.as_mut());
-        match organiser::move_duplicates(&dedup_result.duplicate_groups, output_dir, &mut recorder)
-        {
+        match organiser::move_duplicates(
+            &dedup_result.duplicate_groups,
+            output_dir,
+            layout.duplicates(),
+            &mut recorder,
+        ) {
             Ok((dm, de)) => {
                 println!("  Moved {dm} duplicate files ({de} errors)");
                 (dm, de)

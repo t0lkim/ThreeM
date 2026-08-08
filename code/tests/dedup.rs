@@ -52,6 +52,7 @@ use assert_cmd::Command;
 use tempfile::TempDir;
 
 use common::{file_contents_by_marker, naive, snapshot_tree, snapshot_tree_hashed, MediaTree};
+use mmm::scanner::ScanFilter;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -114,7 +115,7 @@ fn scratch_output() -> (TempDir, PathBuf) {
 /// the scanner rather than assuming. This calls the same function the binary
 /// calls, over the same unmodified directory.
 fn scan_order(input: &Path) -> Vec<PathBuf> {
-    mmm::scanner::scan_directories(&[input.to_path_buf()])
+    mmm::scanner::scan_directories(&[input.to_path_buf()], &ScanFilter::default())
         .files
         .into_iter()
         .map(|f| f.path)
@@ -388,7 +389,8 @@ fn two_files_of_identical_size_but_different_content_are_not_grouped() {
         .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
         .jpeg_with_exif("b.jpg", naive(2024, 5, 6, 7, 8, 9), None);
 
-    let scanned = mmm::scanner::scan_directories(&[tree.path().to_path_buf()]).files;
+    let scanned =
+        mmm::scanner::scan_directories(&[tree.path().to_path_buf()], &ScanFilter::default()).files;
     assert_eq!(scanned.len(), 2);
     assert_eq!(
         scanned[0].size, scanned[1].size,

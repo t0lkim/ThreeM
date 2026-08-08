@@ -372,7 +372,7 @@ fn the_unsorted_path_is_used_when_a_file_genuinely_has_no_date() {
     };
 
     let scheme = Settings::default()
-        .naming_scheme()
+        .layout()
         .expect("the built-in default formats must be valid");
     let (dir, filename) = build_target_path(&meta, "jpg", "IMG_0001", &GeoLookup::new(), &scheme);
     assert_eq!(dir, Path::new("unsorted"));
@@ -1051,12 +1051,31 @@ fn project_config(contents: &str) -> TempDir {
 }
 
 /// Run `mmm` from inside `project`, so the config walk starts there.
+///
+/// The layers *below* the project config are emptied first, and they have to
+/// be: the developer's own `~/.config/mmm/config.toml` is a real layer under
+/// every assertion here, and an `MMM_CHUNK_SIZE` exported in the shell that ran
+/// `cargo test` outranks every file these tests write. Either would fail
+/// intermittently, on one machine, and read as a bug in the tool. Nothing calls
+/// `set_var` — the environment is set on the child, because Rust test binaries
+/// are threaded and one test's variable is every concurrent test's variable.
 fn run_in_project(project: &Path, args: &[&str]) -> std::process::Output {
-    Command::cargo_bin("mmm")
-        .unwrap()
-        .current_dir(project)
-        .args(args)
-        .output()
+    // Inside `project` rather than a directory of its own: `XDG_CONFIG_HOME`
+    // points at somewhere with no `mmm/config.toml` in it, which is the whole
+    // requirement, and this way it lives and dies with the fixture.
+    let empty_config_home = project.join("xdg-config-home");
+    std::fs::create_dir_all(&empty_config_home).expect("creating an empty config home");
+
+    let mut cmd = Command::cargo_bin("mmm").unwrap();
+    cmd.current_dir(project)
+        .env("XDG_CONFIG_HOME", &empty_config_home)
+        .args(args);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("MMM_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.output()
         .expect("running mmm inside a project directory")
 }
 
@@ -1195,6 +1214,203 @@ fn the_chunk_size_flag_outranks_a_project_config() {
         stdout_of(&out)
     );
     assert_eq!(file_contents_by_marker(&out_dir).len(), 3);
+}
+
+/// The formats, end to end, against a golden tree.
+///
+/// The two settings people actually want to stop retyping, in the two shapes
+/// the documentation offers: a nested layout, and a filename that keeps the
+/// original stem. Asserted as a whole tree rather than as "the destination
+/// contains 2024" — a format that reached the organiser but was applied to only
+/// one of the two would satisfy the weaker claim.
+#[test]
+fn a_project_config_supplies_the_dated_layout_and_the_filename() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("beach.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_with_exif("holiday/paris.jpg", naive(2024, 2, 20, 9, 5, 6), None);
+    let (_scratch, out_dir) = scratch_output();
+    let project = project_config(&format!(
+        "output_dir = {}\n\
+         date_directory_format = \"%Y/%Y-%m\"\n\
+         filename_format = \"{{original_stem}}-{{date}}-{{time}}.{{ext}}\"\n",
+        toml_path(&out_dir)
+    ));
+
+    let out = run_in_project(
+        project.path(),
+        &[
+            &tree.path().display().to_string(),
+            "--commit",
+            "--no-prompt",
+        ],
+    );
+    assert_ok(&out, "a commit run taking both formats from a config");
+
+    assert_eq!(
+        snapshot_tree(&out_dir),
+        vec![
+            "2024/2024-01/beach-2024-01-15-143000.jpg".to_string(),
+            "2024/2024-02/paris-2024-02-20-090506.jpg".to_string(),
+        ]
+    );
+
+    // ...and it is those files, not merely files of those names.
+    let landed = file_contents_by_marker(&out_dir);
+    assert_eq!(
+        landed.get("beach.jpg").map(Vec::as_slice),
+        Some(["2024/2024-01/beach-2024-01-15-143000.jpg".to_string()].as_slice())
+    );
+    assert_eq!(
+        landed.get("holiday/paris.jpg").map(Vec::as_slice),
+        Some(["2024/2024-02/paris-2024-02-20-090506.jpg".to_string()].as_slice())
+    );
+}
+
+/// A renamed `duplicates_dir` moves the relocated copies, manifest and all.
+///
+/// The `duplicates/` name was a literal in `organiser.rs` until this phase, so
+/// what this really asserts is that the setting is read at all — and the
+/// negative half matters as much as the positive one: a run that wrote to both
+/// would leave a photo library with two duplicate directories and no error.
+#[test]
+fn a_project_config_supplies_the_duplicates_directory() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("beach.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("copy.jpg", "beach.jpg");
+    let (_scratch, out_dir) = scratch_output();
+    let project = project_config(&format!(
+        "output_dir = {}\nduplicates_dir = \"copies\"\n",
+        toml_path(&out_dir)
+    ));
+
+    let out = run_in_project(
+        project.path(),
+        &[
+            &tree.path().display().to_string(),
+            "--commit",
+            "--no-prompt",
+        ],
+    );
+    assert_ok(&out, "a commit run with a configured duplicates directory");
+
+    let landed = snapshot_tree(&out_dir);
+    assert!(
+        landed
+            .iter()
+            .any(|path| path.starts_with("copies/000/") && path.ends_with("manifest.txt")),
+        "the group manifest should be under the configured directory: {landed:?}"
+    );
+    assert!(
+        landed
+            .iter()
+            .any(|path| path.starts_with("copies/000/") && !path.ends_with("manifest.txt")),
+        "the relocated duplicate should be under the configured directory: {landed:?}"
+    );
+    assert!(
+        !out_dir.join("duplicates").exists(),
+        "the built-in name must not be written as well: {landed:?}"
+    );
+    assert!(
+        stdout_of(&out).contains("copies/ directory"),
+        "the run should say where it is putting them:\n{}",
+        stdout_of(&out)
+    );
+}
+
+/// A renamed `unsorted_dir`, at the level where it is reachable.
+///
+/// **This one is deliberately not driven through the binary, and the reason is
+/// pre-existing behaviour rather than a shortcut.** See
+/// `a_file_with_unparseable_exif_is_dated_from_the_filesystem_not_sent_to_unsorted`
+/// above: `metadata::extract_metadata` falls back to the filesystem timestamp
+/// whenever EXIF cannot be read, and every file on disk has one, so no CLI
+/// invocation can put a file in the unsorted directory at all. A test that ran
+/// the binary and asserted an empty `no-date/` would pass for the wrong reason
+/// and would keep passing if the setting were ignored entirely.
+///
+/// So the config text is parsed by the real loader and resolved by the real
+/// fold — only the undateable *file* is constructed directly, because that is
+/// the part the CLI cannot produce.
+#[test]
+fn a_config_supplied_unsorted_directory_is_where_an_undateable_file_lands() {
+    let layer = mmm::settings::parse_layer("unsorted_dir = \"no-date\"\n", Path::new("mmm.toml"))
+        .expect("the fixture config must parse");
+    let settings = Settings::resolve([layer]);
+    let layout = settings.layout().expect("a valid layout");
+
+    let meta = FileMetadata {
+        date: None,
+        latitude: None,
+        longitude: None,
+        date_source: DateSource::None,
+    };
+    let (dir, filename) = build_target_path(&meta, "jpg", "IMG_0001", &GeoLookup::new(), &layout);
+
+    assert_eq!(dir, Path::new("no-date"));
+    assert_eq!(filename, "unknown.jpg");
+}
+
+/// A `skip_patterns` entry keeps files out of the scan — and, because the run
+/// never sees them, leaves them exactly where they are.
+///
+/// Both halves are asserted. "Not in the output tree" alone would also be true
+/// of a file the run had deleted, and the whole point of a skip is that the
+/// tool does not touch it.
+#[test]
+fn a_project_config_skip_pattern_excludes_files_from_the_scan() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("beach.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_with_exif("thumb_beach.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_with_exif("exports/web.jpg", naive(2024, 2, 20, 9, 5, 6), None);
+    let before = snapshot_tree_hashed(tree.path());
+    let (_scratch, out_dir) = scratch_output();
+    let project = project_config(&format!(
+        "output_dir = {}\nskip_patterns = [\"thumb_*.jpg\", \"exports\"]\n",
+        toml_path(&out_dir)
+    ));
+
+    let out = run_in_project(
+        project.path(),
+        &[
+            &tree.path().display().to_string(),
+            "--commit",
+            "--no-prompt",
+        ],
+    );
+    assert_ok(&out, "a commit run with configured skip patterns");
+
+    assert_eq!(
+        snapshot_tree(&out_dir),
+        vec!["2024-01-15/2024-01-15-143000.jpg".to_string()],
+        "only the unskipped photograph should have been organised"
+    );
+
+    // Untouched, not merely unorganised.
+    let after = snapshot_tree_hashed(tree.path());
+    let survivors: Vec<&String> = after.iter().collect();
+    assert!(
+        survivors
+            .iter()
+            .any(|entry| entry.contains("thumb_beach.jpg")),
+        "the skipped file must still be where it was: {after:?}"
+    );
+    assert!(
+        survivors
+            .iter()
+            .any(|entry| entry.contains("exports/web.jpg")),
+        "the skipped directory's contents must still be where they were: {after:?}"
+    );
+    assert_eq!(
+        before.len() - after.len(),
+        1,
+        "exactly one file — the unskipped one — should have left the input tree"
+    );
+
+    assert!(
+        stdout_of(&out).contains("excluded by skip_patterns"),
+        "a skip that quietly swallowed files would be invisible:\n{}",
+        stdout_of(&out)
+    );
 }
 
 /// A config file cannot make a run destructive. The file below is refused at the

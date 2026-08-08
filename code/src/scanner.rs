@@ -1,7 +1,10 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use thiserror::Error;
 use tracing::{debug, warn};
 use walkdir::{DirEntry, WalkDir};
 
@@ -23,6 +26,153 @@ pub const IMAGE_EXTENSIONS: &[&str] = &[
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mov", "mp4", "m4v", "avi", "mkv", "wmv", "flv", "webm", "3gp", "mts", "m2ts",
 ];
+
+/// A `skip_patterns` entry that is not a glob.
+///
+/// Refused where it was written rather than passed over, for the reason
+/// `deny_unknown_fields` exists one layer up: a pattern that silently matches
+/// nothing is indistinguishable from a setting that does not work, and the
+/// person who typed it would find out by wondering why their `.thumbnails`
+/// directory keeps being organised.
+#[derive(Debug, Error)]
+#[error("`skip_patterns` entry {pattern:?} is not a valid glob: {message}")]
+pub struct PatternError {
+    pub pattern: String,
+    pub message: String,
+}
+
+/// What the scan admits, and what it passes over.
+///
+/// Built once from the resolved [`crate::settings::Settings`] and handed to
+/// [`scan_directories`], so the extensions a run recognises and the paths it
+/// skips are decided in exactly one place.
+///
+/// # How a skip pattern is matched
+///
+/// * A pattern with **no `/`** is matched against each path component's own
+///   name — `*.tmp` skips those files anywhere in the tree, and `node_modules`
+///   or `.thumbnails` prunes that directory wherever it appears. This is the
+///   form people reach for, and matching it against the whole path instead
+///   would make the common case silently match nothing.
+/// * A pattern **containing `/`** is matched against the path relative to the
+///   scan root it was found under — `raw/**` skips one subtree and nothing with
+///   the same name elsewhere. `*` does not cross a separator; `**` does.
+///
+/// A matching directory is not descended into, so a skipped tree costs nothing
+/// to walk.
+#[derive(Debug)]
+pub struct ScanFilter {
+    image: HashSet<String>,
+    video: HashSet<String>,
+    /// Patterns matched against one component's name.
+    names: GlobSet,
+    /// Patterns matched against the path relative to the scan root.
+    paths: GlobSet,
+}
+
+impl Default for ScanFilter {
+    /// The built-in extensions, skipping nothing — what a run with no config
+    /// does.
+    fn default() -> Self {
+        Self {
+            image: IMAGE_EXTENSIONS.iter().map(|s| (*s).to_string()).collect(),
+            video: VIDEO_EXTENSIONS.iter().map(|s| (*s).to_string()).collect(),
+            names: GlobSet::empty(),
+            paths: GlobSet::empty(),
+        }
+    }
+}
+
+impl ScanFilter {
+    /// Build a filter from the resolved settings' extension lists and skip
+    /// patterns.
+    ///
+    /// Extensions are lowercased here rather than trusted, because the scanner
+    /// compares against a lowercased extension and a config file saying `"JPG"`
+    /// would otherwise match nothing at all.
+    ///
+    /// # Errors
+    ///
+    /// [`PatternError`] naming the first skip pattern that is not a glob.
+    pub fn new(
+        image: &[String],
+        video: &[String],
+        skip_patterns: &[String],
+    ) -> Result<Self, PatternError> {
+        let mut names = GlobSetBuilder::new();
+        let mut paths = GlobSetBuilder::new();
+
+        for pattern in skip_patterns {
+            let glob = compile(pattern)?;
+            if pattern.contains('/') {
+                paths.add(glob);
+            } else {
+                names.add(glob);
+            }
+        }
+
+        Ok(Self {
+            image: image.iter().map(|e| e.to_lowercase()).collect(),
+            video: video.iter().map(|e| e.to_lowercase()).collect(),
+            names: build(&names, skip_patterns)?,
+            paths: build(&paths, skip_patterns)?,
+        })
+    }
+
+    /// Whether `name` — one path component — is skipped outright.
+    fn skips_name(&self, name: &OsStr) -> bool {
+        self.names.is_match(name)
+    }
+
+    /// Whether `path` is skipped by a pattern written with a separator in it.
+    ///
+    /// `relative` is the path below the scan root; a path that is somehow not
+    /// below it is not matched rather than being matched against an absolute
+    /// path a pattern could never have meant.
+    fn skips_path(&self, relative: &Path) -> bool {
+        self.paths.is_match(relative)
+    }
+
+    /// The kind of media `extension` names, if it names one.
+    fn kind(&self, extension: &str) -> Option<MediaKind> {
+        if self.image.contains(extension) {
+            Some(MediaKind::Image)
+        } else if self.video.contains(extension) {
+            Some(MediaKind::Video)
+        } else {
+            None
+        }
+    }
+}
+
+/// Which of the two extension lists admitted a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaKind {
+    Image,
+    Video,
+}
+
+/// Compile one pattern, naming it if it will not compile.
+fn compile(pattern: &str) -> Result<Glob, PatternError> {
+    // `literal_separator` is what makes `*` stop at a `/`: without it,
+    // `raw/*` would match `raw/2024/a.jpg` and a pattern meant for one
+    // directory would take a whole subtree with it.
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .map_err(|error| PatternError {
+            pattern: pattern.to_string(),
+            message: error.to_string(),
+        })
+}
+
+/// Finish a set, attributing a failure to the patterns that went into it.
+fn build(builder: &GlobSetBuilder, patterns: &[String]) -> Result<GlobSet, PatternError> {
+    builder.build().map_err(|error| PatternError {
+        pattern: patterns.join(", "),
+        message: error.to_string(),
+    })
+}
 
 /// A discovered media file with basic filesystem metadata
 #[derive(Debug, Clone)]
@@ -55,6 +205,16 @@ pub struct ScanResult {
     /// it is a distinct condition, loud in its own right, and mixing it into
     /// this figure would make the number mean two things at once.
     pub skipped: usize,
+    /// Entries a `skip_patterns` entry matched — files passed over, and
+    /// directories the walk did not descend into (one each, whatever they
+    /// hold).
+    ///
+    /// Separate from `skipped` for the reason that field's own comment gives:
+    /// "we could not look" and "you told us not to" are different answers, and
+    /// one number meaning both would tell the operator neither. Reported so a
+    /// pattern that is quietly excluding a whole library is visible rather than
+    /// inferred from a count that came out lower than expected.
+    pub excluded: usize,
 }
 
 /// Whether the walk should refuse to descend into this entry.
@@ -79,18 +239,41 @@ fn is_excluded(entry: &DirEntry) -> bool {
         && entry.file_name() == OsStr::new(METADATA_DIR_NAME)
 }
 
+/// Whether `filter` says to pass this entry over.
+///
+/// The root itself is exempt, as it is for `.mmm/`: a directory named on the
+/// command line was pointed at deliberately, and a pattern that happened to
+/// match its name would silently scan nothing at all.
+fn is_skipped(entry: &DirEntry, root: &Path, filter: &ScanFilter) -> bool {
+    if entry.depth() == 0 {
+        return false;
+    }
+    if filter.skips_name(entry.file_name()) {
+        return true;
+    }
+    entry
+        .path()
+        .strip_prefix(root)
+        .is_ok_and(|relative| filter.skips_path(relative))
+}
+
 /// Scan one or more directories recursively for media files.
 ///
 /// Infallible by construction. Every per-entry failure is a warning and a
 /// skip, never an abort, because the caller is about to organise whatever
 /// comes back and "the scan died two directories in" must not be
 /// indistinguishable from "that is all there was".
-pub fn scan_directories(dirs: &[PathBuf]) -> ScanResult {
-    let image_ext: HashSet<&str> = IMAGE_EXTENSIONS.iter().copied().collect();
-    let video_ext: HashSet<&str> = VIDEO_EXTENSIONS.iter().copied().collect();
-
+///
+/// What counts as media, and what is passed over, is `filter`'s business —
+/// see [`ScanFilter`]. Pass [`ScanFilter::default`] for the built-in lists.
+pub fn scan_directories(dirs: &[PathBuf], filter: &ScanFilter) -> ScanResult {
     let mut files = Vec::new();
     let mut skipped = 0;
+    // A `Cell` because the count is incremented from inside `filter_entry`'s
+    // closure, which is where a pruned directory is decided and the only place
+    // it is visible — a directory that is never descended into produces no
+    // entry to count later.
+    let excluded = Cell::new(0usize);
 
     for dir in dirs {
         if !dir.is_dir() {
@@ -101,7 +284,17 @@ pub fn scan_directories(dirs: &[PathBuf]) -> ScanResult {
         for entry in WalkDir::new(dir)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|entry| !is_excluded(entry))
+            .filter_entry(|entry| {
+                if is_excluded(entry) {
+                    return false;
+                }
+                if is_skipped(entry, dir, filter) {
+                    debug!(path = %entry.path().display(), "skipped by skip_patterns");
+                    excluded.set(excluded.get() + 1);
+                    return false;
+                }
+                true
+            })
         {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -125,12 +318,9 @@ pub fn scan_directories(dirs: &[PathBuf]) -> ScanResult {
                 continue;
             };
 
-            let is_image = image_ext.contains(ext.as_str());
-            let is_video = video_ext.contains(ext.as_str());
-
-            if !is_image && !is_video {
+            let Some(kind) = filter.kind(&ext) else {
                 continue;
-            }
+            };
 
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
@@ -151,12 +341,16 @@ pub fn scan_directories(dirs: &[PathBuf]) -> ScanResult {
                 path: path.to_path_buf(),
                 size: metadata.len(),
                 extension: ext,
-                is_video,
+                is_video: kind == MediaKind::Video,
             });
         }
     }
 
-    ScanResult { files, skipped }
+    ScanResult {
+        files,
+        skipped,
+        excluded: excluded.get(),
+    }
 }
 
 fn normalised_extension(path: &Path) -> Option<String> {
@@ -182,7 +376,7 @@ mod tests {
         let jpg = tmp.path().join("photo.jpg");
         fs::write(&jpg, b"fake jpeg data").unwrap();
 
-        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &ScanFilter::default());
         assert_eq!(scan.files.len(), 1);
         assert_eq!(scan.files[0].extension, "jpg");
         assert!(!scan.files[0].is_video);
@@ -195,7 +389,7 @@ mod tests {
         let mov = tmp.path().join("clip.mov");
         fs::write(&mov, b"fake mov data").unwrap();
 
-        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &ScanFilter::default());
         assert_eq!(scan.files.len(), 1);
         assert!(scan.files[0].is_video);
     }
@@ -206,7 +400,7 @@ mod tests {
         fs::write(tmp.path().join("readme.txt"), b"text").unwrap();
         fs::write(tmp.path().join("doc.pdf"), b"pdf").unwrap();
 
-        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &ScanFilter::default());
         assert!(scan.files.is_empty());
         assert_eq!(
             scan.skipped, 0,
@@ -221,7 +415,7 @@ mod tests {
         fs::create_dir(&sub).unwrap();
         fs::write(sub.join("deep.png"), b"png data").unwrap();
 
-        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &ScanFilter::default());
         assert_eq!(scan.files.len(), 1);
     }
 
@@ -232,7 +426,10 @@ mod tests {
         fs::write(tmp1.path().join("a.jpg"), b"data").unwrap();
         fs::write(tmp2.path().join("b.mp4"), b"data").unwrap();
 
-        let scan = scan_directories(&[tmp1.path().to_path_buf(), tmp2.path().to_path_buf()]);
+        let scan = scan_directories(
+            &[tmp1.path().to_path_buf(), tmp2.path().to_path_buf()],
+            &ScanFilter::default(),
+        );
         assert_eq!(scan.files.len(), 2);
     }
 
@@ -242,7 +439,7 @@ mod tests {
         fs::write(tmp.path().join("photo.JPG"), b"data").unwrap();
         fs::write(tmp.path().join("clip.MOV"), b"data").unwrap();
 
-        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &ScanFilter::default());
         assert_eq!(scan.files.len(), 2);
     }
 
@@ -262,7 +459,7 @@ mod tests {
         // filter alone would already have passed over the .jsonl.
         fs::write(journal.join("thumbnail.jpg"), b"data").unwrap();
 
-        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &ScanFilter::default());
 
         assert_eq!(
             scan.files.len(),
@@ -289,7 +486,7 @@ mod tests {
         fs::write(nested.join("beach.jpg"), b"data").unwrap();
         fs::write(nested.join(".mmm").join("journal").join("stale.png"), b"x").unwrap();
 
-        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &ScanFilter::default());
 
         assert_eq!(scan.files.len(), 1);
         assert!(scan.files[0].path.ends_with("beach.jpg"));
@@ -305,8 +502,187 @@ mod tests {
         fs::create_dir(&meta).unwrap();
         fs::write(meta.join("recovered.jpg"), b"data").unwrap();
 
-        let scan = scan_directories(&[meta]);
+        let scan = scan_directories(&[meta], &ScanFilter::default());
         assert_eq!(scan.files.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // ScanFilter: extensions
+    // -----------------------------------------------------------------
+
+    /// A configured extension list *replaces* the built-in one, which is the
+    /// merge rule `PartialSettings` documents. A user who lists two formats
+    /// wants those two, not those two and twenty more.
+    #[test]
+    fn a_configured_extension_list_replaces_the_built_in_one() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("keep.dng"), b"data").unwrap();
+        fs::write(tmp.path().join("drop.jpg"), b"data").unwrap();
+
+        let filter = ScanFilter::new(&["dng".to_string()], &[], &[]).unwrap();
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
+
+        assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
+        assert!(scan.files[0].path.ends_with("keep.dng"));
+    }
+
+    /// A file's extension is lowercased before the comparison, so the list has
+    /// to be too — otherwise `image = ["JPG"]` would silently match nothing and
+    /// read as a scanner that cannot see photographs.
+    #[test]
+    fn a_configured_extension_is_matched_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("photo.JPG"), b"data").unwrap();
+
+        let filter = ScanFilter::new(&["JPG".to_string()], &[], &[]).unwrap();
+        assert_eq!(
+            scan_directories(&[tmp.path().to_path_buf()], &filter)
+                .files
+                .len(),
+            1
+        );
+    }
+
+    /// Which list an extension came from decides how its date is read later, so
+    /// a configured video extension has to arrive as a video.
+    #[test]
+    fn a_configured_video_extension_is_scanned_as_video() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("clip.insv"), b"data").unwrap();
+
+        let filter = ScanFilter::new(&[], &["insv".to_string()], &[]).unwrap();
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
+
+        assert_eq!(scan.files.len(), 1);
+        assert!(scan.files[0].is_video);
+    }
+
+    // -----------------------------------------------------------------
+    // ScanFilter: skip_patterns
+    // -----------------------------------------------------------------
+
+    /// The form people write: a bare glob, matched against a file's own name
+    /// anywhere in the tree.
+    #[test]
+    fn a_bare_pattern_skips_matching_files_at_any_depth() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("holiday")).unwrap();
+        fs::write(tmp.path().join("keep.jpg"), b"data").unwrap();
+        fs::write(tmp.path().join("holiday/thumb_small.jpg"), b"data").unwrap();
+
+        let filter =
+            ScanFilter::new(&["jpg".to_string()], &[], &["thumb_*.jpg".to_string()]).unwrap();
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
+
+        assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
+        assert!(scan.files[0].path.ends_with("keep.jpg"));
+        assert_eq!(scan.excluded, 1);
+        assert_eq!(
+            scan.skipped, 0,
+            "a file the operator asked to pass over is not one the scan could not read"
+        );
+    }
+
+    /// A directory the patterns match is not descended into, which is the case
+    /// the setting is actually for — a cache or an export folder somebody does
+    /// not want organised.
+    #[test]
+    fn a_matching_directory_is_pruned_rather_than_walked() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join(".thumbnails");
+        fs::create_dir_all(cache.join("nested")).unwrap();
+        fs::write(cache.join("a.jpg"), b"data").unwrap();
+        fs::write(cache.join("nested/b.jpg"), b"data").unwrap();
+        fs::write(tmp.path().join("real.jpg"), b"data").unwrap();
+
+        let filter =
+            ScanFilter::new(&["jpg".to_string()], &[], &[".thumbnails".to_string()]).unwrap();
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
+
+        assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
+        assert!(scan.files[0].path.ends_with("real.jpg"));
+        assert_eq!(
+            scan.excluded, 1,
+            "a pruned directory counts once, whatever it holds — the walk never enumerated it"
+        );
+    }
+
+    /// A pattern with a separator is anchored to the scan root, so it can name
+    /// one subtree without taking every directory of that name with it.
+    #[test]
+    fn a_pattern_with_a_separator_is_relative_to_the_scan_root() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("raw/2024")).unwrap();
+        fs::create_dir_all(tmp.path().join("holiday/raw")).unwrap();
+        fs::write(tmp.path().join("raw/2024/a.jpg"), b"data").unwrap();
+        fs::write(tmp.path().join("holiday/raw/b.jpg"), b"data").unwrap();
+
+        let filter = ScanFilter::new(&["jpg".to_string()], &[], &["raw/**".to_string()]).unwrap();
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
+
+        assert_eq!(
+            scan.files.len(),
+            1,
+            "only the top-level raw/ subtree should be skipped; got {:?}",
+            scan.files
+        );
+        assert!(scan.files[0].path.ends_with("holiday/raw/b.jpg"));
+    }
+
+    /// `*` stops at a separator: `raw/*.jpg` is a statement about the files
+    /// directly inside `raw/`, and the subdirectory beside them is untouched.
+    ///
+    /// Note what `raw/*` on its own would do instead — it matches the *directory*
+    /// `raw/2024` as well, and a matched directory is pruned, so it takes the
+    /// subtree with it. That is the gitignore reading and it is the one people
+    /// expect; this test pins the narrower pattern, where the difference is
+    /// observable.
+    #[test]
+    fn a_star_does_not_cross_a_separator() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("raw/2024")).unwrap();
+        fs::write(tmp.path().join("raw/top.jpg"), b"data").unwrap();
+        fs::write(tmp.path().join("raw/2024/deep.jpg"), b"data").unwrap();
+
+        let filter =
+            ScanFilter::new(&["jpg".to_string()], &[], &["raw/*.jpg".to_string()]).unwrap();
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
+
+        assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
+        assert!(
+            scan.files[0].path.ends_with("2024/deep.jpg"),
+            "the file one level down is not what `raw/*.jpg` named"
+        );
+    }
+
+    /// A root named on the command line was pointed at deliberately. A pattern
+    /// that happened to match its name must not turn the whole run into a scan
+    /// of nothing.
+    #[test]
+    fn a_pattern_cannot_skip_the_root_it_was_pointed_at() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("cache");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("photo.jpg"), b"data").unwrap();
+
+        let filter = ScanFilter::new(&["jpg".to_string()], &[], &["cache".to_string()]).unwrap();
+        let scan = scan_directories(&[root], &filter);
+
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.excluded, 0);
+    }
+
+    /// A pattern that will not compile is refused where it was written, not
+    /// dropped: a skip that silently matches nothing is indistinguishable from
+    /// a setting that does not work.
+    #[test]
+    fn a_pattern_that_is_not_a_glob_is_refused_and_named() {
+        let error = ScanFilter::new(&[], &[], &["[unclosed".to_string()]).unwrap_err();
+        assert_eq!(error.pattern, "[unclosed");
+        assert!(
+            error.to_string().contains("skip_patterns"),
+            "the refusal must name the setting: {error}"
+        );
     }
 
     /// One directory the walk cannot descend into must cost that directory
@@ -331,7 +707,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
         let readable = fs::read_dir(&locked).is_ok();
-        let scan = scan_directories(&[tmp.path().to_path_buf()]);
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &ScanFilter::default());
 
         // Restore before asserting, or `TempDir` cannot clean up after a panic.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();

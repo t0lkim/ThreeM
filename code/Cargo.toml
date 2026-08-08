@@ -22,6 +22,10 @@ thiserror = "2"
 walkdir = "2"
 toml = "1.1.4"
 directories = "6.0.0"
+# `skip_patterns` are globs. Hand-rolling the matcher would mean hand-rolling
+# character classes, `**` and escaping — three places to be subtly wrong about
+# which of somebody's photographs get passed over.
+globset = "0.4"
 
 [dev-dependencies]
 assert_cmd = "2"

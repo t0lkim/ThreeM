@@ -11,7 +11,7 @@ use crate::geocoder::GeoLookup;
 use crate::hasher::DuplicateGroup;
 use crate::journal::{IntentKind, Journal, JournalEntry};
 use crate::metadata::{self, DateSource, FileMetadata};
-use crate::naming::{sanitise_for_filename, year_is_representable, FilenameParts, Scheme};
+use crate::naming::{sanitise_for_filename, year_is_representable, FilenameParts, Layout};
 use crate::scanner::ScannedFile;
 
 /// A planned file operation (computed during scan, executed during process)
@@ -39,7 +39,7 @@ pub fn plan_move(
     file: &ScannedFile,
     output_dir: &Path,
     geo: &GeoLookup,
-    scheme: &Scheme,
+    layout: &Layout,
     known_hash: Option<String>,
 ) -> Result<PlannedMove> {
     let meta = metadata::extract_metadata(&file.path, file.is_video)?;
@@ -55,7 +55,7 @@ pub fn plan_move(
         .unwrap_or_default();
 
     let (date_dir, filename) =
-        build_target_path(&meta, &file.extension, original_stem, geo, scheme);
+        build_target_path(&meta, &file.extension, original_stem, geo, layout);
     let destination = output_dir.join(date_dir).join(filename);
 
     Ok(PlannedMove {
@@ -67,14 +67,14 @@ pub fn plan_move(
     })
 }
 
-/// Build the dated directory and the filename `scheme` asks for.
+/// Build the dated directory and the filename `layout` asks for.
 ///
 /// Total by construction: the directory it returns is either the rendering of
-/// [`Scheme::date_directory`] — a relative path of ordinary components, whatever
-/// the pattern — or exactly `unsorted`, and the filename is always a single
-/// ordinary path component. `tests/path_properties.rs` asserts both over
-/// generated input *and over generated formats*, which is what closed the four
-/// holes described below.
+/// [`Scheme::date_directory`] or the layout's `unsorted` directory — both
+/// relative paths of ordinary components, whatever the config said — and the
+/// filename is always a single ordinary path component. `tests/path_properties.rs`
+/// asserts both over generated input *and over generated formats*, which is what
+/// closed the four holes described below.
 ///
 /// **The extension is sanitised.** It arrives here as arbitrary text — this
 /// function is `pub`, and nothing in its signature stops a caller passing
@@ -84,32 +84,32 @@ pub fn plan_move(
 /// not reachable from the CLI; it is fixed because the invariant belongs to the
 /// function rather than to the discipline of one caller.
 ///
-/// **A year outside four digits goes to `unsorted`.** See
+/// **A year outside four digits goes to the unsorted directory.** See
 /// [`crate::naming::year_is_representable`] — printing it produced directories
 /// like `44-03-15` and, for the negative years `chrono` will parse out of an
 /// EXIF string, `-44-03-15` plus a filename beginning with `-`.
 ///
-/// **A format that renders to nothing goes to `unsorted` too.** A pattern is
+/// **A format that renders to nothing goes there too.** A pattern is
 /// trial-rendered when it is validated, so this is not reachable from a config
 /// file; it is here because `Scheme` renders against a date and a date is not
-/// something validation can enumerate. `unsorted/` is the bucket that already
-/// means "no filing we can trust", which is better than a directory named after
-/// whatever the default happened to be.
+/// something validation can enumerate. The unsorted directory is the bucket that
+/// already means "no filing we can trust", which is better than a directory
+/// named after whatever the default happened to be.
 // exposed for integration tests
 pub fn build_target_path(
     meta: &FileMetadata,
     extension: &str,
     original_stem: &str,
     geo: &GeoLookup,
-    scheme: &Scheme,
+    layout: &Layout,
 ) -> (PathBuf, String) {
     let extension = sanitise_for_filename(extension);
 
     let dated = match meta.date {
-        Some(dt) if year_is_representable(dt.year()) => scheme.date_directory(&dt).map(|dir| {
+        Some(dt) if year_is_representable(dt.year()) => layout.date_directory(&dt).map(|dir| {
             (
                 dir,
-                date_filename(&dt, meta, &extension, original_stem, geo, scheme),
+                date_filename(&dt, meta, &extension, original_stem, geo, layout),
             )
         }),
         _ => None,
@@ -117,7 +117,7 @@ pub fn build_target_path(
 
     dated.unwrap_or_else(|| {
         (
-            PathBuf::from("unsorted"),
+            layout.unsorted().to_path_buf(),
             format!("{}.{extension}", crate::naming::UNNAMED),
         )
     })
@@ -134,12 +134,12 @@ fn date_filename(
     extension: &str,
     original_stem: &str,
     geo: &GeoLookup,
-    scheme: &Scheme,
+    layout: &Layout,
 ) -> String {
     let date = format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day());
     let time = format!("{:02}{:02}{:02}", dt.hour(), dt.minute(), dt.second());
 
-    let location = match (scheme.include_location(), meta.latitude, meta.longitude) {
+    let location = match (layout.include_location(), meta.latitude, meta.longitude) {
         (true, Some(lat), Some(lon)) => geo
             .lookup(lat, lon)
             // The separator belongs to the token, not to the pattern: a file
@@ -148,7 +148,7 @@ fn date_filename(
         _ => String::new(),
     };
 
-    scheme.filename(&FilenameParts {
+    layout.filename(&FilenameParts {
         date: &date,
         time: &time,
         location: &location,
@@ -529,9 +529,13 @@ pub(crate) fn recorded_move(
     }
 }
 
-/// Move duplicate files into numbered subdirectories under duplicates/
-/// Each duplicate group gets its own directory: duplicates/000/, duplicates/001/, etc.
+/// Move duplicate files into numbered subdirectories under the duplicates
+/// directory — `duplicates/000/`, `duplicates/001/`, and so on, or whatever
+/// `duplicates_dir` renamed it to.
 /// The first file in each group is the "original" and is NOT moved here.
+///
+/// `duplicates_dir` is relative to `output_dir` and comes from the run's
+/// [`Layout`], which is the proof it cannot leave the output tree.
 ///
 /// Each group's `manifest.txt` is written in full before any of that group's
 /// files move, and each outcome is appended as it happens — see
@@ -550,9 +554,10 @@ pub(crate) fn recorded_move(
 pub fn move_duplicates(
     groups: &[DuplicateGroup],
     output_dir: &Path,
+    duplicates_dir: &Path,
     recorder: &mut MoveRecorder<'_>,
 ) -> Result<(usize, usize)> {
-    let dup_base = output_dir.join("duplicates");
+    let dup_base = output_dir.join(duplicates_dir);
     let mut moved = 0;
     let mut errors = 0;
 
@@ -1312,12 +1317,24 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// The scheme a run with no config file uses, so that every assertion below
-    /// pins the *default* behaviour rather than a scheme invented for the test.
-    fn scheme() -> Scheme {
+    /// The layout a run with no config file uses, so that every assertion below
+    /// pins the *default* behaviour rather than one invented for the test.
+    fn scheme() -> Layout {
         crate::settings::Settings::default()
-            .naming_scheme()
+            .layout()
             .expect("the built-in default formats must be valid")
+    }
+
+    /// A layout built from the two formats, with the default directories.
+    fn layout_of(date_directory_format: &str, filename_format: &str, location: bool) -> Layout {
+        crate::settings::Settings {
+            date_directory_format: date_directory_format.to_string(),
+            filename_format: filename_format.to_string(),
+            include_location: location,
+            ..Default::default()
+        }
+        .layout()
+        .expect("the test's formats must be valid")
     }
 
     #[test]
@@ -1338,7 +1355,7 @@ mod tests {
     /// function that files the photograph rather than through the format alone.
     #[test]
     fn test_a_configured_date_directory_format_nests_the_tree() {
-        let nested = Scheme::new("%Y/%m/%d", "{date}-{time}{location}.{ext}", true).unwrap();
+        let nested = layout_of("%Y/%m/%d", "{date}-{time}{location}.{ext}", true);
         let (dir, filename) =
             build_target_path(&at(2024, 3, 15), "jpg", "IMG_0001", geo(), &nested);
         assert_eq!(dir, PathBuf::from("2024/03/15"));
@@ -1348,7 +1365,7 @@ mod tests {
     /// And the other half: the name, with a token the default never uses.
     #[test]
     fn test_a_configured_filename_format_is_applied() {
-        let renamed = Scheme::new("%Y-%m-%d", "{original_stem}-{date}.{ext}", true).unwrap();
+        let renamed = layout_of("%Y-%m-%d", "{original_stem}-{date}.{ext}", true);
         let (dir, filename) =
             build_target_path(&at(2024, 3, 15), "jpg", "IMG_0001", geo(), &renamed);
         assert_eq!(dir, PathBuf::from("2024-03-15"));
@@ -1365,7 +1382,7 @@ mod tests {
         located.longitude = Some(-0.12);
 
         let (_, with) = build_target_path(&located, "jpg", "IMG_0001", geo(), &scheme());
-        let without = Scheme::new("%Y-%m-%d", "{date}-{time}{location}.{ext}", false).unwrap();
+        let without = layout_of("%Y-%m-%d", "{date}-{time}{location}.{ext}", false);
         let (_, plain) = build_target_path(&located, "jpg", "IMG_0001", geo(), &without);
 
         assert!(
@@ -2142,8 +2159,13 @@ mod tests {
         let group = duplicate_group(&[kept, doomed.clone(), survivor.clone()], b"BODY");
         fs::remove_file(&doomed).unwrap();
 
-        let (moved, errors) =
-            move_duplicates(&[group], &output, &mut MoveRecorder::disabled()).unwrap();
+        let (moved, errors) = move_duplicates(
+            &[group],
+            &output,
+            Path::new("duplicates"),
+            &mut MoveRecorder::disabled(),
+        )
+        .unwrap();
 
         assert_eq!((moved, errors), (1, 1), "one move must fail, one succeed");
 
@@ -2184,8 +2206,13 @@ mod tests {
         }
 
         let group = duplicate_group(&[kept, first.clone(), second.clone()], b"BODY");
-        let (moved, errors) =
-            move_duplicates(&[group], &output, &mut MoveRecorder::disabled()).unwrap();
+        let (moved, errors) = move_duplicates(
+            &[group],
+            &output,
+            Path::new("duplicates"),
+            &mut MoveRecorder::disabled(),
+        )
+        .unwrap();
         assert_eq!((moved, errors), (2, 0));
 
         let group_dir = output.join("duplicates/000");
@@ -2577,6 +2604,7 @@ mod tests {
         let (moved, errors) = move_duplicates(
             &[group],
             &output,
+            Path::new("duplicates"),
             &mut MoveRecorder::new(Some(&mut journal)),
         )
         .unwrap();
@@ -2624,6 +2652,7 @@ mod tests {
         move_duplicates(
             &[group],
             &tmp.path().join("output"),
+            Path::new("duplicates"),
             &mut MoveRecorder::new(Some(&mut journal)),
         )
         .unwrap();

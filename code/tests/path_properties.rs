@@ -48,9 +48,11 @@ use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use mmm::geocoder::GeoLookup;
 use mmm::metadata::{DateSource, FileMetadata};
 use mmm::naming::{
-    sanitise_for_filename, year_is_representable, DateDirectoryFormat, FilenameFormat, Scheme,
+    sanitise_for_filename, year_is_representable, DateDirectoryFormat, FilenameFormat, Layout,
+    OutputSubdir, Scheme,
 };
 use mmm::organiser::{build_target_path, collision_candidate, execute_move, PlannedMove};
+use mmm::scanner::ScanFilter;
 use mmm::settings::Settings;
 use proptest::prelude::*;
 use tempfile::TempDir;
@@ -62,16 +64,17 @@ fn geo() -> &'static GeoLookup {
     GEO.get_or_init(GeoLookup::new)
 }
 
-/// The naming scheme a run with no config file uses.
+/// The layout a run with no config file uses.
 ///
 /// Every property above is stated about the *default* layout, which is what the
 /// tool promises when nobody has configured it. The configured case has its own
-/// section at the bottom of this file, where the format is generated too.
-fn scheme() -> &'static Scheme {
-    static SCHEME: OnceLock<Scheme> = OnceLock::new();
-    SCHEME.get_or_init(|| {
+/// section at the bottom of this file, where the formats and the two
+/// directories are generated too.
+fn scheme() -> &'static Layout {
+    static LAYOUT: OnceLock<Layout> = OnceLock::new();
+    LAYOUT.get_or_init(|| {
         Settings::default()
-            .naming_scheme()
+            .layout()
             .expect("the built-in default formats must be valid")
     })
 }
@@ -393,7 +396,7 @@ proptest! {
         let source = input.join(format!("{stem}.{ext}"));
         fs::write(&source, b"pixels").unwrap();
 
-        let scan = mmm::scanner::scan_directories(std::slice::from_ref(&input));
+        let scan = mmm::scanner::scan_directories(std::slice::from_ref(&input), &ScanFilter::default());
         prop_assert_eq!(
             scan.files.len(),
             1,
@@ -616,14 +619,54 @@ fn filename_format() -> impl Strategy<Value = FilenameFormat> {
         })
 }
 
-/// Both formats at once, as a run holds them.
-fn naming_scheme() -> impl Strategy<Value = Scheme> {
-    (date_format(), filename_format(), any::<bool>()).prop_filter_map(
-        "not a scheme the loader accepts",
-        |(date, name, include_location)| {
-            Scheme::new(date.pattern(), name.pattern(), include_location).ok()
-        },
+/// Fragments a generated `unsorted_dir` is assembled from.
+///
+/// Deliberately hostile in the ways a directory name can be: separators that
+/// make it nested, a dot that would hide it, characters no filename should
+/// carry. Every one of these is *accepted* by the loader — the two shapes it
+/// refuses (`/` first, and `..`) cannot be generated here, because a strategy
+/// that mostly produced rejects would be testing the refusal rather than the
+/// containment.
+const SUBDIR_FRAGMENTS: &[&str] = &[
+    "unsorted", "undated", "/", "-", "_", ".", " ", "%", "a", "", "0",
+];
+
+/// An `unsorted_dir` or `duplicates_dir` the loader would accept.
+fn subdir(key: &'static str) -> impl Strategy<Value = OutputSubdir> {
+    prop::collection::vec(
+        prop_oneof![
+            8 => prop::sample::select(SUBDIR_FRAGMENTS).prop_map(str::to_owned),
+            1 => arbitrary_text(),
+        ],
+        1..4,
     )
+    .prop_map(|pieces| pieces.concat())
+    .prop_filter_map("not a directory the loader accepts", move |pattern| {
+        OutputSubdir::new(key, &pattern).ok()
+    })
+}
+
+/// The whole configured shape of an output tree, as a run holds it.
+///
+/// The two directories are generated alongside the formats because they are
+/// subject to the same rule: an undated photograph has to land inside the tree
+/// the run was pointed at, whatever the config file called the bucket it lands
+/// in.
+fn naming_scheme() -> impl Strategy<Value = Layout> {
+    (
+        date_format(),
+        filename_format(),
+        any::<bool>(),
+        subdir("unsorted_dir"),
+        subdir("duplicates_dir"),
+    )
+        .prop_filter_map(
+            "not a layout the loader accepts",
+            |(date, name, include_location, unsorted, duplicates)| {
+                let scheme = Scheme::new(date.pattern(), name.pattern(), include_location).ok()?;
+                Some(Layout::new(scheme, unsorted, duplicates))
+            },
+        )
 }
 
 proptest! {

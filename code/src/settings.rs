@@ -32,8 +32,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
-use crate::naming::{DateDirectoryFormat, FilenameFormat, FormatError, Scheme};
-use crate::scanner::{IMAGE_EXTENSIONS, VIDEO_EXTENSIONS};
+use crate::naming::{
+    DateDirectoryFormat, FilenameFormat, FormatError, Layout, OutputSubdir, Scheme,
+};
+use crate::scanner::{PatternError, ScanFilter, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS};
 
 /// Files processed between prompts, when nothing says otherwise.
 pub const DEFAULT_CHUNK_SIZE: usize = 100;
@@ -229,9 +231,12 @@ pub struct PartialSettings {
     #[serde(default, deserialize_with = "de_filename_format")]
     pub filename_format: Option<String>,
     pub include_location: Option<bool>,
+    #[serde(default, deserialize_with = "de_duplicates_dir")]
     pub duplicates_dir: Option<PathBuf>,
+    #[serde(default, deserialize_with = "de_unsorted_dir")]
     pub unsorted_dir: Option<PathBuf>,
     pub extensions: Option<PartialExtensions>,
+    #[serde(default, deserialize_with = "de_skip_patterns")]
     pub skip_patterns: Option<Vec<String>>,
 }
 
@@ -309,24 +314,104 @@ where
     Ok(pattern)
 }
 
+/// Read `duplicates_dir`, refusing a name that would leave the output tree.
+///
+/// See [`de_date_directory_format`] for why this is a deserialiser. The
+/// containment argument is the same one, and it applies here for a blunter
+/// reason: `duplicates_dir = "/"` is a single line that would scatter a photo
+/// library across the root of the filesystem.
+fn de_duplicates_dir<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    de_subdir(deserializer, "duplicates_dir")
+}
+
+/// Read `unsorted_dir`, refusing a name that would leave the output tree.
+///
+/// See [`de_duplicates_dir`].
+fn de_unsorted_dir<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    de_subdir(deserializer, "unsorted_dir")
+}
+
+/// The shared body of the two subdirectory deserialisers.
+fn de_subdir<'de, D>(deserializer: D, key: &'static str) -> Result<Option<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let name = Option::<String>::deserialize(deserializer)?;
+    if let Some(name) = &name {
+        OutputSubdir::new(key, name).map_err(serde::de::Error::custom)?;
+    }
+    Ok(name.map(PathBuf::from))
+}
+
+/// Read `skip_patterns`, refusing an entry that is not a glob.
+///
+/// See [`de_date_directory_format`] for why this is a deserialiser. A pattern
+/// that will not compile is refused rather than dropped, because a skip that
+/// silently matches nothing is indistinguishable from a setting that does not
+/// work — and the operator would only find out by noticing that files they
+/// asked to pass over were organised anyway.
+fn de_skip_patterns<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let patterns = Option::<Vec<String>>::deserialize(deserializer)?;
+    if let Some(patterns) = &patterns {
+        ScanFilter::new(&[], &[], patterns).map_err(serde::de::Error::custom)?;
+    }
+    Ok(patterns)
+}
+
 impl Settings {
-    /// The validated naming scheme this run files and names files with.
+    /// The validated shape of the output tree this run writes.
     ///
-    /// Every layer that can supply a format validates it as it is read — the
-    /// file layers in [`parse_layer`], the environment in [`env_layer`] — so in
-    /// a real run this cannot fail. It returns a `Result` anyway because
+    /// Every layer that can supply one of these validates it as it is read —
+    /// the file layers in [`parse_layer`], the environment in [`env_layer`] —
+    /// so in a real run this cannot fail. It returns a `Result` anyway because
     /// [`Settings`] is an ordinary struct that a caller may build by hand, and
     /// the alternative to an error here would be the organiser discovering the
     /// problem with half a library already moved.
     ///
+    /// The two directory names go through `to_string_lossy`, so a path that is
+    /// not valid UTF-8 — impossible from TOML, and unreachable through the
+    /// environment parser, but constructible by hand — arrives as replacement
+    /// characters and is sanitised like any other text rather than being
+    /// refused for a reason nobody could act on.
+    ///
     /// # Errors
     ///
-    /// The first [`FormatError`] either pattern produces.
-    pub fn naming_scheme(&self) -> Result<Scheme, FormatError> {
-        Scheme::new(
-            &self.date_directory_format,
-            &self.filename_format,
-            self.include_location,
+    /// The first [`FormatError`] any of the four produces.
+    pub fn layout(&self) -> Result<Layout, FormatError> {
+        Ok(Layout::new(
+            Scheme::new(
+                &self.date_directory_format,
+                &self.filename_format,
+                self.include_location,
+            )?,
+            OutputSubdir::new("unsorted_dir", &self.unsorted_dir.to_string_lossy())?,
+            OutputSubdir::new("duplicates_dir", &self.duplicates_dir.to_string_lossy())?,
+        ))
+    }
+
+    /// What the scan admits and what it passes over.
+    ///
+    /// Fallible for the same reason as [`Self::layout`]: every layer compiled
+    /// its own patterns as it was read, so this is the last line of defence
+    /// rather than the first.
+    ///
+    /// # Errors
+    ///
+    /// [`PatternError`] naming the first skip pattern that is not a glob.
+    pub fn scan_filter(&self) -> Result<ScanFilter, PatternError> {
+        ScanFilter::new(
+            &self.extensions.image,
+            &self.extensions.video,
+            &self.skip_patterns,
         )
     }
 
@@ -761,8 +846,20 @@ where
         match key.as_str() {
             "output_dir" => layer.output_dir = Some(PathBuf::from(value)),
             "journal_dir" => layer.journal_dir = Some(PathBuf::from(value)),
-            "duplicates_dir" => layer.duplicates_dir = Some(PathBuf::from(value)),
-            "unsorted_dir" => layer.unsorted_dir = Some(PathBuf::from(value)),
+            // The two that must stay below the output tree are checked here for
+            // the same reason the formats are: the file layers refuse
+            // `duplicates_dir = "/"`, and an environment that did not would be a
+            // hole straight through that refusal.
+            "duplicates_dir" => {
+                OutputSubdir::new("duplicates_dir", &value)
+                    .map_err(|error| env_refusal(&variable, &error))?;
+                layer.duplicates_dir = Some(PathBuf::from(value));
+            }
+            "unsorted_dir" => {
+                OutputSubdir::new("unsorted_dir", &value)
+                    .map_err(|error| env_refusal(&variable, &error))?;
+                layer.unsorted_dir = Some(PathBuf::from(value));
+            }
             // Validated here rather than after the fold for the same reason the
             // file layers are, minus the span: the variable's own name is the
             // thing the reader has to go and fix.
@@ -778,7 +875,12 @@ where
             "verbose" => layer.verbose = Some(parse_number(&variable, &value)?),
             "no_prompt" => layer.no_prompt = Some(parse_bool(&variable, &value)?),
             "include_location" => layer.include_location = Some(parse_bool(&variable, &value)?),
-            "skip_patterns" => layer.skip_patterns = Some(parse_list(&value)),
+            "skip_patterns" => {
+                let patterns = parse_list(&value);
+                ScanFilter::new(&[], &[], &patterns)
+                    .map_err(|error| env_refusal(&variable, &error))?;
+                layer.skip_patterns = Some(patterns);
+            }
             "extensions_image" => {
                 extensions.image = Some(parse_list(&value));
                 saw_extensions = true;
@@ -805,8 +907,13 @@ where
     Ok(layer)
 }
 
-/// Dress a [`FormatError`] as the environment's refusal of one variable.
-fn env_refusal(variable: &str, error: &FormatError) -> ConfigError {
+/// Dress a validation failure as the environment's refusal of one variable.
+///
+/// Generic over the error so the formats, the two subdirectories and the skip
+/// patterns all report the same way: the variable's own name, then whatever the
+/// validator said. The variable name is the thing the reader has to go and fix,
+/// and it is the one piece none of the validators knows.
+fn env_refusal(variable: &str, error: &impl fmt::Display) -> ConfigError {
     ConfigError::Environment {
         variable: variable.to_string(),
         message: error.to_string(),
@@ -1213,7 +1320,7 @@ mod tests {
         )]);
         assert_eq!(settings.date_directory_format, "%Y/%Y-%m");
         assert_eq!(settings.filename_format, "{original_stem}-{date}.{ext}");
-        assert!(settings.naming_scheme().is_ok());
+        assert!(settings.layout().is_ok());
     }
 
     /// A config file gets the file, the line and the column, because that is
@@ -1255,14 +1362,98 @@ mod tests {
         );
     }
 
+    /// The two directories are subject to the same containment rule as the
+    /// dated path, and for a blunter reason: `unsorted_dir = "/etc"` is one line
+    /// that would file photographs outside the tree the run was pointed at.
+    /// Refused by the layer that carries it, so the position is the value's own.
+    #[test]
+    fn a_subdirectory_that_could_leave_the_output_tree_is_refused_at_its_position() {
+        let error = parse_layer("unsorted_dir = \"/etc\"\n", Path::new("mmm.toml"))
+            .expect_err("an absolute unsorted_dir must be refused");
+        let message = error.to_string();
+        assert!(message.starts_with("mmm.toml:1:"), "got {message}");
+        assert!(message.contains("unsorted_dir"), "got {message}");
+        assert!(message.contains("absolute path"), "got {message}");
+
+        let error = parse_layer(
+            "chunk_size = 10\nduplicates_dir = \"../dupes\"\n",
+            Path::new("mmm.toml"),
+        )
+        .expect_err("a duplicates_dir walking out of the tree must be refused");
+        let message = error.to_string();
+        assert!(message.starts_with("mmm.toml:2:"), "got {message}");
+        assert!(message.contains("duplicates_dir"), "got {message}");
+    }
+
+    /// The environment is not a hole through the rule above.
+    #[test]
+    fn a_subdirectory_from_the_environment_is_refused_and_names_the_variable() {
+        let error = env_layer([("MMM_UNSORTED_DIR".to_string(), "/etc".to_string())])
+            .expect_err("an absolute unsorted_dir must be refused");
+        let message = error.to_string();
+        assert!(message.starts_with("MMM_UNSORTED_DIR:"), "got {message}");
+        assert!(message.contains("absolute path"), "got {message}");
+
+        assert!(
+            env_layer([("MMM_DUPLICATES_DIR".to_string(), "copies".to_string())]).is_ok(),
+            "an ordinary name must still be accepted"
+        );
+    }
+
+    /// A skip pattern that will not compile is a config error, not a pattern
+    /// that quietly matches nothing.
+    #[test]
+    fn a_skip_pattern_that_is_not_a_glob_is_refused() {
+        let error = parse_layer("skip_patterns = [\"[unclosed\"]\n", Path::new("mmm.toml"))
+            .expect_err("a malformed glob must be refused");
+        let message = error.to_string();
+        assert!(message.starts_with("mmm.toml:1:"), "got {message}");
+        assert!(message.contains("skip_patterns"), "got {message}");
+
+        let error = env_layer([("MMM_SKIP_PATTERNS".to_string(), "*.tmp,[bad".to_string())])
+            .expect_err("a malformed glob must be refused from the environment too");
+        assert!(
+            error.to_string().starts_with("MMM_SKIP_PATTERNS:"),
+            "got {error}"
+        );
+
+        assert!(
+            parse_layer(
+                "skip_patterns = [\"*.tmp\", \"raw/**\"]\n",
+                Path::new("mmm.toml")
+            )
+            .is_ok(),
+            "the patterns the documentation offers must be accepted"
+        );
+    }
+
+    /// The settings the organiser and the scanner actually read come off the
+    /// resolved struct, so a key that resolves and never reaches them is the
+    /// bug this asserts against.
+    #[test]
+    fn the_resolved_settings_build_the_layout_and_the_filter_they_name() {
+        let settings = Settings::resolve([layer(
+            r#"{"unsorted_dir": "no-date", "duplicates_dir": "copies",
+                "skip_patterns": ["*.tmp"],
+                "extensions": {"image": ["dng"], "video": ["insv"]}}"#,
+        )]);
+
+        let layout = settings.layout().expect("a valid layout");
+        assert_eq!(layout.unsorted(), Path::new("no-date"));
+        assert_eq!(layout.duplicates(), Path::new("copies"));
+        settings.scan_filter().expect("a valid scan filter");
+    }
+
     /// The built-in defaults are themselves a scheme, and a default that could
     /// not be built would break every run rather than only a configured one.
     #[test]
     fn the_default_settings_resolve_to_a_scheme() {
-        let scheme = Settings::default()
-            .naming_scheme()
+        let layout = Settings::default()
+            .layout()
             .expect("the built-in defaults must be valid");
-        assert!(scheme.include_location());
+        assert!(layout.include_location());
+        assert_eq!(layout.unsorted(), Path::new("unsorted"));
+        assert_eq!(layout.duplicates(), Path::new("duplicates"));
     }
 
     // -----------------------------------------------------------------

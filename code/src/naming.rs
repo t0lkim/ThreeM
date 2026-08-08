@@ -107,19 +107,19 @@ pub enum FormatError {
     #[error("`{key}` contains a null byte, which no filesystem will accept: {pattern:?}")]
     NullByte { key: &'static str, pattern: String },
 
-    /// A dated directory pattern rooted at the filesystem, not at the output.
+    /// A directory pattern rooted at the filesystem, not at the output.
     #[error(
-        "`date_directory_format` must be relative to the output directory, and {pattern:?} is an \
-         absolute path — it would file photographs at the root of the filesystem"
+        "`{key}` must be relative to the output directory, and {pattern:?} is an absolute path — \
+         it would file photographs at the root of the filesystem"
     )]
-    Absolute { pattern: String },
+    Absolute { key: &'static str, pattern: String },
 
-    /// A dated directory pattern that walks back out of the output tree.
+    /// A directory pattern that walks back out of the output tree.
     #[error(
-        "`date_directory_format` must not contain `..`, and {pattern:?} does — it would file \
-         photographs outside the output directory"
+        "`{key}` must not contain `..`, and {pattern:?} does — it would file photographs outside \
+         the output directory"
     )]
-    ParentDir { pattern: String },
+    ParentDir { key: &'static str, pattern: String },
 
     /// A `%` that `strftime` does not recognise.
     #[error(
@@ -183,6 +183,43 @@ fn reject_shared(key: &'static str, pattern: &str) -> Result<(), FormatError> {
     Ok(())
 }
 
+/// Refuse a directory pattern that would not stay below the output tree.
+///
+/// The two shapes a person actually types when they mean to point somewhere
+/// else — a leading `/` and a `..` — refused by name so the error says which
+/// one it was. Everything that survives is still put through
+/// [`sanitise_for_filename`] component by component before it becomes a path.
+fn reject_escaping(key: &'static str, pattern: &str) -> Result<(), FormatError> {
+    if pattern.starts_with('/') || Path::new(pattern).is_absolute() {
+        return Err(FormatError::Absolute {
+            key,
+            pattern: pattern.to_string(),
+        });
+    }
+    if pattern.contains("..") {
+        return Err(FormatError::ParentDir {
+            key,
+            pattern: pattern.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Split a relative pattern into sanitised, non-empty path components.
+///
+/// The same reduction [`DateDirectoryFormat::render`] applies to a rendered
+/// date, and for the same reason: whatever the string carries — spaces, colons,
+/// a `\`, a leading dot — each component comes out as one ordinary name.
+/// Doubled and trailing separators collapse rather than producing a nameless
+/// directory.
+fn sanitised_components(pattern: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    for component in pattern.split('/').filter(|piece| !piece.is_empty()) {
+        path.push(sanitise_for_filename(component));
+    }
+    path
+}
+
 /// A validated `strftime` pattern for the dated directory a file is filed under.
 ///
 /// Slashes are the one piece of structure the pattern is allowed to carry:
@@ -210,17 +247,8 @@ impl DateDirectoryFormat {
     /// `..`, an unknown `%` specifier, or a pattern that renders to nothing.
     pub fn new(pattern: &str) -> Result<Self, FormatError> {
         reject_shared("date_directory_format", pattern)?;
+        reject_escaping("date_directory_format", pattern)?;
 
-        if pattern.starts_with('/') || Path::new(pattern).is_absolute() {
-            return Err(FormatError::Absolute {
-                pattern: pattern.to_string(),
-            });
-        }
-        if pattern.contains("..") {
-            return Err(FormatError::ParentDir {
-                pattern: pattern.to_string(),
-            });
-        }
         if StrftimeItems::new(pattern).any(|item| matches!(item, Item::Error)) {
             return Err(FormatError::Strftime {
                 pattern: pattern.to_string(),
@@ -276,14 +304,69 @@ impl DateDirectoryFormat {
         )
         .ok()?;
 
-        let mut path = PathBuf::new();
-        let mut components = 0usize;
-        for component in rendered.split('/').filter(|piece| !piece.is_empty()) {
-            path.push(sanitise_for_filename(component));
-            components += 1;
+        let path = sanitised_components(&rendered);
+        (path.components().count() > 0).then_some(path)
+    }
+}
+
+/// A validated directory name below the output tree — `unsorted/`,
+/// `duplicates/`, or whatever a config file renamed them to.
+///
+/// The same containment argument [`DateDirectoryFormat`] makes, for the two
+/// directories that are chosen rather than rendered. It matters just as much:
+/// `unsorted_dir = "/etc"` and `duplicates_dir = "../../elsewhere"` are one line
+/// of config each, and both would file somebody's photographs outside the tree
+/// they pointed the run at. Neither is a plausible typo, which is exactly why
+/// the guarantee has to be structural rather than trusted — a `Layout` in hand
+/// is the proof that both were checked.
+///
+/// Nested names are allowed (`"_review/undated"`): every component is sanitised
+/// separately, so nesting costs nothing and refusing it would be a rule with no
+/// reason behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSubdir {
+    pattern: String,
+    path: PathBuf,
+}
+
+impl OutputSubdir {
+    /// Validate a directory name, or say why it cannot be one.
+    ///
+    /// `key` is the setting the reader has to go and edit, and appears in every
+    /// error this returns.
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError`] for an empty name, a null byte, an absolute path, a `..`,
+    /// or a name whose components all sanitise away to nothing.
+    pub fn new(key: &'static str, pattern: &str) -> Result<Self, FormatError> {
+        reject_shared(key, pattern)?;
+        reject_escaping(key, pattern)?;
+
+        let path = sanitised_components(pattern);
+        // Belt and braces: every non-empty relative string has at least one
+        // component today, because a string of nothing but separators is
+        // absolute and was refused above. If that ever stops being true, the
+        // failure is an error rather than an empty path silently meaning "the
+        // output directory itself".
+        if path.components().count() == 0 {
+            return Err(FormatError::Empty { key });
         }
 
-        (components > 0).then_some(path)
+        Ok(Self {
+            pattern: pattern.to_string(),
+            path,
+        })
+    }
+
+    /// The name as written, for error messages.
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    /// The directory itself: always relative, always ordinary components.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -558,6 +641,67 @@ impl Scheme {
     /// locations off also stops paying for them.
     pub fn include_location(&self) -> bool {
         self.include_location
+    }
+}
+
+/// Everything about the shape of the output tree, validated together.
+///
+/// A [`Scheme`] says how a *dated* file is filed and named. A run also has to
+/// answer two questions the scheme cannot: where a file with no usable date
+/// goes, and where a duplicate goes. Both are settings, both are directories
+/// below the output tree, and both are subject to the same containment rule as
+/// the dated path — so they are validated by the same module and carried by one
+/// value that the whole pipeline reads.
+///
+/// One type rather than three arguments threaded separately, and for the reason
+/// the [`Scheme`] doc gives: they are decided together at startup and constant
+/// for the run. Holding a `Layout` is the proof that every part of it was
+/// checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    scheme: Scheme,
+    unsorted: OutputSubdir,
+    duplicates: OutputSubdir,
+}
+
+impl Layout {
+    /// Pair a validated scheme with the two validated directories.
+    pub fn new(scheme: Scheme, unsorted: OutputSubdir, duplicates: OutputSubdir) -> Self {
+        Self {
+            scheme,
+            unsorted,
+            duplicates,
+        }
+    }
+
+    /// How dated files are filed and named.
+    pub fn scheme(&self) -> &Scheme {
+        &self.scheme
+    }
+
+    /// Where a file with no usable date goes, relative to the output.
+    pub fn unsorted(&self) -> &Path {
+        self.unsorted.path()
+    }
+
+    /// Where relocated duplicates are grouped, relative to the output.
+    pub fn duplicates(&self) -> &Path {
+        self.duplicates.path()
+    }
+
+    /// The dated directory for `dt`, or `None` if there is none to give.
+    pub fn date_directory(&self, dt: &DateTime<Utc>) -> Option<PathBuf> {
+        self.scheme.date_directory(dt)
+    }
+
+    /// The filename for `parts`.
+    pub fn filename(&self, parts: &FilenameParts<'_>) -> String {
+        self.scheme.filename(parts)
+    }
+
+    /// Whether a geocoded place name is spelled into filenames at all.
+    pub fn include_location(&self) -> bool {
+        self.scheme.include_location()
     }
 }
 
@@ -837,6 +981,109 @@ mod tests {
             "2024-03-15.jpg"
         );
         assert!(!scheme.include_location());
+    }
+
+    // -----------------------------------------------------------------
+    // OutputSubdir
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_subdir_keeps_the_name_it_was_given() {
+        let dir = OutputSubdir::new("unsorted_dir", "undated").unwrap();
+        assert_eq!(dir.path(), Path::new("undated"));
+        assert_eq!(dir.pattern(), "undated");
+    }
+
+    /// Nesting is allowed, because every component is sanitised separately and
+    /// refusing it would be a rule with nothing behind it.
+    #[test]
+    fn a_subdir_may_be_nested() {
+        assert_eq!(
+            OutputSubdir::new("duplicates_dir", "_review/copies")
+                .unwrap()
+                .path(),
+            Path::new("_review/copies")
+        );
+    }
+
+    /// The whole reason the type exists. `unsorted_dir = "/etc"` is one line of
+    /// config away from filing photographs outside the tree the run was pointed
+    /// at, and the error has to name the key the reader must go and edit.
+    #[test]
+    fn a_subdir_that_could_leave_the_output_tree_is_refused() {
+        let absolute = OutputSubdir::new("unsorted_dir", "/etc").unwrap_err();
+        assert!(matches!(absolute, FormatError::Absolute { .. }));
+        assert!(
+            absolute.to_string().contains("unsorted_dir"),
+            "the refusal must name the key: {absolute}"
+        );
+
+        assert!(matches!(
+            OutputSubdir::new("duplicates_dir", "../elsewhere"),
+            Err(FormatError::ParentDir { .. })
+        ));
+        assert!(matches!(
+            OutputSubdir::new("unsorted_dir", ""),
+            Err(FormatError::Empty { .. })
+        ));
+        assert!(matches!(
+            OutputSubdir::new("unsorted_dir", "un\0sorted"),
+            Err(FormatError::NullByte { .. })
+        ));
+    }
+
+    /// What the refusals cannot catch, the sanitising does: a name that is
+    /// accepted still comes out as ordinary components, whatever it carried.
+    #[test]
+    fn an_accepted_subdir_is_still_sanitised_component_by_component() {
+        assert_eq!(
+            OutputSubdir::new("unsorted_dir", ".hidden dir/a:b")
+                .unwrap()
+                .path(),
+            Path::new("_hidden-dir/a_b"),
+            "a leading dot hides the directory and a colon is not a filename character"
+        );
+        assert_eq!(
+            OutputSubdir::new("unsorted_dir", "a//b/").unwrap().path(),
+            Path::new("a/b"),
+            "doubled and trailing separators collapse rather than making a nameless directory"
+        );
+        assert_eq!(
+            OutputSubdir::new("unsorted_dir", "a\\b").unwrap().path(),
+            Path::new("a_b"),
+            "a backslash is one component's text, not a separator"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Layout
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_layout_carries_the_scheme_and_both_directories() {
+        let layout = Layout::new(
+            Scheme::new("%Y/%m", "{date}.{ext}", false).unwrap(),
+            OutputSubdir::new("unsorted_dir", "undated").unwrap(),
+            OutputSubdir::new("duplicates_dir", "copies").unwrap(),
+        );
+
+        assert_eq!(
+            layout.date_directory(&march()),
+            Some(PathBuf::from("2024/03"))
+        );
+        assert_eq!(
+            layout.filename(&parts("-London-GB", "jpg")),
+            "2024-03-15.jpg"
+        );
+        assert!(!layout.include_location());
+        assert_eq!(layout.unsorted(), Path::new("undated"));
+        assert_eq!(layout.duplicates(), Path::new("copies"));
+        // The scheme is reachable whole, not only through the three methods
+        // `Layout` forwards.
+        assert_eq!(
+            layout.scheme().date_directory(&march()),
+            layout.date_directory(&march())
+        );
     }
 
     /// The first failure wins, and it is the one the reader has to fix.
