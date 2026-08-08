@@ -155,6 +155,36 @@ pull request as the fix.
 - Purely internal changes — repository hygiene, ignore rules, tooling — need no
   entry. The test is whether a user could notice.
 
+## Releasing
+
+Pushing a `v*` tag is the whole release. `.github/workflows/release.yml` takes
+it from there, in this order, and each step has to pass before the next starts:
+
+| Job | Does |
+|---|---|
+| `verify` | Refuses the tag if `v<x.y.z>` does not match `version` in `code/Cargo.toml`, or if `CHANGELOG.md` has no `## [x.y.z]` section. Both take seconds, so a wrong tag fails before twenty minutes of builds. |
+| `gate` | `cargo fmt --check`, `clippy --all-targets -- -D warnings`, `test --all-targets` on Linux and macOS, against the tagged commit. **A failing test blocks the release.** |
+| `build` | `cargo build --release --target …` for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`, each archived as a `.tar.gz` with a `.sha256` beside it. |
+| `publish` | Creates the GitHub Release with the changelog section as its body and the six files attached. The only job with a write token. |
+
+Two of the pieces are scripts rather than inline YAML, so they can be run
+locally against a real build instead of being debugged through tag pushes:
+
+```sh
+.github/scripts/changelog-section.sh 0.2.0        # the release body, to stdout
+cd code && cargo build --release --target aarch64-apple-darwin && cd ..
+.github/scripts/package-release.sh aarch64-apple-darwin 0.2.0 dist
+```
+
+Both are covered by [`code/tests/release.rs`](code/tests/release.rs), which
+runs in the ordinary suite — the alternative is discovering the extractor is
+broken during the one minute a year it executes.
+
+The binaries are not stripped by the workflow; `[profile.release]` sets
+`strip = true` and the packaging script *checks* that it took effect, because
+deleting that one line would otherwise ship debug symbols with nothing to say
+so.
+
 ## Reporting a bug
 
 Open an issue using the bug report template, which asks for the four things

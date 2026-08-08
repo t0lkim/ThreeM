@@ -1,0 +1,210 @@
+name: Release
+
+# Fires on a `v*` tag and nothing else. Pushing the tag is the decision to
+# release; everything below is the consequence of it.
+#
+# The order of the jobs is the whole point of the file. Nothing is published
+# until the full test gate has passed on both platforms, because a release is
+# the one artefact a user cannot undo by pulling again — somebody downloads a
+# binary that moves their photograph library, and no amount of reverting the
+# tag takes it off their disk.
+#
+#   verify → gate → build (3 targets) → publish
+#
+# `verify` is first and cheap: it fails a tag whose version does not match
+# `code/Cargo.toml`, or whose changelog section was never written, in about
+# fifteen seconds rather than after twenty minutes of LTO builds.
+#
+# The two scripts this calls live in `.github/scripts/` rather than inline
+# here, so the packaging and the changelog extraction can be run locally
+# against a real build before a tag exists. They were.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Read-only by default; only `publish` is granted write, and only to contents.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # A tag is a claim about a commit, and the two ways it can be false are
+      # both silent: `v0.2.0` on a tree whose Cargo.toml still says 0.1.0 ships
+      # binaries that report the wrong version out of `--version`, and a tag
+      # with no changelog section ships a release with an empty body.
+      - name: Tag version matches Cargo.toml
+        id: version
+        run: |
+          set -euo pipefail
+          tag='${{ github.ref_name }}'
+          version="${tag#v}"
+          declared=$(sed -n 's/^version = "\(.*\)"$/\1/p' code/Cargo.toml | head -1)
+          echo "tag $tag → version $version; code/Cargo.toml declares $declared"
+          if [ "$version" != "$declared" ]; then
+            echo "::error::tag $tag does not match the version in code/Cargo.toml ($declared)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A version with a pre-release identifier (0.2.0-rc.1) is marked as a
+          # pre-release on GitHub rather than silently becoming "latest".
+          case "$version" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Extract the release notes from CHANGELOG.md
+        run: .github/scripts/changelog-section.sh "${{ steps.version.outputs.version }}" > release-notes.md
+
+      # Uploaded rather than re-extracted in `publish`, so the body that will be
+      # posted is inspectable on a run that failed later on for another reason.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  gate:
+    name: gate (${{ matrix.os }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    # The same gate `ci.yml` runs on every push, run again here against the
+    # tagged commit. It is not redundant with CI: CI proves the commit was green
+    # when it was pushed, and this proves it is green now, on the tree the
+    # binaries below are about to be built from. A failing test here stops the
+    # release, which is the requirement.
+    #
+    # `cargo build --release` is the gate's fourth command and is not repeated
+    # here — the `build` job does exactly that, per target, and cannot start
+    # until this job has passed.
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code
+
+      - name: cargo fmt --check
+        working-directory: code
+        run: cargo fmt --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        working-directory: code
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test --all-targets
+        working-directory: code
+        run: cargo test --all-targets
+
+  build:
+    name: ${{ matrix.target }}
+    needs: [verify, gate]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every target reports independently. A macOS linker failure must not
+      # hide whether the Linux binary built.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # macOS runners are arm64, so this one is native and the next is a
+          # cross-compile that the Apple toolchain handles without a separate
+          # linker. Both were built and unpacked locally before this file was
+          # written; `file` confirms the archives hold different architectures
+          # rather than two copies of the host's.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code
+          # The release profile shares no artifacts with the dev profile the
+          # gate above builds, and each target is its own directory.
+          key: release-${{ matrix.target }}
+
+      - name: cargo build --release --target ${{ matrix.target }}
+        working-directory: code
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # Archives the two binaries with README, LICENSE and CHANGELOG, writes a
+      # .sha256 beside the tarball, and refuses to package a binary that still
+      # carries its symbols — `[profile.release] strip = true` is one line, and
+      # deleting it would otherwise ship debug symbols silently.
+      - name: Archive and checksum
+        run: .github/scripts/package-release.sh ${{ matrix.target }} ${{ needs.verify.outputs.version }} dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: List what is about to be published
+        run: |
+          set -euo pipefail
+          ls -l dist
+          echo "--- checksums ---"
+          cat dist/*.tar.gz.sha256
+          echo "--- they verify ---"
+          (cd dist && sha256sum -c ./*.tar.gz.sha256)
+
+      # `gh` is on the runner already, so there is no third-party action in the
+      # one step that holds a write token.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create '${{ github.ref_name }}' \
+            --repo '${{ github.repository }}' \
+            --title 'mmm ${{ needs.verify.outputs.version }}' \
+            --notes-file dist/release-notes.md \
+            ${{ needs.verify.outputs.prerelease == 'true' && '--prerelease' || '' }} \
+            dist/*.tar.gz dist/*.tar.gz.sha256
