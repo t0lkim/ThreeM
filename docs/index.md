@@ -22,6 +22,7 @@ related:
   - '[[mutation-testing]]'
   - '[[fuzzing]]'
   - '[[hashing-baseline]]'
+  - '[[v0.2.0-readiness]]'
   - '[[CHANGELOG]]'
   - '[[CONTRIBUTING]]'
   - '[[SECURITY]]'
@@ -76,6 +77,7 @@ it, not a promise about the current commit.
 | [[mutation-testing]] | [`research/mutation-testing.md`](research/mutation-testing.md) | What `cargo-mutants` broke that the suite did not notice, which tests were added, and which survivors were accepted. |
 | [[fuzzing]] | [`research/fuzzing.md`](research/fuzzing.md) | The four fuzz targets over the parsers that read untrusted bytes, the defect they found, and what is still unfuzzed. |
 | [[hashing-baseline]] | [`research/hashing-baseline.md`](research/hashing-baseline.md) | Serial and parallel cascade throughput, run-to-run variance, and where the speedup does and does not hold. |
+| [[v0.2.0-readiness]] | [`research/v0.2.0-readiness.md`](research/v0.2.0-readiness.md) | What shipped in v0.2.0, every figure above in one place, the three defects that are live at the tag, and every limitation the release carries. **Start here if you are deciding whether to ship.** |
 
 ## Elsewhere in the repository
 
