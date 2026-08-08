@@ -30,19 +30,24 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use tempfile::TempDir;
 
 #[cfg(unix)]
 use common::deny_reads;
-use common::{file_contents_by_marker, naive, snapshot_tree, snapshot_tree_hashed, MediaTree};
+use common::{
+    file_contents_by_marker, journals_in, metadata_snapshot, naive, snapshot_tree,
+    snapshot_tree_hashed, MediaTree,
+};
 use mmm::geocoder::GeoLookup;
+use mmm::journal::{IntentKind, Journal, JournalEntry, RunHeader};
 use mmm::metadata::{DateSource, FileMetadata};
 use mmm::organiser::build_target_path;
 use mmm::reporter::{
-    COMMIT_BANNER, DRY_RUN_BANNER, HASH_SKIPPED_LABEL, SCAN_SKIPPED_LABEL, UNPROCESSED_LABEL,
+    COMMIT_BANNER, DRY_RUN_BANNER, HASH_SKIPPED_LABEL, JOURNAL_LABEL, NO_JOURNAL_NOTICE,
+    SCAN_SKIPPED_LABEL, UNPROCESSED_LABEL,
 };
 
 // ---------------------------------------------------------------------------
@@ -738,4 +743,271 @@ fn an_unreadable_directory_and_file_are_skipped_reported_and_left_alone() {
     // thoroughly as it hid them from the scan.
     drop(locked_dir);
     assert!(tree.join("locked/hidden.jpg").exists());
+}
+
+// ---------------------------------------------------------------------------
+// The run journal
+// ---------------------------------------------------------------------------
+//
+// The journal is what `mmm undo` replays, so these assertions are about the
+// record rather than about the tree: which runs write one, where it goes, and
+// whether it describes the moves that actually happened.
+
+/// Run `mmm --commit` with extra arguments appended.
+fn run_commit_with(input: &Path, output: &Path, extra: &[&str]) -> std::process::Output {
+    Command::cargo_bin("mmm")
+        .unwrap()
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .arg("--commit")
+        .arg("--no-prompt")
+        .args(extra)
+        .output()
+        .expect("running mmm in commit mode")
+}
+
+/// The single journal under `root`, read back through the real reader.
+fn sole_journal(root: &Path) -> (RunHeader, Vec<JournalEntry>) {
+    let journals = journals_in(root);
+    assert_eq!(
+        journals.len(),
+        1,
+        "expected exactly one journal under {}; found {journals:?}",
+        root.display()
+    );
+    Journal::read(&journals[0]).expect("reading the journal the run just wrote")
+}
+
+/// A three-file tree with no duplicates, dated so the destinations are known.
+fn plain_tree() -> MediaTree {
+    MediaTree::new()
+        .jpeg_with_exif("beach.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_with_exif("holiday/paris.jpg", naive(2024, 2, 20, 9, 5, 6), None)
+        .jpeg_with_exif("holiday/rome.jpg", naive(2024, 3, 1, 8, 0, 0), None)
+}
+
+/// A preview moves nothing, so it records nothing. The metadata directory must
+/// not exist at all afterwards — "wrote an empty journal" is still a write into
+/// a tree the operator asked us only to look at.
+#[test]
+fn a_preview_writes_no_journal_at_all() {
+    let tree = plain_tree();
+
+    let out = run_preview(tree.path());
+
+    assert_ok(&out, "preview run");
+    assert!(
+        metadata_snapshot(tree.path()).is_empty(),
+        "a dry run left metadata behind: {:?}",
+        metadata_snapshot(tree.path())
+    );
+    assert!(
+        !tree.join(".mmm").exists(),
+        "a dry run must not create the .mmm directory"
+    );
+    assert!(
+        !stdout_of(&out).contains(JOURNAL_LABEL),
+        "a preview has nothing to undo, so it must not talk about a journal:\n{}",
+        stdout_of(&out)
+    );
+}
+
+/// A committing run journals an intent and an outcome for every file it moved,
+/// and says where the record went.
+#[test]
+fn a_committing_run_journals_every_move_and_prints_where() {
+    let tree = plain_tree();
+    let (_scratch, out_dir) = scratch_output();
+
+    let out = run_commit(tree.path(), &out_dir);
+    assert_ok(&out, "commit run");
+    let stdout = stdout_of(&out);
+
+    let (header, entries) = sole_journal(&out_dir);
+    assert_eq!(header.output_dir, out_dir, "the journal names its own run");
+    assert!(
+        header.argv.iter().any(|arg| arg == "--commit"),
+        "the command line must survive on disk: {:?}",
+        header.argv
+    );
+
+    let committed: Vec<&PathBuf> = entries
+        .iter()
+        .filter_map(|e| match e {
+            JournalEntry::MoveCommitted {
+                final_destination, ..
+            } => Some(final_destination),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(committed.len(), 3, "three files moved: {entries:?}");
+    for destination in &committed {
+        assert!(
+            destination.exists(),
+            "the journal names {} as committed, but nothing is there",
+            destination.display()
+        );
+    }
+
+    let intents = entries
+        .iter()
+        .filter(|e| matches!(e, JournalEntry::MoveIntent { .. }))
+        .count();
+    assert_eq!(intents, 3, "one intent per move: {entries:?}");
+
+    assert!(
+        matches!(
+            entries.last(),
+            Some(JournalEntry::RunCompleted {
+                moved: 3,
+                failed: 0,
+                skipped: 0,
+                ..
+            })
+        ),
+        "a run that finished must say so on its last line: {entries:?}"
+    );
+
+    // The path is the one thing the operator needs to undo the run, so the
+    // summary carries it.
+    let journal_path = journals_in(&out_dir)[0].display().to_string();
+    assert!(
+        stdout.contains(&journal_path),
+        "the run must print where its journal went:\n{stdout}"
+    );
+}
+
+/// The duplicate pass is journalled through the same mechanism as the organise
+/// pass, so undo can put duplicates back too.
+#[test]
+fn duplicate_relocations_are_journalled_with_their_group() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("beach.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("copies/beach-again.jpg", "beach.jpg");
+    let (_scratch, out_dir) = scratch_output();
+
+    let out = run_commit(tree.path(), &out_dir);
+    assert_ok(&out, "commit run over a tree with duplicates");
+
+    let (_header, entries) = sole_journal(&out_dir);
+    let relocated: Vec<(usize, &PathBuf)> = entries
+        .iter()
+        .filter_map(|e| match e {
+            JournalEntry::DuplicateMoved {
+                group, destination, ..
+            } => Some((*group, destination)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        relocated.len(),
+        1,
+        "one duplicate was relocated: {entries:?}"
+    );
+    assert_eq!(relocated[0].0, 0, "it belongs to the first group");
+    assert!(
+        relocated[0].1.exists(),
+        "the journal names {} but nothing is there",
+        relocated[0].1.display()
+    );
+    assert!(
+        entries.iter().any(|e| matches!(
+            e,
+            JournalEntry::MoveIntent {
+                kind: IntentKind::Duplicate,
+                source_hash: Some(_),
+                ..
+            }
+        )),
+        "a duplicate's intent carries the digest the dedup pass already computed: {entries:?}"
+    );
+}
+
+/// A run the operator stops part-way through still closes its journal — an
+/// interrupted-looking journal means something quite different to undo, and the
+/// operator who declined at a prompt did not interrupt anything.
+#[test]
+fn a_run_stopped_at_a_chunk_boundary_still_closes_its_journal() {
+    let tree = plain_tree();
+    let (_scratch, out_dir) = scratch_output();
+
+    let out = run_commit_answering(tree.path(), &out_dir, "n\n");
+    assert_ok(&out, "commit run declined at the first chunk boundary");
+
+    let (_header, entries) = sole_journal(&out_dir);
+    let Some(JournalEntry::RunCompleted {
+        moved,
+        failed,
+        skipped,
+        ..
+    }) = entries.last()
+    else {
+        panic!("a stopped run must still close its journal: {entries:?}");
+    };
+    assert_eq!(
+        (*moved, *failed, *skipped),
+        (1, 0, 2),
+        "one file moved before the operator declined, and two were never attempted"
+    );
+}
+
+/// `--journal-dir` is honoured by the run, not merely parsed.
+#[test]
+fn the_journal_directory_can_be_moved_off_the_output_tree() {
+    let tree = plain_tree();
+    let (_scratch, out_dir) = scratch_output();
+    let elsewhere = TempDir::new().expect("creating journal TempDir");
+
+    let out = run_commit_with(
+        tree.path(),
+        &out_dir,
+        &["--journal-dir", &elsewhere.path().display().to_string()],
+    );
+    assert_ok(&out, "commit run with a relocated journal");
+
+    assert!(
+        metadata_snapshot(&out_dir).is_empty(),
+        "the output tree must hold no journal when one was asked for elsewhere: {:?}",
+        metadata_snapshot(&out_dir)
+    );
+    let written: Vec<_> = std::fs::read_dir(elsewhere.path())
+        .expect("reading the relocated journal directory")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(written.len(), 1, "expected one journal; found {written:?}");
+    Journal::read(&written[0]).expect("the relocated journal must be readable");
+}
+
+/// `--no-journal` writes nothing and says so. A run that cannot be undone has
+/// to admit it at the one moment the operator is reading.
+#[test]
+fn an_unjournalled_run_says_it_cannot_be_undone() {
+    let tree = plain_tree();
+    let (_scratch, out_dir) = scratch_output();
+
+    let out = run_commit_with(
+        tree.path(),
+        &out_dir,
+        &["--no-journal", "--i-know-what-im-doing"],
+    );
+    assert_ok(&out, "unjournalled commit run");
+
+    assert!(
+        metadata_snapshot(&out_dir).is_empty(),
+        "--no-journal must write nothing: {:?}",
+        metadata_snapshot(&out_dir)
+    );
+    assert_eq!(
+        file_contents_by_marker(&out_dir).len(),
+        3,
+        "the files should still have been organised"
+    );
+    assert!(
+        stdout_of(&out).contains(NO_JOURNAL_NOTICE),
+        "the summary must say the run cannot be undone:\n{}",
+        stdout_of(&out)
+    );
 }

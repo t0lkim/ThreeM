@@ -1,13 +1,16 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use chrono::Utc;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{error, info};
 
-use mmm::{hasher, organiser, reporter, scanner};
+use mmm::{hasher, journal, organiser, reporter, scanner};
 
 use mmm::config::Config;
 use mmm::geocoder::GeoLookup;
-use mmm::organiser::ChunkController;
+use mmm::journal::{Journal, JournalEntry, RunHeader};
+use mmm::organiser::{ChunkController, MoveRecorder};
+use mmm::reporter::JournalStatus;
 
 /// Drives the chunked move phase from the terminal: the progress bar, and the
 /// operator's answer at each chunk boundary.
@@ -40,6 +43,64 @@ impl ChunkController for CliController<'_> {
         // exited the process from inside this closure.
         self.bar
             .suspend(|| reporter::prompt_continue(chunk_number, remaining))
+    }
+}
+
+/// Open this run's journal, or report that there will not be one.
+///
+/// Called only on the committing path, and deliberately not before: a preview
+/// must leave no trace at all, and the surest way to guarantee that is for the
+/// journal never to be created on that path rather than for something later to
+/// remember not to write to it.
+///
+/// # Errors
+///
+/// Returns an error if the journal cannot be created. Nothing has moved at that
+/// point, and nothing will: a run that cannot record what it is about to do
+/// must not do it.
+fn open_journal(config: &Config) -> Result<Option<Journal>> {
+    let Some(dir) = config.resolve_journal_dir() else {
+        println!();
+        reporter::print_journal_location(JournalStatus::Disabled);
+        return Ok(None);
+    };
+
+    let header = RunHeader::new(
+        journal::generate_run_id(),
+        config.output_dir(),
+        RunHeader::current_argv(),
+    );
+    let journal = Journal::create(&dir, &header)
+        .context("the run journal could not be created, so no files have been moved")?;
+
+    // Printed here as well as in the summary: an interrupted run never reaches
+    // its summary, and its operator is the one who most needs this path.
+    println!();
+    reporter::print_journal_location(JournalStatus::At(journal.path()));
+
+    Ok(Some(journal))
+}
+
+/// Close the journal with the `RunCompleted` line, on every path out of a
+/// committing run.
+///
+/// Best effort by design. The run is over and its counts are already on their
+/// way to the operator; a journal that cannot take this last line is one whose
+/// *missing* `RunCompleted` tells `undo` the run did not finish cleanly, which
+/// is exactly what undo needs to know.
+fn finish_journal(journal: Option<&mut Journal>, moved: usize, failed: usize, skipped: usize) {
+    let Some(journal) = journal else { return };
+
+    if let Err(e) = journal.append(&JournalEntry::RunCompleted {
+        moved,
+        failed,
+        skipped,
+        ended_at: Utc::now(),
+    }) {
+        error!(
+            error = %format!("{e:#}"),
+            "could not close the run journal; undo will treat this run as interrupted"
+        );
     }
 }
 
@@ -172,19 +233,40 @@ fn main() -> Result<()> {
     // === DRY RUN (the default): stop here, before anything is moved ===
     if config.is_dry_run() {
         reporter::print_dry_run(&planned_moves);
-        reporter::print_summary(&summary);
+        // No journal, and none reported: a preview moves nothing, so there is
+        // nothing to undo.
+        reporter::print_summary(&summary, JournalStatus::NotNeeded);
         println!("{}", reporter::DRY_RUN_BANNER);
         return Ok(());
     }
 
+    // === JOURNAL: opened before the first move, closed on every way out ===
+    let mut journal = open_journal(&config)?;
+    let journal_path = journal.as_ref().map(|j| j.path().to_path_buf());
+    let journal_status = || match journal_path.as_deref() {
+        Some(path) => JournalStatus::At(path),
+        None => JournalStatus::Disabled,
+    };
+
     // === Move duplicates to duplicates/ directory ===
-    let (_dup_moved, dup_errors) = if dedup_result.duplicate_groups.is_empty() {
+    let (dup_moved, dup_errors) = if dedup_result.duplicate_groups.is_empty() {
         (0, 0)
     } else {
         println!("\nMoving duplicates to duplicates/ directory...");
-        let (dm, de) = organiser::move_duplicates(&dedup_result.duplicate_groups, output_dir)?;
-        println!("  Moved {dm} duplicate files ({de} errors)");
-        (dm, de)
+        let mut recorder = MoveRecorder::new(journal.as_mut());
+        match organiser::move_duplicates(&dedup_result.duplicate_groups, output_dir, &mut recorder)
+        {
+            Ok((dm, de)) => {
+                println!("  Moved {dm} duplicate files ({de} errors)");
+                (dm, de)
+            }
+            // Nothing in the organise pass has run yet, so every planned move
+            // is untouched — but the journal still owes a closing line.
+            Err(e) => {
+                finish_journal(journal.as_mut(), 0, 0, planned_moves.len());
+                return Err(e);
+            }
+        }
     };
 
     // === PHASE B: PROCESS (chunked) ===
@@ -199,11 +281,18 @@ fn main() -> Result<()> {
         bar: &move_pb,
         prompt: !config.no_prompt,
     };
-    let run = organiser::process_moves(&planned_moves, config.chunk_size, &mut controller);
+    let mut recorder = MoveRecorder::new(journal.as_mut());
+    let run = organiser::process_moves(
+        &planned_moves,
+        config.chunk_size,
+        &mut controller,
+        &mut recorder,
+    );
 
-    // A run the operator stopped did not complete, and the bar must not claim
-    // it did.
-    if run.stopped_early {
+    // A run that stopped did not complete, and the bar must not claim it did.
+    if run.journal_failed {
+        move_pb.abandon_with_message("journal write failed");
+    } else if run.stopped_early {
         move_pb.abandon_with_message("stopped by user");
         println!(
             "\nStopped by user. {} file{} organised, {} left untouched.",
@@ -215,15 +304,41 @@ fn main() -> Result<()> {
         move_pb.finish_with_message("organisation complete");
     }
 
+    // Every exit path from the move phase closes the journal, including the
+    // early stop and the journal's own failure. `failed` counts moves that were
+    // attempted and did not happen; `skipped` counts files never attempted —
+    // those the run stopped before, plus those whose destination could not be
+    // planned.
+    finish_journal(
+        journal.as_mut(),
+        run.moved + dup_moved,
+        run.errors + dup_errors,
+        run.unprocessed + plan_errors,
+    );
+
     // Printed on every path out of the move phase, including the early stop —
     // the operator who just interrupted a run is precisely the one who needs
     // to be told what it managed first.
-    reporter::print_summary(&reporter::RunSummary {
-        organised: run.moved,
-        unprocessed: run.unprocessed,
-        errors: plan_errors + run.errors + dup_errors,
-        ..summary
-    });
+    reporter::print_summary(
+        &reporter::RunSummary {
+            organised: run.moved,
+            unprocessed: run.unprocessed,
+            errors: plan_errors + run.errors + dup_errors,
+            ..summary
+        },
+        journal_status(),
+    );
+
+    // A run that stopped because it could not record itself is a failed run,
+    // and a script driving `mmm` has to be able to tell.
+    if run.journal_failed {
+        anyhow::bail!(
+            "the run journal could not be written, so the run stopped after {} file{} — see the \
+             errors above. Nothing further was moved.",
+            run.moved,
+            if run.moved == 1 { "" } else { "s" }
+        );
+    }
 
     Ok(())
 }

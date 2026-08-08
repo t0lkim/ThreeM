@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::Path;
 
 use crate::hasher::DuplicateGroup;
 use crate::metadata::DateSource;
@@ -136,13 +137,57 @@ pub const HASH_SKIPPED_LABEL: &str = "Unhashable (dedup):";
 /// Label for files the run never got to because it was stopped.
 pub const UNPROCESSED_LABEL: &str = "Not processed:";
 
+/// Label for the run journal's location.
+pub const JOURNAL_LABEL: &str = "Journal:";
+
+/// Printed in place of a path when `--no-journal` was used.
+///
+/// A run with no journal is a run that cannot be reversed, and the summary is
+/// the last moment at which saying so is any use.
+pub const NO_JOURNAL_NOTICE: &str = "none — this run was not recorded and cannot be undone";
+
+/// What became of this run's journal.
+///
+/// Three states rather than an `Option<&Path>`, because "there is no journal"
+/// means two opposite things: a preview recorded nothing because it moved
+/// nothing, and `--no-journal` moved files that can now never be put back. The
+/// first deserves silence and the second a warning.
+#[derive(Debug, Clone, Copy)]
+pub enum JournalStatus<'a> {
+    /// A preview. Nothing moved, so there is nothing to undo and nothing to say.
+    NotNeeded,
+    /// Written here.
+    At(&'a Path),
+    /// Refused by `--no-journal`.
+    Disabled,
+}
+
+/// Print where this run's journal went, or that there is not one.
+///
+/// Called from the summary, and again when the journal is opened: a run that is
+/// interrupted never reaches its summary, and the operator of an interrupted
+/// run is precisely the one who needs the path.
+pub fn print_journal_location(journal: JournalStatus<'_>) {
+    match journal {
+        JournalStatus::NotNeeded => {}
+        JournalStatus::At(path) => println!("  {JOURNAL_LABEL:<LABEL_WIDTH$}{}", path.display()),
+        JournalStatus::Disabled => {
+            println!("  {JOURNAL_LABEL:<LABEL_WIDTH$}{NO_JOURNAL_NOTICE}");
+        }
+    }
+}
+
 /// Print the final summary after processing.
 ///
 /// The skip lines appear only when something was skipped — a run that omitted
 /// nothing should not invite the operator to look for what it omitted. When
 /// they do appear they are unconditional: a file left out of the plan is
 /// reported here or it is not reported at all.
-pub fn print_summary(summary: &RunSummary) {
+///
+/// The journal line answers "how do I undo this?", which is a question every
+/// committing run owes an answer to — including the answer "you cannot". See
+/// [`JournalStatus`].
+pub fn print_summary(summary: &RunSummary, journal: JournalStatus<'_>) {
     println!("\n═══ Processing Complete ═══");
     println!("  {:<LABEL_WIDTH$}{}", "Files scanned:", summary.scanned);
     println!(
@@ -175,6 +220,7 @@ pub fn print_summary(summary: &RunSummary) {
     if summary.errors > 0 {
         println!("  {:<LABEL_WIDTH$}{}", "Errors:", summary.errors);
     }
+    print_journal_location(journal);
     println!("═══════════════════════════\n");
 }
 

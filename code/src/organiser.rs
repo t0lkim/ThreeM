@@ -9,6 +9,7 @@ use tracing::{debug, error, info};
 
 use crate::geocoder::GeoLookup;
 use crate::hasher::DuplicateGroup;
+use crate::journal::{IntentKind, Journal, JournalEntry};
 use crate::metadata::{self, DateSource, FileMetadata};
 use crate::naming::{sanitise_for_filename, year_is_representable};
 use crate::scanner::ScannedFile;
@@ -266,20 +267,247 @@ impl GroupManifest {
     }
 }
 
+/// What a move is for, and therefore what its commit record says.
+///
+/// The two move passes differ in exactly this and nothing else, so it is the
+/// only thing [`recorded_move`] takes beyond the move itself. A duplicate's
+/// record carries the group it belongs to, because `duplicates/007/photo.jpg`
+/// is meaningless without it, and its BLAKE3 digest, which the dedup cascade
+/// has already computed — the organise pass has no equivalent, since a unique
+/// file is never fully hashed.
+#[derive(Debug, Clone, Copy)]
+pub enum MovePurpose<'a> {
+    /// A media file moving into the dated output tree.
+    Organise,
+    /// A duplicate moving into `duplicates/<group>/`.
+    Duplicate { group: usize, hash: &'a str },
+}
+
+impl MovePurpose<'_> {
+    fn intent_kind(self) -> IntentKind {
+        match self {
+            Self::Organise => IntentKind::Organise,
+            Self::Duplicate { .. } => IntentKind::Duplicate,
+        }
+    }
+
+    fn source_hash(self) -> Option<String> {
+        match self {
+            Self::Organise => None,
+            Self::Duplicate { hash, .. } => Some(hash.to_string()),
+        }
+    }
+}
+
+/// Where a move pass writes its record, or nothing.
+///
+/// The alternative — passing `Option<&mut Journal>` down to each loop — puts
+/// the "record, then move" ordering at every call site, which is the one place
+/// it must not live: the ordering is the safety property, and a call site that
+/// forgets it produces a move nothing can reverse. Here it is written once, in
+/// [`recorded_move`], and both passes go through it.
+pub struct MoveRecorder<'a> {
+    sink: Sink<'a>,
+}
+
+enum Sink<'a> {
+    /// `--no-journal`, and the tests that are not about journalling.
+    Off,
+    Open(&'a mut Journal),
+    /// Every write fails. An open file descriptor cannot be made to fail from
+    /// a test — the disk going away mid-run is not reproducible — so the one
+    /// behaviour that matters, *stop rather than move unrecorded*, is driven
+    /// through this instead. Same reasoning as the injected `copy` parameter
+    /// on [`copy_verify_delete`].
+    #[cfg(test)]
+    Failing,
+}
+
+impl<'a> MoveRecorder<'a> {
+    pub fn new(journal: Option<&'a mut Journal>) -> Self {
+        Self {
+            sink: journal.map_or(Sink::Off, Sink::Open),
+        }
+    }
+
+    /// A recorder that records nothing.
+    pub fn disabled() -> Self {
+        Self { sink: Sink::Off }
+    }
+
+    #[cfg(test)]
+    fn failing() -> Self {
+        Self {
+            sink: Sink::Failing,
+        }
+    }
+
+    fn append(&mut self, entry: &JournalEntry) -> Result<()> {
+        match &mut self.sink {
+            Sink::Off => Ok(()),
+            Sink::Open(journal) => journal.append(entry),
+            #[cfg(test)]
+            Sink::Failing => bail!("the journal is on a disk that went away"),
+        }
+    }
+
+    /// Record the intent to move `planned`, returning the sequence number its
+    /// outcome must be recorded under, or `None` when nothing is being recorded.
+    ///
+    /// Does not return until the entry is on the disk. A caller may only move
+    /// the file once this has succeeded.
+    fn intend(&mut self, planned: &PlannedMove, purpose: MovePurpose<'_>) -> Result<Option<u64>> {
+        let seq = match &mut self.sink {
+            Sink::Off => return Ok(None),
+            Sink::Open(journal) => journal.next_seq(),
+            #[cfg(test)]
+            Sink::Failing => 0,
+        };
+
+        // Stat now rather than carrying the scan's figure: undo compares this
+        // against the file it finds at the destination, so the size that
+        // matters is the one the file had immediately before it moved. A stat
+        // that fails means the move is about to fail too and say why — the
+        // journal records what it can and lets the move report the cause.
+        let source_size = fs::metadata(&planned.source)
+            .map(|m| m.len())
+            .unwrap_or_default();
+
+        self.append(&JournalEntry::MoveIntent {
+            seq,
+            source: planned.source.clone(),
+            destination: planned.destination.clone(),
+            source_size,
+            source_hash: purpose.source_hash(),
+            kind: purpose.intent_kind(),
+        })?;
+
+        Ok(Some(seq))
+    }
+
+    /// Record where the file actually landed — which is not always where it was
+    /// planned to, once collision resolution has had its say.
+    fn commit(
+        &mut self,
+        seq: Option<u64>,
+        purpose: MovePurpose<'_>,
+        source: &Path,
+        outcome: &MoveOutcome,
+    ) -> Result<()> {
+        let Some(seq) = seq else { return Ok(()) };
+
+        let entry = match purpose {
+            MovePurpose::Organise => JournalEntry::MoveCommitted {
+                seq,
+                final_destination: outcome.destination.clone(),
+                move_kind: outcome.kind,
+            },
+            MovePurpose::Duplicate { group, .. } => JournalEntry::DuplicateMoved {
+                seq,
+                group,
+                source: source.to_path_buf(),
+                destination: outcome.destination.clone(),
+            },
+        };
+        self.append(&entry)
+    }
+
+    /// Record that the move named by `seq` did not happen. The source is still
+    /// where it was, which is what makes this different from an intent with no
+    /// outcome at all.
+    fn failed(&mut self, seq: Option<u64>, reason: &str) -> Result<()> {
+        let Some(seq) = seq else { return Ok(()) };
+        self.append(&JournalEntry::MoveFailed {
+            seq,
+            reason: reason.to_string(),
+        })
+    }
+}
+
+/// Why a recorded move produced no moved file.
+///
+/// The split is the same one [`MoveError`] makes one level down, for the same
+/// reason: the caller has to tell "this photo did not move, carry on" from
+/// "stop the run". A journal that cannot be written turns every later move into
+/// an unrecorded one, which is the single failure this module exists to prevent.
+#[derive(Debug)]
+pub enum RecordedMoveError {
+    /// The move failed. It has been recorded as such and the run may continue.
+    Move(anyhow::Error),
+    /// The journal could not be written.
+    ///
+    /// `moved` says whether the file moved before the record failed: an intent
+    /// that cannot be written stops the move from being attempted, but an
+    /// outcome that cannot be written does not un-move the file. The caller
+    /// needs the difference to count honestly.
+    Journal { error: anyhow::Error, moved: bool },
+}
+
+/// Record the intent, perform the move, record the outcome.
+///
+/// The ordering is the whole point and is stated here once: the intent is on
+/// the disk *before* [`execute_move`] is called, so a run killed between the
+/// two leaves a journal naming a file as possibly moved rather than a library
+/// with an unrecorded hole in it.
+///
+/// # Errors
+///
+/// [`RecordedMoveError::Move`] if the move failed, and
+/// [`RecordedMoveError::Journal`] if any of the three journal writes did.
+fn recorded_move(
+    recorder: &mut MoveRecorder<'_>,
+    planned: &PlannedMove,
+    purpose: MovePurpose<'_>,
+) -> Result<MoveOutcome, RecordedMoveError> {
+    let seq = recorder
+        .intend(planned, purpose)
+        .map_err(|error| RecordedMoveError::Journal {
+            error,
+            moved: false,
+        })?;
+
+    match execute_move(planned) {
+        Ok(outcome) => {
+            recorder
+                .commit(seq, purpose, &planned.source, &outcome)
+                .map_err(|error| RecordedMoveError::Journal { error, moved: true })?;
+            Ok(outcome)
+        }
+        Err(e) => {
+            recorder.failed(seq, &format!("{e:#}")).map_err(|error| {
+                RecordedMoveError::Journal {
+                    error,
+                    moved: false,
+                }
+            })?;
+            Err(RecordedMoveError::Move(e))
+        }
+    }
+}
+
 /// Move duplicate files into numbered subdirectories under duplicates/
 /// Each duplicate group gets its own directory: duplicates/000/, duplicates/001/, etc.
 /// The first file in each group is the "original" and is NOT moved here.
 ///
 /// Each group's `manifest.txt` is written in full before any of that group's
 /// files move, and each outcome is appended as it happens — see
-/// [`GroupManifest`].
+/// [`GroupManifest`]. Every relocation additionally goes through `recorder`, so
+/// `mmm undo` can put duplicates back alongside the ordinary moves; the
+/// manifest stays because it is the per-group record a person reads, and
+/// `mmm-dedup-verifier` parses.
 ///
 /// # Errors
 ///
 /// Returns an error if a `duplicates/NNN/` directory or its `manifest.txt`
-/// cannot be created. Individual failed moves are recorded and counted, not
-/// propagated.
-pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(usize, usize)> {
+/// cannot be created, or if the journal cannot be written — in which case the
+/// remaining duplicates are left where they are rather than relocated with no
+/// record of where they came from. Individual failed moves are recorded and
+/// counted, not propagated.
+pub fn move_duplicates(
+    groups: &[DuplicateGroup],
+    output_dir: &Path,
+    recorder: &mut MoveRecorder<'_>,
+) -> Result<(usize, usize)> {
     let dup_base = output_dir.join("duplicates");
     let mut moved = 0;
     let mut errors = 0;
@@ -311,15 +539,31 @@ pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(
                 has_location: false,
             };
 
-            let recorded = match execute_move(&planned) {
+            let purpose = MovePurpose::Duplicate {
+                group: i,
+                hash: &group.hash,
+            };
+
+            let manifested = match recorded_move(recorder, &planned, purpose) {
                 Ok(outcome) => {
                     moved += 1;
                     manifest.record_move(dup_path, &outcome.destination)
                 }
-                Err(e) => {
+                Err(RecordedMoveError::Move(e)) => {
                     error!(path = %dup_path.display(), error = %e, "failed to move duplicate");
                     errors += 1;
                     manifest.record_failure(dup_path, &format!("{e:#}"))
+                }
+                // The journal is what `undo` replays. Without it the rest of
+                // this group would be relocated into a numbered directory with
+                // nothing on disk saying where the files came from, which for a
+                // photo library is close to losing them.
+                Err(RecordedMoveError::Journal { error, .. }) => {
+                    return Err(error.context(format!(
+                        "the run journal could not be written while relocating duplicate {}; \
+                         the remaining duplicates have been left where they are",
+                        dup_path.display()
+                    )))
                 }
             };
 
@@ -328,7 +572,7 @@ pub fn move_duplicates(groups: &[DuplicateGroup], output_dir: &Path) -> Result<(
             // is recording, which is the failure this whole structure exists
             // to avoid — better to leave the rest where the user can still
             // find them.
-            if let Err(e) = recorded {
+            if let Err(e) = manifested {
                 let abandoned = group.files.len() - 1 - done - 1;
                 error!(
                     group = i,
@@ -652,10 +896,15 @@ pub struct MoveRun {
     pub moved: usize,
     /// Files whose move failed. Counted, logged, and stepped over.
     pub errors: usize,
-    /// Files never attempted, because the operator stopped the run.
+    /// Files never attempted, because the run stopped before reaching them.
     pub unprocessed: usize,
     /// Whether the run ended at a chunk boundary rather than at the end.
     pub stopped_early: bool,
+    /// Whether the run stopped because the journal could not be written.
+    ///
+    /// Distinct from [`MoveRun::stopped_early`], which is the operator's
+    /// decision. This one is a failure, and the caller is expected to say so.
+    pub journal_failed: bool,
 }
 
 /// How the caller observes and steers a chunked run.
@@ -696,10 +945,17 @@ pub trait ChunkController {
 /// Infallible by signature: a failed move is counted and the next file is
 /// attempted, exactly as the scanner and the hashing passes treat an unreadable
 /// file. One photo that cannot move is not a reason to abandon the rest.
+///
+/// A journal that cannot be written *is* such a reason, and is the one
+/// condition that stops the run on its own: every move after it would be one
+/// `undo` could not reverse. That stop is reported as
+/// [`MoveRun::journal_failed`] rather than as a failed move, because the files
+/// left behind are untouched, not broken.
 pub fn process_moves(
     planned: &[PlannedMove],
     chunk_size: usize,
     controller: &mut impl ChunkController,
+    recorder: &mut MoveRecorder<'_>,
 ) -> MoveRun {
     let total = planned.len();
     // `slice::chunks` panics on a zero size, and `--chunk-size 0` is one
@@ -720,9 +976,9 @@ pub fn process_moves(
         controller.chunk_started(i + 1, chunk_count);
 
         for planned in *chunk {
-            match execute_move(planned) {
+            match recorded_move(recorder, planned, MovePurpose::Organise) {
                 Ok(_) => run.moved += 1,
-                Err(e) => {
+                Err(RecordedMoveError::Move(e)) => {
                     error!(
                         src = %planned.source.display(),
                         dst = %planned.destination.display(),
@@ -731,11 +987,35 @@ pub fn process_moves(
                     );
                     run.errors += 1;
                 }
+                Err(RecordedMoveError::Journal { error, moved }) => {
+                    // The file may or may not have moved — `moved` says which —
+                    // but either way nothing after this point could be
+                    // recorded, so nothing after this point is attempted.
+                    if moved {
+                        run.moved += 1;
+                    }
+                    error!(
+                        src = %planned.source.display(),
+                        moved,
+                        error = %format!("{error:#}"),
+                        "the run journal could not be written; stopping so that no further move \
+                         goes unrecorded"
+                    );
+                    run.journal_failed = true;
+                }
             }
             controller.file_finished();
+
+            if run.journal_failed {
+                break;
+            }
         }
 
         let remaining = total - (run.moved + run.errors);
+        if run.journal_failed {
+            run.unprocessed = remaining;
+            break;
+        }
         if remaining > 0 && !controller.should_continue(i + 1, remaining) {
             run.stopped_early = true;
             run.unprocessed = remaining;
@@ -1745,7 +2025,8 @@ mod tests {
         let group = duplicate_group(&[kept, doomed.clone(), survivor.clone()], b"BODY");
         fs::remove_file(&doomed).unwrap();
 
-        let (moved, errors) = move_duplicates(&[group], &output).unwrap();
+        let (moved, errors) =
+            move_duplicates(&[group], &output, &mut MoveRecorder::disabled()).unwrap();
 
         assert_eq!((moved, errors), (1, 1), "one move must fail, one succeed");
 
@@ -1786,7 +2067,8 @@ mod tests {
         }
 
         let group = duplicate_group(&[kept, first.clone(), second.clone()], b"BODY");
-        let (moved, errors) = move_duplicates(&[group], &output).unwrap();
+        let (moved, errors) =
+            move_duplicates(&[group], &output, &mut MoveRecorder::disabled()).unwrap();
         assert_eq!((moved, errors), (2, 0));
 
         let group_dir = output.join("duplicates/000");
@@ -1879,7 +2161,7 @@ mod tests {
         let planned = four_planned_moves(tmp.path());
         let mut controller = ScriptedController::new(&[false]);
 
-        let run = process_moves(&planned, 2, &mut controller);
+        let run = process_moves(&planned, 2, &mut controller, &mut MoveRecorder::disabled());
 
         assert_eq!(
             (run.moved, run.errors, run.unprocessed, run.stopped_early),
@@ -1915,7 +2197,7 @@ mod tests {
         let planned = four_planned_moves(tmp.path());
         let mut controller = ScriptedController::new(&[true, true, true]);
 
-        let run = process_moves(&planned, 2, &mut controller);
+        let run = process_moves(&planned, 2, &mut controller, &mut MoveRecorder::disabled());
 
         assert_eq!(
             (run.moved, run.errors, run.unprocessed, run.stopped_early),
@@ -1939,7 +2221,7 @@ mod tests {
         fs::remove_file(&planned[1].source).unwrap();
         let mut controller = ScriptedController::new(&[true, true, true]);
 
-        let run = process_moves(&planned, 2, &mut controller);
+        let run = process_moves(&planned, 2, &mut controller, &mut MoveRecorder::disabled());
 
         assert_eq!(
             (run.moved, run.errors, run.unprocessed, run.stopped_early),
@@ -1960,10 +2242,313 @@ mod tests {
         let planned = four_planned_moves(tmp.path());
         let mut controller = ScriptedController::new(&[]);
 
-        let run = process_moves(&planned, 0, &mut controller);
+        let run = process_moves(&planned, 0, &mut controller, &mut MoveRecorder::disabled());
 
         assert_eq!((run.moved, run.errors, run.unprocessed), (4, 0, 0));
         assert!(controller.asked.is_empty(), "one chunk asks nothing");
+    }
+
+    // -----------------------------------------------------------------
+    // Journalling the move passes
+    // -----------------------------------------------------------------
+
+    /// A journal under `<dir>/.mmm/journal`, as a real run would have.
+    fn open_journal(dir: &Path) -> Journal {
+        Journal::create(
+            &dir.join(".mmm/journal"),
+            &crate::journal::RunHeader::new("20240315-103000-abc123", dir, vec!["mmm".to_string()]),
+        )
+        .unwrap()
+    }
+
+    /// Every entry in `journal`, in the order it was written.
+    fn entries_of(journal: &Journal) -> Vec<JournalEntry> {
+        Journal::read(journal.path()).unwrap().1
+    }
+
+    /// The organise pass writes an intent for each file and an outcome after
+    /// it, in that order, naming both ends of the move.
+    #[test]
+    fn test_the_organise_pass_journals_an_intent_then_an_outcome_per_file() {
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+        let mut journal = open_journal(tmp.path());
+        let mut controller = ScriptedController::new(&[]);
+
+        let run = process_moves(
+            &planned,
+            0,
+            &mut controller,
+            &mut MoveRecorder::new(Some(&mut journal)),
+        );
+        assert_eq!((run.moved, run.errors), (4, 0));
+
+        let entries = entries_of(&journal);
+        assert_eq!(
+            entries.len(),
+            8,
+            "four intents and four outcomes: {entries:?}"
+        );
+
+        for (i, planned) in planned.iter().enumerate() {
+            let JournalEntry::MoveIntent {
+                seq,
+                source,
+                destination,
+                source_size,
+                kind,
+                ..
+            } = &entries[i * 2]
+            else {
+                panic!(
+                    "entry {} should be the intent; got {:?}",
+                    i * 2,
+                    entries[i * 2]
+                );
+            };
+            assert_eq!(source, &planned.source);
+            assert_eq!(destination, &planned.destination);
+            assert_eq!(*kind, IntentKind::Organise);
+            assert_eq!(
+                *source_size,
+                fs::metadata(&planned.destination).unwrap().len(),
+                "the recorded size must be the size of the file that moved"
+            );
+
+            let JournalEntry::MoveCommitted {
+                seq: committed_seq,
+                final_destination,
+                ..
+            } = &entries[i * 2 + 1]
+            else {
+                panic!(
+                    "entry {} should be the outcome; got {:?}",
+                    i * 2 + 1,
+                    entries[i * 2 + 1]
+                );
+            };
+            assert_eq!(
+                committed_seq, seq,
+                "the outcome must be paired to its intent by sequence number"
+            );
+            assert_eq!(final_destination, &planned.destination);
+        }
+    }
+
+    /// The recorded destination is the one the file reached, suffix and all.
+    /// A record naming the *planned* path cannot be used to find the file.
+    #[test]
+    fn test_the_journal_records_the_destination_the_file_actually_reached() {
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+        fs::write(&planned[0].destination, b"TAKEN").unwrap();
+        let mut journal = open_journal(tmp.path());
+        let mut controller = ScriptedController::new(&[]);
+
+        process_moves(
+            &planned[..1],
+            0,
+            &mut controller,
+            &mut MoveRecorder::new(Some(&mut journal)),
+        );
+
+        let expected = collision_candidate(&planned[0].destination, 1);
+        let entries = entries_of(&journal);
+        assert!(
+            matches!(
+                &entries[1],
+                JournalEntry::MoveCommitted { final_destination, .. } if final_destination == &expected
+            ),
+            "expected a commit naming {}; got {:?}",
+            expected.display(),
+            entries[1]
+        );
+    }
+
+    /// A move that failed is recorded as failed. The distinction matters to
+    /// undo: an intent with a `MoveFailed` means the source never left, while
+    /// an intent with nothing after it means nobody knows.
+    #[test]
+    fn test_a_failed_move_is_journalled_as_failed() {
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+        fs::remove_file(&planned[0].source).unwrap();
+        let mut journal = open_journal(tmp.path());
+        let mut controller = ScriptedController::new(&[]);
+
+        let run = process_moves(
+            &planned[..1],
+            0,
+            &mut controller,
+            &mut MoveRecorder::new(Some(&mut journal)),
+        );
+        assert_eq!((run.moved, run.errors), (0, 1));
+
+        let entries = entries_of(&journal);
+        assert!(matches!(
+            entries[0],
+            JournalEntry::MoveIntent { seq: 0, .. }
+        ));
+        assert!(
+            matches!(&entries[1], JournalEntry::MoveFailed { seq: 0, reason } if !reason.is_empty()),
+            "got {:?}",
+            entries[1]
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, JournalEntry::MoveCommitted { .. })),
+            "a move that did not happen must not be recorded as committed"
+        );
+    }
+
+    /// The ordering the whole module exists for, asserted where it is
+    /// observable: a recorder that cannot write refuses *before* the move, so
+    /// the file is still where it was. Were the move attempted first, the
+    /// source would be gone and the journal would say nothing about it.
+    #[test]
+    fn test_an_unwritable_journal_stops_the_run_before_anything_moves() {
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+        let mut controller = ScriptedController::new(&[]);
+
+        let run = process_moves(&planned, 2, &mut controller, &mut MoveRecorder::failing());
+
+        assert!(run.journal_failed, "the run must report why it stopped");
+        assert!(
+            !run.stopped_early,
+            "a journal failure is not the operator's decision and must not be reported as one"
+        );
+        assert_eq!(
+            (run.moved, run.errors, run.unprocessed),
+            (0, 0, 4),
+            "nothing moved, nothing failed, and every file is accounted for"
+        );
+        for planned in &planned {
+            assert!(
+                planned.source.exists(),
+                "{} moved despite the journal refusing the intent",
+                planned.source.display()
+            );
+            assert!(!planned.destination.exists());
+        }
+        assert_eq!(
+            controller.asked,
+            Vec::new(),
+            "a halted run must not ask the operator whether to continue"
+        );
+    }
+
+    /// Duplicates are journalled through the same mechanism, carrying the group
+    /// they landed in and the digest the dedup cascade already computed.
+    #[test]
+    fn test_duplicates_are_journalled_with_their_group_and_digest() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let output = tmp.path().join("output");
+
+        let kept = input.join("kept.jpg");
+        let copy = input.join("copy.jpg");
+        for path in [&kept, &copy] {
+            fs::write(path, b"BODY").unwrap();
+        }
+        let group = duplicate_group(&[kept, copy.clone()], b"BODY");
+        let digest = group.hash.clone();
+
+        let mut journal = open_journal(tmp.path());
+        let (moved, errors) = move_duplicates(
+            &[group],
+            &output,
+            &mut MoveRecorder::new(Some(&mut journal)),
+        )
+        .unwrap();
+        assert_eq!((moved, errors), (1, 0));
+
+        let entries = entries_of(&journal);
+        assert!(
+            matches!(
+                &entries[0],
+                JournalEntry::MoveIntent { source, kind, source_hash, .. }
+                    if source == &copy
+                        && *kind == IntentKind::Duplicate
+                        && source_hash.as_deref() == Some(digest.as_str())
+            ),
+            "got {:?}",
+            entries[0]
+        );
+        assert!(
+            matches!(
+                &entries[1],
+                JournalEntry::DuplicateMoved { group: 0, source, destination, .. }
+                    if source == &copy && destination == &output.join("duplicates/000/copy.jpg")
+            ),
+            "got {:?}",
+            entries[1]
+        );
+    }
+
+    /// One counter across both passes. Duplicates move first and the organise
+    /// pass follows; if each kept its own sequence, undo could not tell two
+    /// records apart.
+    #[test]
+    fn test_both_passes_draw_from_one_sequence_counter() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let kept = input.join("kept.jpg");
+        let copy = input.join("copy.jpg");
+        for path in [&kept, &copy] {
+            fs::write(path, b"BODY").unwrap();
+        }
+        let group = duplicate_group(&[kept, copy], b"BODY");
+
+        let mut journal = open_journal(tmp.path());
+        move_duplicates(
+            &[group],
+            &tmp.path().join("output"),
+            &mut MoveRecorder::new(Some(&mut journal)),
+        )
+        .unwrap();
+
+        let planned = four_planned_moves(tmp.path());
+        let mut controller = ScriptedController::new(&[]);
+        process_moves(
+            &planned,
+            0,
+            &mut controller,
+            &mut MoveRecorder::new(Some(&mut journal)),
+        );
+
+        let seqs: Vec<u64> = entries_of(&journal)
+            .iter()
+            .filter_map(|e| match e {
+                JournalEntry::MoveIntent { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2, 3, 4],
+            "the duplicate pass takes seq 0 and the organise pass carries on from there"
+        );
+    }
+
+    /// `--no-journal`, and every test above that is not about journalling: the
+    /// moves still happen and nothing is written.
+    #[test]
+    fn test_a_disabled_recorder_moves_files_and_records_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+        let mut controller = ScriptedController::new(&[]);
+
+        let run = process_moves(&planned, 0, &mut controller, &mut MoveRecorder::disabled());
+
+        assert_eq!((run.moved, run.errors, run.journal_failed), (4, 0, false));
+        assert!(
+            !tmp.path().join(".mmm").exists(),
+            "a disabled recorder must not create the metadata directory"
+        );
     }
 
     #[test]

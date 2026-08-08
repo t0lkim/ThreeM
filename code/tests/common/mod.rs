@@ -46,6 +46,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
+use mmm::METADATA_DIR_NAME;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -185,17 +186,65 @@ pub fn naive(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> 
 // Golden-tree helpers
 // ---------------------------------------------------------------------------
 
-/// Sorted, `/`-separated paths of every file under `root`, relative to `root`.
+/// Sorted, `/`-separated paths of every media-tree file under `root`, relative
+/// to `root`.
 ///
 /// Directories are omitted — an empty directory is not an observable outcome
 /// worth asserting on, and including them would make the snapshots noisy.
+///
+/// So is `.mmm/`, the tool's own metadata: a run journal is named for the run,
+/// so its filename is different every time and no golden snapshot could contain
+/// it. Excluding it here keeps these assertions about the *library*, which is
+/// what they are for — the metadata tree has [`metadata_snapshot`], and the
+/// tests that care about it say so explicitly rather than relying on a snapshot
+/// to notice.
 pub fn snapshot_tree(root: &Path) -> Vec<String> {
-    let mut out: Vec<String> = WalkDir::new(root)
+    let mut out: Vec<String> = media_files(root)
+        .map(|path| relative_slug(root, &path))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every file under `root` except the tool's own `.mmm/` metadata.
+fn media_files(root: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || e.file_name() != METADATA_DIR_NAME)
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+}
+
+/// Sorted paths under `root/.mmm/`, relative to `root` — everything
+/// [`snapshot_tree`] leaves out.
+///
+/// A dry run must produce an empty one of these: previewing writes nothing at
+/// all, journal included.
+pub fn metadata_snapshot(root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = WalkDir::new(root.join(METADATA_DIR_NAME))
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .map(|e| relative_slug(root, e.path()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The journals written under `root/.mmm/journal/`, sorted by run id — which,
+/// the run id being what it is, is chronological order.
+pub fn journals_in(root: &Path) -> Vec<PathBuf> {
+    let dir = root.join(METADATA_DIR_NAME).join("journal");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
         .collect();
     out.sort();
     out
@@ -207,16 +256,12 @@ pub fn snapshot_tree(root: &Path) -> Vec<String> {
 /// *content*. Use it for the "a default run leaves the input byte-identical"
 /// assertion, where equal path lists would not actually establish the claim.
 pub fn snapshot_tree_hashed(root: &Path) -> Vec<String> {
-    let mut out: Vec<String> = WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .map(|e| {
-            let bytes = fs::read(e.path())
-                .unwrap_or_else(|err| panic!("reading {}: {err}", e.path().display()));
+    let mut out: Vec<String> = media_files(root)
+        .map(|path| {
+            let bytes =
+                fs::read(&path).unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
             let hash = blake3::hash(&bytes).to_hex().to_string();
-            format!("{}  {hash}", relative_slug(root, e.path()))
+            format!("{}  {hash}", relative_slug(root, &path))
         })
         .collect();
     out.sort();
@@ -240,16 +285,11 @@ pub fn snapshot_tree_hashed(root: &Path) -> Vec<String> {
 pub fn file_contents_by_marker(root: &Path) -> BTreeMap<String, Vec<String>> {
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
-        if let Some(marker) = marker_of(entry.path()) {
+    for path in media_files(root) {
+        if let Some(marker) = marker_of(&path) {
             map.entry(marker)
                 .or_default()
-                .push(relative_slug(root, entry.path()));
+                .push(relative_slug(root, &path));
         }
     }
 
