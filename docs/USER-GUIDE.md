@@ -263,6 +263,9 @@ Two limits worth knowing:
 bound at all" to the underlying thread pool, which is the opposite of what the
 setting is for. Omit the flag to get the default.
 
+Why the duplicate scan is parallel at all, why the ceiling is 8, and what the
+change actually measured — [`docs/decisions/adr-007-parallel-hashing.md`](decisions/adr-007-parallel-hashing.md).
+
 ---
 
 ## Timezones

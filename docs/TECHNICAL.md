@@ -39,14 +39,14 @@ The system uses a **two-pass architecture**:
 |---|---|
 | `config.rs` | CLI argument parsing via clap derive API |
 | `scanner.rs` | Recursive directory traversal, extension filtering, skip-and-count on unreadable entries |
-| `hasher.rs` | Three-phase dedup cascade, BLAKE3 hashing, skip-and-count on unhashable files |
+| `hasher.rs` | Three-phase dedup cascade, BLAKE3 hashing, the bounded `HashPool`, skip-and-count on unhashable files |
 | `metadata.rs` | EXIF extraction (images), container metadata (video), filesystem fallback |
 | `geocoder.rs` | Offline reverse geocoding via GeoNames k-d tree |
 | `naming.rs` | How names are spelled: filename sanitising, the four-digit year range |
 | `organiser.rs` | Target path computation, atomic file moves, duplicate movement, chunked execution |
 | `reporter.rs` | Dry-run output, duplicate listing, summary reports, chunk prompts |
 | `error.rs` | Typed error definitions (thiserror) |
-| `main.rs` | Orchestration, progress bars, terminal prompting via `ChunkController` |
+| `main.rs` | Orchestration, building the hashing pool, progress bars, terminal prompting via `ChunkController` |
 | `bin/dedup_verifier.rs` | Independent verification binary |
 
 ---
@@ -55,65 +55,124 @@ The system uses a **two-pass architecture**:
 
 The deduplication strategy is designed to minimise I/O. Most files in a typical photo library are unique, so the goal is to prove uniqueness as cheaply as possible and only pay the cost of full-file hashing for the tiny subset that survives the cheap filters.
 
+Phase 1 is serial and reads nothing. **Phases 2 and 3 hash in parallel**, on a pool whose width the run owns — see [Concurrency](#concurrency-a-bounded-pool-of-the-runs-own) below and [ADR-007](decisions/adr-007-parallel-hashing.md) for the reasoning and the measurements.
+
 ### Phase 1: Group by File Size
 
-**Cost:** Zero I/O (filesystem metadata only, already collected during scan).
+**Cost:** Zero I/O (filesystem metadata only, already collected during scan). **Serial.**
 
 Files are grouped by byte size. Any file whose size is unique across the entire input set is immediately classified as unique and skipped for all further hashing.
 
 **Typical elimination rate:** 70-90% of files. Two different photos almost never have the exact same byte count.
 
+It stays serial by measurement, not by oversight: 12 µs against phase 3's 94 ms on the benchmark corpus — 0.012% of the cascade. A thread pool cannot make free work cheaper.
+
 ### Phase 2: Partial BLAKE3 Hash
 
-**Cost:** 128KB read per file (first 64KB + last 64KB).
+**Cost:** at most 128KB read per file (first 64KB + last 64KB). **Parallel.**
 
-For files that share a size with at least one other file, a partial hash is computed. The hasher reads:
-
-- The **first 64KB** of the file (captures headers, EXIF differences, encoding parameters)
-- The **last 64KB** of the file (captures content/trailer differences)
-
-These two chunks are fed into a single BLAKE3 hasher to produce a partial hash. Files within a size group that have different partial hashes are classified as unique.
+For files that share a size with at least one other file, a partial hash is computed. Files within a size group that have different partial hashes are classified as unique.
 
 **Why first + last:** Two photos with the same file size almost never have identical header and trailer bytes. This is especially effective for media files where headers contain unique EXIF data and trailers contain format-specific padding or checksums.
 
-**Edge case:** If a file is smaller than 128KB total, only the first chunk is read (the entire file fits in one read).
+#### Which bytes are actually read
+
+The boundary is a named rule (`partial_coverage`), not two inline comparisons, because the promotion below turns on getting it right:
+
+| File size | Bytes hashed | `PartialCoverage` |
+|---|---|---|
+| `0 ..= 64KB` | the whole file | `WholeFile` |
+| `64KB+1 ..= 128KB` | the first 64KB only | `HeadOnly` |
+| `128KB+1 ..` | the first and last 64KB | `HeadAndTail` |
+
+**The middle band is the surprising one.** A 100KB file is fingerprinted on its first 64KB and nothing else, so two files of exactly that length differing only past that point both survive to phase 3 and are separated there. That is the cascade working — a partial hash is a filter, and a filter is allowed false positives. The band exists because below 128KB a tail read would overlap the head, re-reading bytes already hashed in the one phase whose job is to avoid reads. The behaviour there is deliberately frozen: changing which bytes are hashed would repartition every existing library on upgrade.
+
+#### Files phase 2 settles outright
+
+At `WholeFile` coverage the partial digest **is** the file's full-content digest, so a group of such files is a confirmed duplicate group the moment phase 2 buckets it. It is not sent to phase 3, which would only read every one of those files a second time to recompute a number already in hand. On a library of screenshots, thumbnails and sidecars that second read is most of the cascade's I/O.
+
+The promotion is a property of the **read**, not of the scan record. `partial_hash` takes the scan-time size as a *check*: it compares against the length of the open handle, refuses a mismatch as a per-file skip, and refuses again if a read returns fewer bytes than that length promised. Only then is the coverage claim made.
+
+#### Bucket key
+
+Phase 2 buckets by **`(size, digest)`**, not by digest alone. A partial hash is head-only below 128KB, so two files of different lengths can legitimately share one — a truncated download and the file it came from. Phase 1 already separated them, and phase 2 flattens every size group into a single call, so keying by digest alone would put them back together and buy each such pair a full read it does not need.
 
 ### Phase 3: Full BLAKE3 Hash
 
-**Cost:** Full file read (streaming, 128KB buffer).
+**Cost:** Full file read (streaming, 128KB buffer). **Parallel.**
 
-Only files that matched on both size AND partial hash reach this phase. A streaming full-file BLAKE3 hash is computed and compared. Files with matching full hashes are confirmed as true duplicates (cryptographic certainty).
+Only files that matched on both size AND partial hash, *and* whose partial hash did not already cover them entirely, reach this phase. A streaming full-file BLAKE3 hash is computed and compared. Files with matching full hashes are confirmed as true duplicates (cryptographic certainty).
 
-**Typical volume:** Less than 1% of input files reach this phase.
+Buckets by the **digest alone**, which merges nothing: equal full hashes mean equal content, which means equal size, so those files shared a size group already.
+
+**Typical volume:** Less than 1% of input files reach this phase — and it is nonetheless 92% of the cascade's time, because it is the only phase that reads whole files.
 
 ### Cascade Summary
 
 ```
 All files
   │
-  ├── Phase 1: Group by size ──────── unique sizes → UNIQUE (skip)
+  ├── Phase 1: Group by size ──────── unique sizes → UNIQUE (skip)   [serial]
   │     │
   │     └── size matches
   │           │
   │           ├── Phase 2: Partial hash ── unique partials → UNIQUE (skip)
+  │           │     │                                                [parallel]
+  │           │     ├── partial matches, whole file covered (≤64KB)
+  │           │     │     └──────────────────────→ DUPLICATE GROUP (no second read)
   │           │     │
-  │           │     └── partial matches
+  │           │     └── partial matches, partially covered
   │           │           │
   │           │           └── Phase 3: Full hash ── unique fulls → UNIQUE
-  │           │                 │
+  │           │                 │                                   [parallel]
   │           │                 └── full matches → DUPLICATE GROUP
   │           │
   │           └── ...
   └── ...
 ```
 
+### Determinism
+
+The cascade's working sets are `HashMap`s, whose iteration order differs between two runs in one process, let alone between machines. Every ordering a user can observe is therefore **settled by sorting after the hashing has collected**, which is also what keeps the answer independent of thread completion order:
+
+- **Within a duplicate group:** sorted by `by_depth_then_path` — shallowest path first, then lexicographically smallest. `files[0]` is the retained original, the one copy left where it is.
+- **Between groups:** sorted by the group's BLAKE3 digest, with the retained original's path as a tie-break. A group therefore keeps its `duplicates/NNN` number between runs over the same tree.
+- **`unique`:** sorted by the same comparator. It is the order the organiser plans moves in, so it decides which of two files competing for one name gets `photo.jpg` and which gets `photo-1.jpg`.
+
+The contract: **a run at `--threads 1` and a run at the default produce byte-identical duplicate groups, the same retained original in each, the same group numbering and the same plan order.** Only the pace changes.
+
+### Concurrency: a bounded pool of the run's own
+
+`HashPool` wraps a dedicated `rayon::ThreadPool`, built in `main` and passed into `find_duplicates` — never rayon's global pool, which is process-wide, built once from whoever asked first, and therefore neither reconfigurable nor testable at two widths in one process. Building it before the cascade means a thread count that cannot be spawned stops the run before the cascade opens a single file.
+
+- **Width:** `--threads <N>` or `hash_threads`, defaulting to `min(available_parallelism(), 8)`. The bound is a queue depth for the storage device, not a use of the CPU — see [How many threads](USER-GUIDE.md#how-many-threads).
+- **Flat, not group-at-a-time.** Both phases hand their whole candidate set to one call. Duplicate groups are typically *pairs*, so parallelising within a group would cap the cascade at two-way concurrency however many cores were free.
+- **`NonZeroUsize` throughout,** because rayon reads `num_threads(0)` as "use your default" — a zero passed through would be no bound at all rather than a very small one. Zero and anything above 1024 are refused by `validate_hash_threads`, with one message shared by the TOML deserialiser, the `MMM_HASH_THREADS` parser and clap.
+- **No shared counter.** `map(...).collect()` yields results in **input** order regardless of completion order, so the skip count is a local in a serial fold and the warnings come out reproducibly. The per-file `Result` carries the resilience contract across the thread boundary intact.
+
+### Progress accounting
+
+The bar counts **reads, not files**, and `find_duplicates` owns its position, length and message for the duration of the call. Counting files would make it lie about where the time goes: phase 1 retires most of a library in microseconds, so a per-file bar leaps to 90% in the first millisecond and spends the whole run on the last tenth. Each phase-2 candidate is charged two reads — the partial hash, and the full hash it may need — and the second is refunded for every file phase 2 rules out or settles. Position rises, length only falls, so the fraction never goes backwards, and the bar ends exactly full by doing the work rather than by `finish()` papering over a shortfall. A file that will not open still ticks: the read was attempted, and the operator waited for it.
+
+### Measured
+
+Apple M1 Pro, 8 cores, NVMe-class SSD, page-cache warm. Full tables in [`docs/research/hashing-baseline.md`](research/hashing-baseline.md).
+
+| Measurement | Serial | Parallel | Speedup |
+|---|---|---|---|
+| Whole cascade | 102.49 ms | 39.174 ms | **2.62×** |
+| Phase 3 — full hash | 94.347 ms | 37.181 ms | 2.54× |
+| Phase 2 — partial hash | 3.6495 ms | 1.3194 ms | 2.77× |
+
+The corpus has no file below 100 KiB, so the phase-2 promotion scores 0% there; it was measured separately over 6 400 duplicate 40 KiB files, where a whole run went 0.61 s → 0.52 s and phase 3 went from 6 400 reads to none.
+
 ### Implementation Details
 
 - Hash algorithm: **BLAKE3** (standard mode, unkeyed)
-- Partial hash read: first 64KB + last 64KB via a bounded `Read::take` and `File::seek(SeekFrom::End)`. The length comes from the open file handle, not from the scan record — see [Resilience](#resilience-one-bad-file-costs-one-file) below
+- Partial hash read: first 64KB and, past 128KB, last 64KB, via a bounded `Read::take` and `File::seek(SeekFrom::End)`. The length comes from the open file handle and is checked against the scan record — see [Resilience](#resilience-one-bad-file-costs-one-file) below
 - Full hash read: streaming 128KB buffer via `File::read` loop
 - Hash output: 256-bit hex string (64 characters)
-- Data structure: `HashMap<u64, Vec<ScannedFile>>` for size groups, `HashMap<String, Vec<&ScannedFile>>` for hash groups
+- Data structures: `HashMap<u64, Vec<ScannedFile>>` for size groups; `HashMap<(u64, PartialHash), Vec<&ScannedFile>>` for phase 2 and `HashMap<String, Vec<&ScannedFile>>` for phase 3, both produced by one generic `group_by_key`
 
 ---
 
@@ -344,6 +403,7 @@ The resolver checks existence up to 10,000 suffixes, then falls back to a millis
 | `clap` | 4 | CLI argument parsing (derive API) |
 | `walkdir` | 2 | Recursive directory traversal |
 | `blake3` | 1 | Content hashing (standard and keyed modes) |
+| `rayon` | 1 | Parallel hashing in dedup phases 2 and 3, on a pool the run owns — see [ADR-007](decisions/adr-007-parallel-hashing.md) |
 | `nom-exif` | 1.5 | EXIF metadata (images) and container metadata (video) |
 | `reverse_geocoder` | 4 | Offline GPS reverse geocoding (GeoNames k-d tree) |
 | `chrono` | 0.4 | Date/time parsing and formatting |
@@ -353,6 +413,7 @@ The resolver checks existence up to 10,000 suffixes, then falls back to a millis
 | `tracing` | 0.1 | Structured logging |
 | `tracing-subscriber` | 0.3 | Log formatting and filtering |
 | `tempfile` | 3 | (dev) Temporary directories for tests |
+| `criterion` | 0.8 | (dev) Throughput benchmarks for the dedup cascade — `code/benches/hashing.rs` |
 
 ---
 
@@ -375,6 +436,12 @@ cargo build --target x86_64-apple-darwin --release
 
 # Run tests
 cargo test
+
+# Benchmark the dedup cascade (~109 s; see docs/research/hashing-baseline.md)
+cargo bench --bench hashing
+
+# Compile and run every benchmark once, without sampling — for CI
+cargo bench -- --test
 
 # Lint
 cargo clippy -- -W clippy::all
