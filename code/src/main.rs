@@ -216,6 +216,19 @@ fn run_undo(args: &UndoArgs) -> Result<()> {
             if run.restored == 1 { " was" } else { "s were" }
         );
     }
+    // Reached only when every step succeeded, so this is the one remaining
+    // reason the library may not be as it was: the interrupted run left moves
+    // nothing recorded the outcome of, and undo cannot reverse what it cannot
+    // establish happened. A script must not read that as a clean undo.
+    if !plan.unresolved.is_empty() {
+        anyhow::bail!(
+            "the run was interrupted before it could record what happened to {} move{} — see \
+             \"{}\" above and check each by hand. Everything it did record has been put back.",
+            plan.unresolved.len(),
+            if plan.unresolved.len() == 1 { "" } else { "s" },
+            reporter::POSSIBLY_MOVED_HEADING,
+        );
+    }
 
     Ok(())
 }

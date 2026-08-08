@@ -41,8 +41,10 @@ use chrono::Utc;
 use common::{
     journals_in, metadata_snapshot, naive, snapshot_tree, snapshot_tree_hashed, MediaTree,
 };
+use mmm::journal::{Journal, JournalEntry, TRUNCATED_TAIL_NOTICE};
 use mmm::reporter::{
-    CONFLICTED_LABEL, DRY_RUN_BANNER, RESTORED_LABEL, SKIPPED_MODIFIED_LABEL, WILL_SKIP_PREFIX,
+    CONFLICTED_LABEL, DRY_RUN_BANNER, POSSIBLY_MOVED_HEADING, POSSIBLY_MOVED_LABEL, RESTORED_LABEL,
+    SKIPPED_MODIFIED_LABEL, WILL_SKIP_PREFIX,
 };
 use tempfile::TempDir;
 
@@ -392,6 +394,228 @@ fn undo_skips_a_file_that_changed_after_the_run_and_reports_it() {
         tree.join("holiday/paris.jpg").is_file(),
         "the untouched file should still have been restored: {:?}",
         snapshot_tree(tree.path())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The interrupted run
+// ---------------------------------------------------------------------------
+
+/// What cutting a journal short left behind.
+struct Interrupted {
+    /// The move whose outcome went with the partial line.
+    seq: u64,
+    /// Where that file was before the run — where an undo would put it back, if
+    /// anything said it had moved.
+    source: PathBuf,
+    /// Where it actually is, which only the lost line recorded.
+    destination: PathBuf,
+    /// Complete entries still in the journal afterwards.
+    kept: usize,
+}
+
+/// Cut `path` in the middle of the line recording its last committed move.
+///
+/// This is the closest a test can get to pulling the power mid-run: the journal
+/// keeps every complete entry, its final line is half-written, and the move that
+/// line described is left with an intent and no outcome. Note what the file
+/// system does *not* do — the file itself really did move, because the real run
+/// really did move it. That asymmetry is the whole point: the disk and the
+/// journal disagree, and undo has to cope with the journal it has.
+fn truncate_at_last_commit(path: &Path) -> Interrupted {
+    let (_, entries) = Journal::read(path).expect("the journal the run wrote must be readable");
+
+    let (index, seq, destination) = entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, entry)| match entry {
+            JournalEntry::MoveCommitted {
+                seq,
+                final_destination,
+                ..
+            } => Some((index, *seq, final_destination.clone())),
+            _ => None,
+        })
+        .expect("the run must have committed a move for there to be one to interrupt");
+
+    let (source, planned) = entries
+        .iter()
+        .find_map(|entry| match entry {
+            JournalEntry::MoveIntent {
+                seq: at,
+                source,
+                destination,
+                ..
+            } if *at == seq => Some((source.clone(), destination.clone())),
+            _ => None,
+        })
+        .expect("a commit is always preceded by its own intent");
+    // The reports below name the *planned* destination, since that is all a
+    // lost commit line leaves behind, while the file is at the final one. This
+    // fixture has no collisions so the two agree — if that ever changes, the
+    // assertions have to start telling them apart.
+    assert_eq!(
+        planned, destination,
+        "this fixture must not involve collision resolution"
+    );
+
+    let text = fs::read_to_string(path).expect("reading the journal to cut it");
+    let lines: Vec<&str> = text.lines().collect();
+    // Entry `index` is line `index + 1`: the header takes the first line.
+    let cut_line = lines[index + 1];
+    assert!(
+        cut_line.contains("move_committed"),
+        "expected to be cutting a commit record, got: {cut_line}"
+    );
+
+    // Bytes rather than a string slice: half a line can land inside a
+    // multi-byte character, which is exactly one of the shapes a real
+    // interruption takes and must not be a panic in the harness.
+    let mut truncated = lines[..=index].join("\n").into_bytes();
+    truncated.push(b'\n');
+    truncated.extend_from_slice(&cut_line.as_bytes()[..cut_line.len() / 2]);
+    fs::write(path, &truncated).expect("writing the truncated journal");
+
+    Interrupted {
+        seq,
+        source,
+        destination,
+        kept: index,
+    }
+}
+
+/// `path` relative to `root`, in the form the snapshot helpers use.
+fn relative(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or_else(|_| panic!("{} is not under {}", path.display(), root.display()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The digest a `snapshot_tree_hashed` entry recorded for `rel`.
+fn hash_of(snapshot: &[String], rel: &str) -> String {
+    let prefix = format!("{rel}  ");
+    snapshot
+        .iter()
+        .find_map(|entry| entry.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("{rel} is missing from the snapshot: {snapshot:?}"))
+        .to_string()
+}
+
+/// The crash-resilience claim, end to end: a journal cut off mid-line still
+/// describes every move it completed, `undo` reverses exactly those, and the one
+/// move whose outcome was lost is handed to the operator rather than guessed at
+/// in either direction.
+#[test]
+fn an_interrupted_run_restores_what_it_recorded_and_reports_what_it_could_not() {
+    let tree = nested_tree();
+    let (_scratch, out_dir) = scratch_output();
+    let before = snapshot_tree_hashed(tree.path());
+
+    assert_ok(&organise_commit(tree.path(), &out_dir), "commit run");
+
+    let journal_path = journals_in(&out_dir)
+        .pop()
+        .expect("the commit run must have written a journal");
+    let cut = truncate_at_last_commit(&journal_path);
+
+    // --- The journal survives being cut ---------------------------------
+    let (header, entries) =
+        Journal::read(&journal_path).expect("a truncated journal is still a journal");
+    assert_eq!(
+        entries.len(),
+        cut.kept,
+        "every complete entry must survive, and only the half-written one be dropped"
+    );
+    // "Exactly the moves it recorded" says little about a run that recorded
+    // one. The fixture has to leave several complete moves on the near side of
+    // the cut for the assertions below to mean anything.
+    assert!(
+        cut.kept >= 3,
+        "too few entries survived the cut for this test to prove much: {}",
+        cut.kept
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::RunCompleted { .. })),
+        "a run cut off before its closing line did not finish"
+    );
+    assert!(
+        matches!(entries.last(), Some(JournalEntry::MoveIntent { seq, .. }) if *seq == cut.seq),
+        "the surviving tail must be the intent whose outcome went with the cut line: {:?}",
+        entries.last()
+    );
+    assert_eq!(
+        header.output_dir, out_dir,
+        "the header must still name the library it organised into"
+    );
+
+    // --- The preview says what the commit will do -------------------------
+    let preview = undo(&out_dir, &[]);
+    // Zero: a preview that moves nothing cannot leave the library in a state
+    // worth failing over. The refusal belongs to the run that acts.
+    assert_ok(&preview, "undo preview of an interrupted run");
+    let previewed = stdout_of(&preview);
+    assert!(
+        previewed.contains(POSSIBLY_MOVED_HEADING)
+            && previewed.contains(&cut.source.display().to_string()),
+        "the preview must already name the file the commit will not touch:\n{previewed}"
+    );
+
+    // --- The undo ---------------------------------------------------------
+    let undone = undo(&out_dir, &["--commit"]);
+    assert_failed(&undone, "undo of an interrupted run");
+    let stdout = stdout_of(&undone);
+    let both = format!("{stdout}{}", String::from_utf8_lossy(&undone.stderr));
+
+    assert!(
+        both.contains(TRUNCATED_TAIL_NOTICE),
+        "the discarded line must be warned about, not silently dropped:\n{both}"
+    );
+    assert!(
+        stdout.contains(POSSIBLY_MOVED_HEADING),
+        "an intent with no outcome must be reported as possibly moved:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&cut.source.display().to_string())
+            && stdout.contains(&cut.destination.display().to_string()),
+        "the report must name both places the file could be, since it is one of the two:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(POSSIBLY_MOVED_LABEL),
+        "the count belongs in the closing table too — the list above it can be long:\n{stdout}"
+    );
+
+    // --- Exactly the recorded moves came back -----------------------------
+    let cut_rel = relative(tree.path(), &cut.source);
+    let expected: Vec<String> = before
+        .iter()
+        .filter(|entry| !entry.starts_with(&format!("{cut_rel}  ")))
+        .cloned()
+        .collect();
+    assert_eq!(
+        expected.len(),
+        before.len() - 1,
+        "the fixture must have lost exactly one file to the interruption"
+    );
+    assert_eq!(
+        snapshot_tree_hashed(tree.path()),
+        expected,
+        "the input tree is not the original minus the one move nothing recorded"
+    );
+
+    // And the unrecorded one is untouched where the run left it: not restored,
+    // and not damaged by the attempt either.
+    assert_eq!(
+        snapshot_tree_hashed(&out_dir),
+        vec![format!(
+            "{}  {}",
+            relative(&out_dir, &cut.destination),
+            hash_of(&before, &cut_rel)
+        )],
+        "the library should hold precisely the file whose move was never recorded"
     );
 }
 

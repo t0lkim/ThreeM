@@ -43,6 +43,13 @@ use crate::organiser::MoveKind;
 /// fields, so an older reader survives a newer writer's additions.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Warned when [`Journal::read`] drops a half-written final line.
+///
+/// A constant rather than a bare literal because it is the only outward sign
+/// that a journal was cut short, and the suite that proves an interrupted run is
+/// still recoverable asserts on the words the operator actually sees.
+pub const TRUNCATED_TAIL_NOTICE: &str = "discarding a truncated final journal line";
+
 /// The first line of every journal: what this run was, and what it was told to
 /// do.
 ///
@@ -337,8 +344,8 @@ impl Journal {
                     warn!(
                         journal = %path.display(),
                         error = %format!("{err:#}"),
-                        "discarding a truncated final journal line — the run was interrupted \
-                         while writing it; every complete entry before it has been recovered"
+                        "{TRUNCATED_TAIL_NOTICE} — the run was interrupted while writing it; \
+                         every complete entry before it has been recovered"
                     );
                 }
                 Err(err) => {

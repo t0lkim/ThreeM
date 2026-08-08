@@ -5,7 +5,9 @@ use crate::hasher::DuplicateGroup;
 use crate::journal::{JournalEntry, RunHeader};
 use crate::metadata::DateSource;
 use crate::organiser::PlannedMove;
-use crate::undo::{RestoreOutcome, RestorePlan, RestoreRun, RunRow, Verification};
+use crate::undo::{
+    RestoreOutcome, RestorePlan, RestoreRun, RunRow, UnresolvedIntent, Verification,
+};
 
 /// Print the duplicate groups found during scanning
 pub fn print_duplicates(groups: &[DuplicateGroup]) {
@@ -244,6 +246,50 @@ pub const INTERRUPTED_RUN_NOTICE: &str =
 /// Printed in a preview beside a file the undo would refuse to move.
 pub const WILL_SKIP_PREFIX: &str = "will be skipped";
 
+/// Heading of the section listing moves an interrupted run left in an unknown
+/// state.
+pub const POSSIBLY_MOVED_HEADING: &str = "Possibly moved — verify manually";
+
+/// The same figure in the closing table.
+pub const POSSIBLY_MOVED_LABEL: &str = "Possibly moved:";
+
+/// What the heading above means, in the words the operator needs to act on it.
+///
+/// The caveat about the destination is not a hedge: the line that would have
+/// recorded where the file actually landed is precisely the line the
+/// interruption cost, so all that survives is where the run *meant* to put it.
+/// Under a name collision the organiser lands a file beside that name, and an
+/// operator who checked only the exact path would find nothing and conclude the
+/// move never happened.
+pub const POSSIBLY_MOVED_NOTICE: &str =
+    "The run recorded that it was about to move each of these and never recorded what happened \
+     next, so each one is either still at its original path or already in the library. mmm will \
+     not guess between them: restoring a file that never moved would take it from where it \
+     belongs. Check both paths below by hand — the destination is the one the run planned, and a \
+     name collision could have put the file beside it under a numbered suffix.";
+
+/// List the moves whose outcome the run never recorded.
+///
+/// Printed for both a preview and a commit, because the operator needs the same
+/// list either way — the undo does nothing about these, so there is no
+/// difference between what a preview says of them and what a commit does.
+fn print_unresolved_intents(unresolved: &[UnresolvedIntent]) {
+    if unresolved.is_empty() {
+        return;
+    }
+
+    println!("\n─── {POSSIBLY_MOVED_HEADING} ───\n");
+    println!("{POSSIBLY_MOVED_NOTICE}\n");
+    for intent in unresolved {
+        println!(
+            "  [{:>5}] {}  →  {} (planned)",
+            intent.seq,
+            intent.source.display(),
+            intent.destination.display()
+        );
+    }
+}
+
 /// Announce which run is about to be reversed, and how.
 ///
 /// `checks` is the verification pass over the same steps, when one has been
@@ -269,6 +315,12 @@ pub fn print_restore_plan(plan: &RestorePlan, checks: Option<&[Verification]>) {
     if plan.interrupted {
         println!("\n{INTERRUPTED_RUN_NOTICE}");
     }
+
+    // Before the step list rather than after it, because it belongs beside the
+    // interruption notice that explains it — and because the list it would
+    // otherwise follow can run to thousands of lines. The closing table repeats
+    // the figure for anyone who scrolled past.
+    print_unresolved_intents(&plan.unresolved);
 
     if plan.steps.is_empty() {
         println!("\n{NOTHING_TO_UNDO}");
@@ -409,6 +461,15 @@ pub fn print_restore_summary(plan: &RestorePlan, run: &RestoreRun, journal: Jour
     }
     if run.pruned_dirs > 0 {
         println!("  {PRUNED_LABEL:<LABEL_WIDTH$}{}", run.pruned_dirs);
+    }
+    // A figure from the plan rather than the run: the undo did nothing to these
+    // files, which is precisely why they have to be counted somewhere the
+    // operator will see after the fact.
+    if !plan.unresolved.is_empty() {
+        println!(
+            "  {POSSIBLY_MOVED_LABEL:<LABEL_WIDTH$}{}",
+            plan.unresolved.len()
+        );
     }
     print_journal_location(journal);
     println!("═════════════════════\n");

@@ -25,8 +25,12 @@
 //!   longer the file that was put there, the world has moved on since and
 //!   nothing in the journal says how — so that file is reported and left alone.
 //!   See [`verify_step`].
+//! * **What cannot be reversed is still reported.** A run killed between an
+//!   intent and its outcome leaves a move nothing can undo, because nothing says
+//!   whether it happened. Silence there would be the worst of both: see
+//!   [`UnresolvedIntent`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -67,6 +71,29 @@ pub struct RestoreStep {
     pub kind: IntentKind,
 }
 
+/// A move whose intent reached the disk and whose outcome never did.
+///
+/// This is exactly what an interruption mid-rename looks like from the far
+/// side. The intent is synced *before* the move is attempted, so its presence
+/// says only that the run was about to act: the file is now either still at
+/// `source` or already at `destination`, and no line in the journal says which.
+///
+/// Undo will not guess between them. Restoring a file that never moved would
+/// take it from where it belongs; skipping one that did would leave it in the
+/// library with nothing recording it. So the move is neither reversed nor
+/// silently dropped — it is handed to the operator to check, which is the only
+/// party that can actually look.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedIntent {
+    pub seq: u64,
+    /// Where the file was before the run touched it.
+    pub source: PathBuf,
+    /// Where the run was about to put it. Not necessarily where it is: a move
+    /// that got as far as resolving a collision would have landed beside this.
+    pub destination: PathBuf,
+    pub kind: IntentKind,
+}
+
 /// Everything a run's journal says about putting that run back.
 #[derive(Debug, Clone)]
 pub struct RestorePlan {
@@ -75,6 +102,10 @@ pub struct RestorePlan {
     pub header: RunHeader,
     /// The moves to reverse, already in the order they must be performed.
     pub steps: Vec<RestoreStep>,
+    /// Moves the journal began and never finished recording. Not steps — there
+    /// is nothing safe to do about them — but not nothing either. See
+    /// [`UnresolvedIntent`].
+    pub unresolved: Vec<UnresolvedIntent>,
     /// The run never wrote its closing line, so it was interrupted rather than
     /// finished. The steps below are still every move it managed to record.
     pub interrupted: bool,
@@ -105,6 +136,10 @@ pub fn plan_restore(journal_path: &Path) -> Result<RestorePlan> {
 /// testable without a filesystem.
 pub fn build_plan(journal: PathBuf, header: RunHeader, entries: &[JournalEntry]) -> RestorePlan {
     let mut intents: HashMap<u64, Intent> = HashMap::new();
+    // Every sequence number some later line accounted for, however it turned
+    // out. An intent missing from this set is one the run never finished
+    // reporting on.
+    let mut settled: HashSet<u64> = HashSet::new();
     let mut interrupted = true;
 
     for entry in entries {
@@ -127,8 +162,15 @@ pub fn build_plan(journal: PathBuf, header: RunHeader, entries: &[JournalEntry])
                     },
                 );
             }
+            // All three are outcomes: the move happened, the move happened by
+            // the duplicate door, or the move was attempted and did not. Any of
+            // them answers the question the intent asked.
+            JournalEntry::MoveCommitted { seq, .. }
+            | JournalEntry::DuplicateMoved { seq, .. }
+            | JournalEntry::MoveFailed { seq, .. } => {
+                settled.insert(*seq);
+            }
             JournalEntry::RunCompleted { .. } => interrupted = false,
-            _ => {}
         }
     }
 
@@ -186,10 +228,33 @@ pub fn build_plan(journal: PathBuf, header: RunHeader, entries: &[JournalEntry])
         });
     }
 
+    // Journal order, not reverse: this is a list for a person to work through
+    // rather than a sequence of operations, and the order the run recorded them
+    // in is the order they happened.
+    let unresolved = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            JournalEntry::MoveIntent {
+                seq,
+                source,
+                destination,
+                kind,
+                ..
+            } if !settled.contains(seq) => Some(UnresolvedIntent {
+                seq: *seq,
+                source: source.clone(),
+                destination: destination.clone(),
+                kind: *kind,
+            }),
+            _ => None,
+        })
+        .collect();
+
     RestorePlan {
         journal,
         header,
         steps,
+        unresolved,
         interrupted,
     }
 }
@@ -879,7 +944,8 @@ mod tests {
         assert!(plan.steps.is_empty());
     }
 
-    /// A move that failed never happened, so there is nothing to reverse.
+    /// A move that failed never happened, so there is nothing to reverse — and
+    /// nothing ambiguous about it either. The journal answered the question.
     #[test]
     fn a_failed_move_produces_no_step() {
         let plan = plan_of(&[
@@ -890,20 +956,100 @@ mod tests {
             },
         ]);
         assert!(plan.steps.is_empty());
+        assert!(
+            plan.unresolved.is_empty(),
+            "a recorded failure is an outcome, not an open question: {:?}",
+            plan.unresolved
+        );
     }
 
     /// An intent with no outcome at all is the interrupted-mid-rename case. It
     /// is not restorable — nothing says the file moved — and it must not be
-    /// silently treated as one that did.
+    /// silently treated as one that did, in either direction.
     #[test]
-    fn an_intent_with_no_outcome_produces_no_step() {
+    fn an_intent_with_no_outcome_produces_no_step_but_is_reported() {
         let plan = plan_of(&[intent(
             0,
             "/photos/a.jpg",
             "/out/x.jpg",
             IntentKind::Organise,
         )]);
-        assert!(plan.steps.is_empty());
+
+        assert!(plan.steps.is_empty(), "nothing says the file moved");
+        assert_eq!(
+            plan.unresolved,
+            vec![UnresolvedIntent {
+                seq: 0,
+                source: PathBuf::from("/photos/a.jpg"),
+                destination: PathBuf::from("/out/x.jpg"),
+                kind: IntentKind::Organise,
+            }],
+            "both ends of the move must reach the operator — those are the two places to look"
+        );
+    }
+
+    /// The ordinary case, and the one a false positive here would ruin: a run
+    /// that finished has nothing for the operator to check by hand.
+    #[test]
+    fn a_completed_run_leaves_nothing_unresolved() {
+        let plan = plan_of(&[
+            intent(0, "/photos/a.jpg", "/out/x.jpg", IntentKind::Organise),
+            committed(0, "/out/x.jpg"),
+            intent(
+                1,
+                "/photos/copy.jpg",
+                "/out/duplicates/000/copy.jpg",
+                IntentKind::Duplicate,
+            ),
+            JournalEntry::DuplicateMoved {
+                seq: 1,
+                group: 0,
+                source: PathBuf::from("/photos/copy.jpg"),
+                destination: PathBuf::from("/out/duplicates/000/copy.jpg"),
+            },
+            JournalEntry::RunCompleted {
+                moved: 2,
+                failed: 0,
+                skipped: 0,
+                ended_at: Utc::now(),
+            },
+        ]);
+
+        assert_eq!(plan.steps.len(), 2);
+        assert!(plan.unresolved.is_empty(), "{:?}", plan.unresolved);
+    }
+
+    /// Only the move the interruption caught is ambiguous. Reporting the whole
+    /// run would bury the one file that actually needs looking at.
+    #[test]
+    fn only_the_intent_the_interruption_caught_is_reported() {
+        let plan = plan_of(&[
+            intent(0, "/photos/a.jpg", "/out/x.jpg", IntentKind::Organise),
+            committed(0, "/out/x.jpg"),
+            intent(1, "/photos/b.jpg", "/out/y.jpg", IntentKind::Organise),
+            committed(1, "/out/y.jpg"),
+            // The run died here, between writing this intent and acting on it.
+            intent(2, "/photos/c.jpg", "/out/z.jpg", IntentKind::Organise),
+        ]);
+
+        let seqs: Vec<u64> = plan.unresolved.iter().map(|u| u.seq).collect();
+        assert_eq!(seqs, vec![2]);
+        assert_eq!(plan.steps.len(), 2, "the recorded moves still come back");
+        assert!(plan.interrupted);
+    }
+
+    /// The list is for a person to work through, so it reads in the order the
+    /// run recorded the moves rather than in the reverse order the steps use.
+    #[test]
+    fn unresolved_intents_are_listed_in_the_order_the_run_recorded_them() {
+        let plan = plan_of(&[
+            intent(0, "/photos/a.jpg", "/out/x.jpg", IntentKind::Organise),
+            intent(1, "/photos/b.jpg", "/out/y.jpg", IntentKind::Organise),
+            intent(2, "/photos/c.jpg", "/out/z.jpg", IntentKind::Organise),
+        ]);
+
+        let seqs: Vec<u64> = plan.unresolved.iter().map(|u| u.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2]);
     }
 
     #[test]
@@ -964,6 +1110,7 @@ mod tests {
                     kind: IntentKind::Organise,
                 },
             ],
+            unresolved: Vec::new(),
             interrupted: false,
         };
 
@@ -1004,6 +1151,7 @@ mod tests {
                 source_hash: None,
                 kind: IntentKind::Organise,
             }],
+            unresolved: Vec::new(),
             interrupted: false,
         };
 
@@ -1055,6 +1203,7 @@ mod tests {
                     kind: IntentKind::Organise,
                 },
             ],
+            unresolved: Vec::new(),
             interrupted: false,
         };
 
@@ -1093,6 +1242,7 @@ mod tests {
                 source_hash: None,
                 kind: IntentKind::Organise,
             }],
+            unresolved: Vec::new(),
             interrupted: false,
         };
 
@@ -1267,6 +1417,7 @@ mod tests {
                 source_hash: None,
                 kind: IntentKind::Organise,
             }],
+            unresolved: Vec::new(),
             interrupted: false,
         };
 
@@ -1308,6 +1459,7 @@ mod tests {
                 source_hash: None,
                 kind: IntentKind::Organise,
             }],
+            unresolved: Vec::new(),
             interrupted: false,
         };
 
@@ -1355,6 +1507,7 @@ mod tests {
                 step("conflicted.jpg"),
                 step("vanished.jpg"),
             ],
+            unresolved: Vec::new(),
             interrupted: false,
         };
 
