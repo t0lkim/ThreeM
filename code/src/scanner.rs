@@ -8,13 +8,19 @@ use walkdir::{DirEntry, WalkDir};
 use crate::METADATA_DIR_NAME;
 
 /// Known image extensions (lowercase, no dot)
-const IMAGE_EXTENSIONS: &[&str] = &[
+///
+/// Public because [`crate::settings`] defaults to exactly this list, and a
+/// second copy of it over there would be a second thing to remember to update
+/// the day a new RAW format appears.
+pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "heic", "heif", "tiff", "tif", "raw", "cr2", "cr3", "nef", "arw", "dng",
     "orf", "rw2", "raf", "srw", "pef", "webp", "avif", "bmp",
 ];
 
 /// Known video extensions (lowercase, no dot)
-const VIDEO_EXTENSIONS: &[&str] = &[
+///
+/// Public for the same reason as [`IMAGE_EXTENSIONS`].
+pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mov", "mp4", "m4v", "avi", "mkv", "wmv", "flv", "webm", "3gp", "mts", "m2ts",
 ];
 
