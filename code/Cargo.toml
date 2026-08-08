@@ -40,6 +40,13 @@ chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
 # only — no serde, no encoding detection; an XMP packet is XML and declares
 # itself UTF-8.
 quick-xml = "0.41"
+# Parallel hashing for the dedup cascade. Phase 3 is 92% of the cascade's time
+# (`docs/research/hashing-baseline.md`) and runs at roughly single-threaded
+# BLAKE3 speed — one core busy, the rest idle. A work-stealing pool is the right
+# shape for it because the candidate sets are wildly uneven: one group may hold
+# two 4 GB videos and the next two hundred thumbnails, so a hand-rolled
+# chunk-per-thread split would leave threads idling on the short chunks.
+rayon = "1"
 
 [dev-dependencies]
 assert_cmd = "2"

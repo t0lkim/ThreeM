@@ -1,11 +1,13 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::Hash;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use tracing::{debug, warn};
 
 use crate::scanner::ScannedFile;
@@ -90,7 +92,7 @@ pub struct DuplicateGroup {
 /// accumulate downwards, in `old-phone/DCIM/backup/`. Lexicographic order then
 /// breaks the tie, which makes the rule total: for any two distinct paths it
 /// names one of them, with no appeal to iteration order, filesystem walk order
-/// or (once this cascade is parallel) thread completion order.
+/// or thread completion order.
 fn by_depth_then_path(a: &Path, b: &Path) -> Ordering {
     a.components()
         .count()
@@ -99,13 +101,22 @@ fn by_depth_then_path(a: &Path, b: &Path) -> Ordering {
 }
 
 /// Three-phase dedup cascade:
-/// 1. Group by file size (free — metadata only)
-/// 2. Partial BLAKE3 hash (first 64KB + last 64KB)
-/// 3. Full BLAKE3 hash (only for partial-hash matches)
+/// 1. Group by file size (free — metadata only, and serial)
+/// 2. Partial BLAKE3 hash (first 64KB + last 64KB), hashed in parallel
+/// 3. Full BLAKE3 hash (only for partial-hash matches), hashed in parallel
 ///
 /// Infallible by construction. A file that cannot be read is dropped from the
 /// analysis with a warning and counted in [`DedupResult::skipped`]; it never
 /// takes the rest of the run down with it.
+///
+/// **Parallel in phases 2 and 3, and flat rather than group-at-a-time.** Both
+/// hashing phases hand their whole candidate set to [`group_by_key`] at once
+/// instead of walking one size group after another. That matters more than the
+/// `par_iter` does: duplicate groups are typically pairs, so parallelising
+/// *within* a group would cap the cascade at two-way concurrency no matter how
+/// many cores were free. Phase 1 stays serial deliberately — it reads no file
+/// content and measured 12 µs against phase 3's 94 ms, so there is nothing
+/// there to win.
 ///
 /// **Deterministic by construction too.** The cascade's working sets are
 /// `HashMap`s, and a `HashMap` iterates in an order that differs between two
@@ -123,7 +134,8 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
 
     // Files with unique sizes are immediately unique
     let mut unique: Vec<UniqueFile> = Vec::new();
-    let mut candidates: Vec<Vec<&ScannedFile>> = Vec::new();
+    let mut phase2_candidates: Vec<&ScannedFile> = Vec::new();
+    let mut candidate_groups = 0usize;
 
     for group in size_groups.values() {
         if group.len() == 1 {
@@ -132,79 +144,89 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
                 known_hash: None,
             });
         } else {
-            candidates.push(group.iter().collect());
+            candidate_groups += 1;
+            phase2_candidates.extend(group.iter());
         }
     }
 
     debug!(
         unique = unique.len(),
-        candidate_groups = candidates.len(),
+        candidate_groups,
+        candidate_files = phase2_candidates.len(),
         "phase 1 complete"
     );
 
     // Phase 2: Partial hash
     progress.set_message("Phase 2: partial hashing size-matched files");
-    let mut phase3_candidates: Vec<Vec<&ScannedFile>> = Vec::new();
-    let mut skipped = 0;
+    // Keyed by *size and* digest, not digest alone. A partial hash is only the
+    // head (and, past 128 KB, the tail), so two files of different lengths can
+    // legitimately share one — a truncated download and the whole file it came
+    // from, say. Phase 1 already separated them and phase 2 must not put them
+    // back together, or every such pair buys a full read it does not need.
+    let (partial_groups, mut skipped) = group_by_key(
+        &phase2_candidates,
+        |file| partial_hash(&file.path),
+        |file, digest| (file.size, digest),
+    );
+    progress.inc(phase2_candidates.len() as u64);
 
-    for group in &candidates {
-        let partial = group_by_partial_hash(group);
-        skipped += partial.skipped;
-        for (_hash, pgroup) in partial.groups {
-            if pgroup.len() == 1 {
-                // A *partial* hash is head-plus-tail, not the whole file — it
-                // is not the digest the journal would need, so this one stays
-                // unhashed rather than recording something that only looks like
-                // a full digest.
-                unique.push(UniqueFile {
-                    file: pgroup[0].clone(),
-                    known_hash: None,
-                });
-            } else {
-                phase3_candidates.push(pgroup);
-            }
+    let mut phase3_candidates: Vec<&ScannedFile> = Vec::new();
+    for pgroup in partial_groups.into_values() {
+        if pgroup.len() == 1 {
+            // A *partial* hash is head-plus-tail, not the whole file — it
+            // is not the digest the journal would need, so this one stays
+            // unhashed rather than recording something that only looks like
+            // a full digest.
+            unique.push(UniqueFile {
+                file: pgroup[0].clone(),
+                known_hash: None,
+            });
+        } else {
+            phase3_candidates.extend(pgroup);
         }
-        progress.inc(group.len() as u64);
     }
 
-    debug!(phase3_groups = phase3_candidates.len(), "phase 2 complete");
+    debug!(phase3_files = phase3_candidates.len(), "phase 2 complete");
 
     // Phase 3: Full hash
+    //
+    // Keyed by the digest alone, across what were separate size groups, which
+    // merges nothing: two files with the same full hash have the same content
+    // and therefore the same size, so they were in one size group already.
     progress.set_message("Phase 3: full hashing confirmed candidates");
     let mut duplicate_groups: Vec<DuplicateGroup> = Vec::new();
 
-    for group in &phase3_candidates {
-        let full = group_by_full_hash(group);
-        skipped += full.skipped;
-        for (hash, mut fgroup) in full.groups {
-            // Before anything reads `fgroup[0]`, and before the group is
-            // emitted: the members arrive here in whatever order phase 3
-            // bucketed them, and index 0 is the file that will be left alone.
-            fgroup.sort_by(|a, b| by_depth_then_path(&a.path, &b.path));
+    let full = group_by_full_hash(&phase3_candidates);
+    skipped += full.skipped;
+    progress.inc(phase3_candidates.len() as u64);
 
-            if fgroup.len() == 1 {
-                // Fully hashed to prove it was not a duplicate; the digest is
-                // already paid for, so the journal gets it.
-                unique.push(UniqueFile {
-                    file: fgroup[0].clone(),
-                    known_hash: Some(hash),
-                });
-            } else {
-                // Keep the first file as the "original", rest are duplicates.
-                // Which one that is, is `by_depth_then_path`'s answer, applied
-                // just above. It carries the group's digest for the same reason.
-                unique.push(UniqueFile {
-                    file: fgroup[0].clone(),
-                    known_hash: Some(hash.clone()),
-                });
-                duplicate_groups.push(DuplicateGroup {
-                    hash,
-                    size: fgroup[0].size,
-                    files: fgroup.iter().map(|f| f.path.clone()).collect(),
-                });
-            }
+    for (hash, mut fgroup) in full.groups {
+        // Before anything reads `fgroup[0]`, and before the group is
+        // emitted: the members arrive here in whatever order phase 3
+        // bucketed them, and index 0 is the file that will be left alone.
+        fgroup.sort_by(|a, b| by_depth_then_path(&a.path, &b.path));
+
+        if fgroup.len() == 1 {
+            // Fully hashed to prove it was not a duplicate; the digest is
+            // already paid for, so the journal gets it.
+            unique.push(UniqueFile {
+                file: fgroup[0].clone(),
+                known_hash: Some(hash),
+            });
+        } else {
+            // Keep the first file as the "original", rest are duplicates.
+            // Which one that is, is `by_depth_then_path`'s answer, applied
+            // just above. It carries the group's digest for the same reason.
+            unique.push(UniqueFile {
+                file: fgroup[0].clone(),
+                known_hash: Some(hash.clone()),
+            });
+            duplicate_groups.push(DuplicateGroup {
+                hash,
+                size: fgroup[0].size,
+                files: fgroup.iter().map(|f| f.path.clone()).collect(),
+            });
         }
-        progress.inc(group.len() as u64);
     }
 
     // Both output lists are assembled from `HashMap` iteration, so both are
@@ -250,7 +272,9 @@ pub fn group_by_size(files: &[ScannedFile]) -> HashMap<u64, Vec<ScannedFile>> {
 /// groups and counted in [`HashGroups::skipped`], with a warning naming it.
 // exposed for integration tests
 pub fn group_by_partial_hash<'a>(files: &[&'a ScannedFile]) -> HashGroups<'a> {
-    group_by(files, |file| partial_hash(&file.path))
+    let (groups, skipped) =
+        group_by_key(files, |file| partial_hash(&file.path), |_, digest| digest);
+    HashGroups { groups, skipped }
 }
 
 /// Group files by a full-content BLAKE3 hash.
@@ -260,25 +284,52 @@ pub fn group_by_partial_hash<'a>(files: &[&'a ScannedFile]) -> HashGroups<'a> {
 /// naming it.
 // exposed for integration tests
 pub fn group_by_full_hash<'a>(files: &[&'a ScannedFile]) -> HashGroups<'a> {
-    group_by(files, |file| full_hash(&file.path))
+    let (groups, skipped) = group_by_key(files, |file| full_hash(&file.path), |_, digest| digest);
+    HashGroups { groups, skipped }
 }
 
-/// The shared body of both grouping passes: hash each file, bucket it by the
-/// digest, and drop — loudly — the ones that would not read.
+/// The shared body of both hashing passes: hash every file in parallel, bucket
+/// each one under `key`, and drop — loudly — the ones that would not read.
 ///
 /// One implementation rather than two, because the interesting behaviour here
 /// is the skip, and two copies of it are two chances for one of them to go
-/// back to `?` unnoticed.
-fn group_by<'a>(
+/// back to `?` unnoticed. `key` exists only so phase 2 can bucket by size *and*
+/// digest while phase 3 buckets by digest alone.
+///
+/// # Two halves, and why the split is where it is
+///
+/// The hashing is parallel; the bucketing is not. Rayon's `map(...).collect()`
+/// into a `Vec` yields results in **input order** regardless of which thread
+/// finished first, so the fold below sees the same sequence on every run and
+/// the skip count is an ordinary local variable rather than an
+/// [`AtomicUsize`](std::sync::atomic::AtomicUsize) — no counter is shared
+/// across threads at all, which is a stronger guarantee than incrementing one
+/// atomically, and it is why the warnings come out in a reproducible order too.
+/// Bucketing is a few hash-map inserts against a phase that reads gigabytes, so
+/// leaving it serial costs nothing measurable and removes the need for a
+/// mutex-wrapped map.
+///
+/// The per-file [`Result`] is the resilience contract from Phase 02 carried
+/// intact across the thread boundary: an unreadable file becomes an `Err` in
+/// the vector, not a `?` that would abandon every other file's completed work.
+fn group_by_key<'a, K, H, F>(
     files: &[&'a ScannedFile],
-    hash: impl Fn(&ScannedFile) -> Result<String>,
-) -> HashGroups<'a> {
-    let mut groups: HashMap<String, Vec<&'a ScannedFile>> = HashMap::new();
+    hash: H,
+    key: F,
+) -> (HashMap<K, Vec<&'a ScannedFile>>, usize)
+where
+    K: Eq + Hash,
+    H: Fn(&ScannedFile) -> Result<String> + Sync,
+    F: Fn(&ScannedFile, String) -> K,
+{
+    let digests: Vec<Result<String>> = files.par_iter().map(|file| hash(file)).collect();
+
+    let mut groups: HashMap<K, Vec<&'a ScannedFile>> = HashMap::new();
     let mut skipped = 0;
 
-    for file in files {
-        match hash(file) {
-            Ok(digest) => groups.entry(digest).or_default().push(file),
+    for (file, digest) in files.iter().zip(digests) {
+        match digest {
+            Ok(digest) => groups.entry(key(file, digest)).or_default().push(file),
             Err(e) => {
                 warn!(
                     path = %file.path.display(),
@@ -290,7 +341,7 @@ fn group_by<'a>(
         }
     }
 
-    HashGroups { groups, skipped }
+    (groups, skipped)
 }
 
 /// Hash first 64KB + last 64KB of a file using BLAKE3.
@@ -934,6 +985,181 @@ mod tests {
         let mut sorted = hashes.clone();
         sorted.sort_unstable();
         assert_eq!(hashes, sorted);
+    }
+
+    /// A tree wide enough that the hashing phases really do span threads:
+    /// `groups` duplicate groups of three copies each, every file the same
+    /// 40 KB length so all of them survive phase 1 into one enormous phase-2
+    /// candidate set.
+    ///
+    /// The narrow fixtures above have four or five files in them, which a
+    /// work-stealing pool may well run on one thread — they prove the sort
+    /// rules, not the concurrency. This one is here so that "the same tree
+    /// gives the same answer" is a claim about parallel execution.
+    fn wide_fixture(tmp: &TempDir, groups: u32) -> Vec<ScannedFile> {
+        let mut files = Vec::with_capacity(groups as usize * 3);
+        for g in 0..groups {
+            // Distinct content per group, identical length across all groups.
+            let body: Vec<u8> = (0..40_000u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(g) % 251) as u8)
+                .collect();
+            for copy in 0..3 {
+                files.push(plant(tmp, &format!("g{g:03}/c{copy}/photo.jpg"), &body));
+            }
+        }
+        files
+    }
+
+    /// The determinism guarantee, restated against a corpus large enough to be
+    /// hashed on several threads at once: completion order must not reach the
+    /// output.
+    #[test]
+    fn test_parallel_hashing_gives_byte_identical_output_across_runs() {
+        let tmp = TempDir::new().unwrap();
+        let files = wide_fixture(&tmp, 32);
+
+        let first = render(&find_duplicates(&files, &ProgressBar::hidden()));
+        for run in 1..8 {
+            assert_eq!(
+                render(&find_duplicates(&files, &ProgressBar::hidden())),
+                first,
+                "run {run} disagreed with run 0 — thread completion order is leaking"
+            );
+        }
+
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+        assert_eq!(result.duplicate_groups.len(), 32);
+        assert!(result.duplicate_groups.iter().all(|g| g.files.len() == 3));
+        assert_eq!(result.skipped, 0);
+    }
+
+    /// Many unreadable files, spread across many groups, hashed concurrently:
+    /// every one of them is counted exactly once and excluded from the plan,
+    /// and the readable copies around them still form their groups.
+    ///
+    /// The count is the point. A skip counter that lost increments under
+    /// concurrency would report a clean run over a library that was only
+    /// partly processed — and it would do so intermittently, which is worse.
+    #[cfg(unix)]
+    #[test]
+    fn test_concurrent_read_failures_are_each_counted_exactly_once() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const LOCKED: usize = 12;
+
+        let tmp = TempDir::new().unwrap();
+        let files = wide_fixture(&tmp, 32);
+
+        // One copy locked out of each of the first twelve groups.
+        let locked: Vec<PathBuf> = (0..LOCKED)
+            .map(|g| tmp.path().join(format!("g{g:03}/c0/photo.jpg")))
+            .collect();
+        for path in &locked {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let denied = File::open(&locked[0]).is_err();
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+
+        for path in &locked {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        if !denied {
+            eprintln!(
+                "SKIPPED test_concurrent_read_failures_are_each_counted_exactly_once: a 0o000 \
+                 file was still readable, so this process ignores permission bits (running \
+                 as root?)"
+            );
+            return;
+        }
+
+        assert_eq!(
+            result.skipped, LOCKED,
+            "every unreadable file must be counted once — no more, no less"
+        );
+        for path in &locked {
+            assert!(
+                !result.unique.iter().any(|u| &u.file.path == path),
+                "{} was never read, so it must not be offered as unique",
+                path.display()
+            );
+            assert!(
+                !result
+                    .duplicate_groups
+                    .iter()
+                    .any(|g| g.files.contains(path)),
+                "{} was never read, so it cannot be known to duplicate anything",
+                path.display()
+            );
+        }
+
+        assert_eq!(result.duplicate_groups.len(), 32);
+        let sizes: Vec<usize> = result
+            .duplicate_groups
+            .iter()
+            .map(|g| g.files.len())
+            .collect();
+        assert_eq!(
+            sizes.iter().filter(|&&n| n == 2).count(),
+            LOCKED,
+            "the twelve groups that lost a copy must come back as pairs"
+        );
+        assert_eq!(sizes.iter().filter(|&&n| n == 3).count(), 32 - LOCKED);
+    }
+
+    /// Phase 2 buckets by size *and* digest, so flattening the candidate set
+    /// across size groups cannot undo phase 1's work.
+    ///
+    /// Both fixtures below sit under 128 KB, so `partial_hash` reads only their
+    /// first 64 KB — which is byte-identical between the two sizes. Keyed by
+    /// the digest alone they would land in one bucket of two, be promoted to
+    /// phase 3, and each buy a full read to discover what their lengths already
+    /// said. Keyed by `(size, digest)` each is a bucket of one and neither is
+    /// opened again, which is what `known_hash: None` records here.
+    #[test]
+    fn test_phase_2_does_not_regroup_files_phase_1_separated_by_size() {
+        let tmp = TempDir::new().unwrap();
+
+        let head: Vec<u8> = (0..PARTIAL_HASH_BYTES).map(|i| (i % 251) as u8).collect();
+        let shared_head = |extra: usize, fill: u8| {
+            let mut body = head.clone();
+            body.extend(std::iter::repeat_n(fill, extra));
+            body
+        };
+        // A different first byte is enough to give a different partial digest.
+        let other_head = |extra: usize| {
+            let mut body = vec![0xAAu8; head.len()];
+            body.extend(std::iter::repeat_n(0xBBu8, extra));
+            body
+        };
+
+        let files = vec![
+            // 70 000 bytes: one file sharing the head, one not — so this size
+            // group splits into two buckets of one.
+            plant(&tmp, "small-shared.jpg", &shared_head(5_536, 0x11)),
+            plant(&tmp, "small-other.jpg", &other_head(5_536)),
+            // 80 000 bytes: same shape, and its shared-head file has exactly
+            // the same partial digest as `small-shared.jpg`.
+            plant(&tmp, "large-shared.jpg", &shared_head(15_536, 0x22)),
+            plant(&tmp, "large-other.jpg", &other_head(15_536)),
+        ];
+
+        assert_eq!(
+            partial_hash(&files[0].path).unwrap(),
+            partial_hash(&files[2].path).unwrap(),
+            "the fixture is pointless unless the two sizes really do share a partial digest"
+        );
+
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+
+        assert!(result.duplicate_groups.is_empty());
+        assert_eq!(result.unique.len(), 4);
+        assert!(
+            result.unique.iter().all(|u| u.known_hash.is_none()),
+            "every file was retired by the partial hash, so none of them should have been \
+             read end to end"
+        );
     }
 
     /// `unique` is the order the organiser plans moves in, so it is sorted by
