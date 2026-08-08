@@ -173,9 +173,12 @@ These bound what the numbers can honestly be used for.
 2. **Ten samples, not a hundred.** The large tier reads ~121 MiB per iteration;
    criterion's defaults cannot sample that a hundred times inside a sane window.
    Ten samples in a 12-second window is enough resolution to see a multi-core
-   speedup and keeps a full `cargo bench` to about 109 seconds wall-clock, which
+   speedup and keeps a full `cargo bench` to about two minutes wall-clock, which
    is short enough that it will actually get run. It is not enough to resolve a
-   5% change — do not read one into these tables.
+   5% change — do not read one into these tables. On the `small_100k` tier it is
+   not enough to resolve a *fifty* percent change either; see
+   [Reproducibility](#reproducibility), which measures that directly rather than
+   leaving this caveat as an estimate.
 3. **One machine, one storage type.** Everything here is an 8-core Apple Silicon
    laptop with an internal NVMe-class SSD. The thread-count guidance that comes
    out of this work has to be stated in terms of storage class, not copied from
@@ -297,6 +300,55 @@ No tier regressed, and none failed to improve, so there is nothing here of the
 kind that was to be reported rather than quietly shipped. The one number that
 moved without a cause behind it is phase 1, and it is dissected above rather
 than left in the table to be read as a win.
+
+### Reproducibility
+
+The tables above are each a single run. The end-of-phase gate re-ran the whole
+suite against a tree with **no source change at all** since the run that produced
+them — `git diff a7fbce5..HEAD -- code/` is empty, the five commits in between
+touch only documentation — so the second run is a direct measurement of how much
+these figures move when nothing moves.
+
+| Benchmark | Recorded above | Gate re-run | Speedup vs serial, re-run |
+|---|---|---|---|
+| `find_duplicates/small_100k` | 1.4233 ms | 1.6847 ms | 1.66× |
+| `find_duplicates/medium_5m` | 5.6211 ms | 5.2276 ms | 2.96× |
+| `find_duplicates/large_50m` | 36.082 ms | 36.180 ms | 2.02× |
+| `find_duplicates/mixed` | 39.174 ms | 38.652 ms | 2.65× |
+| `phase/2_partial_hash` | 1.3194 ms | 1.2868 ms | 2.84× |
+| `phase/3_full_hash` | 37.181 ms | 38.687 ms | 2.44× |
+
+**Everything except the small tier reproduces.** `large_50m` lands within 0.3%,
+`mixed` within 1.3%, phases 2 and 3 within 2.5% and 4%. The headline claim — a
+2.6× cascade, phase 3 doing the bulk of it — is stable across runs.
+
+**`small_100k` does not reproduce, and criterion's `change:` line on it should be
+ignored.** The gate run reported it `+52.906% (p = 0.00)`, *Performance has
+regressed*, against a binary that cannot have regressed because it is the same
+binary. Re-running that one benchmark three further times, back to back, on
+unchanged code:
+
+| Run | Point estimate | Criterion's verdict |
+|---|---|---|
+| gate | 1.6847 ms | regressed +52.9% (p = 0.00) |
+| repeat 1 | 1.5604 ms | **improved** −31.2% (p = 0.01) |
+| repeat 2 | 1.4897 ms | no change (p = 0.47) |
+| repeat 3 | 2.2686 ms | regressed +42.4% (p = 0.01) |
+
+Five measurements of one binary spanning 1.42–2.27 ms, with criterion reporting a
+statistically significant improvement *and* a statistically significant
+regression among them. The tier's honest speedup is **somewhere between 1.2× and
+2.0×**, and this corpus cannot pin it tighter; the 1.96× in the table above is
+the luckiest of the five, not a lie, but it should not be quoted to three
+significant figures.
+
+The cause is the tier's shape, not the machine being busy. `small_100k` is
+48 files of ~100 KiB finishing in under two milliseconds, so a single scheduling
+hiccup or page-cache eviction is a large fraction of the total, and the work is
+too short for the parallel section to amortise pool wake-up. The tiers that read
+hundreds of megabytes have no such problem. **A future run that wants to compare
+small-file performance needs a longer-running small tier, not more samples of
+this one.**
 
 ### What this corpus cannot measure
 
