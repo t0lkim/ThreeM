@@ -12,7 +12,8 @@
 //!   media tree file by file.
 //! * A minimal JPEG synthesiser — a genuinely byte-valid 1x1 baseline JPEG
 //!   carrying a hand-built EXIF APP1 segment (TIFF header, IFD0, Exif
-//!   `SubIFD` with `DateTimeOriginal`, optional GPS IFD).
+//!   `SubIFD` with `DateTimeOriginal` and an optional `OffsetTimeOriginal`,
+//!   optional GPS IFD).
 //! * [`snapshot_tree`] / [`file_contents_by_marker`] — golden-tree
 //!   assertion helpers.
 //!
@@ -101,14 +102,54 @@ impl MediaTree {
     /// GPS latitude/longitude when `gps` is `Some`.
     ///
     /// The datetime is written verbatim as EXIF ASCII (`YYYY:MM:DD HH:MM:SS`),
-    /// so a test can assert the exact value round-trips.
+    /// so a test can assert the exact value round-trips. An
+    /// `OffsetTimeOriginal` of `+00:00` is written alongside it, which is what
+    /// makes the stamp mean the same instant on every machine — see
+    /// [`Self::jpeg_with_offset`] for why, and for how to write a file that
+    /// says something else, or nothing at all.
     pub fn jpeg_with_exif(
         self,
         rel: &str,
         datetime: NaiveDateTime,
         gps: Option<(f64, f64)>,
     ) -> Self {
-        let bytes = synth_jpeg(Some((datetime, gps)), rel);
+        self.jpeg_with_offset(rel, datetime, Some("+00:00"), gps)
+    }
+
+    /// The same JPEG, with the EXIF offset tag under the caller's control.
+    ///
+    /// `offset` is written verbatim into `OffsetTimeOriginal` (0x9011) when
+    /// `Some` — `"+08:00"`, `"-05:30"`, or the specification's all-spaces
+    /// "unknown" — and the tag is omitted entirely when `None`.
+    ///
+    /// The distinction is the whole subject of the timezone work, and it is not
+    /// cosmetic. A file *with* the tag has testified about its own zone, and the
+    /// tool believes it over any configuration. A file *without* one carries a
+    /// bare wall clock, so the run has to decide what to read it against — which
+    /// is where `--timezone`, the machine's zone and the UTC admission come in.
+    /// Only the second kind can exercise that resolution order, and until this
+    /// existed the harness could not build one.
+    ///
+    /// A `None` fixture is therefore also the only one whose *recorded instant*
+    /// depends on the machine running the test. Its filed directory does not:
+    /// filing reads the wall clock, and attaching an offset does not move a wall
+    /// clock. Assertions on where such a file lands are safe; assertions on the
+    /// instant it resolves to are not.
+    pub fn jpeg_with_offset(
+        self,
+        rel: &str,
+        datetime: NaiveDateTime,
+        offset: Option<&str>,
+        gps: Option<(f64, f64)>,
+    ) -> Self {
+        let bytes = synth_jpeg(
+            Some(ExifSpec {
+                datetime,
+                offset,
+                gps,
+            }),
+            rel,
+        );
         self.write(rel, &bytes)
     }
 
@@ -419,16 +460,29 @@ pub fn deny_reads(path: &Path) -> Option<RestorePerms> {
 // JPEG synthesiser
 // ---------------------------------------------------------------------------
 
+/// What EXIF a synthesised JPEG is to carry.
+///
+/// A struct rather than a tuple because two of the three fields are `Option`s
+/// of unrelated things, and `Some(dt), None, Some(gps)` at a call site says
+/// nothing about which `None` was meant.
+struct ExifSpec<'a> {
+    datetime: NaiveDateTime,
+    /// Written verbatim into `OffsetTimeOriginal`; the tag is omitted when
+    /// `None`.
+    offset: Option<&'a str>,
+    gps: Option<(f64, f64)>,
+}
+
 /// Assemble a byte-valid 1x1 greyscale baseline JPEG.
 ///
 /// Segment order: `SOI`, `APP1` (EXIF, when requested), `COM` (marker),
 /// `DQT`, `SOF0`, `DHT` x2, `SOS`, one byte of entropy-coded data, `EOI`.
 /// The image decodes; it is simply a single black pixel.
-fn synth_jpeg(exif: Option<(NaiveDateTime, Option<(f64, f64)>)>, marker: &str) -> Vec<u8> {
+fn synth_jpeg(exif: Option<ExifSpec<'_>>, marker: &str) -> Vec<u8> {
     let mut jpeg: Vec<u8> = vec![0xFF, 0xD8]; // SOI
 
-    if let Some((datetime, gps)) = exif {
-        let tiff = build_tiff(datetime, gps);
+    if let Some(spec) = exif {
+        let tiff = build_tiff(&spec);
         let payload_len = 6 + tiff.len(); // "Exif\0\0" + TIFF block
         let seg_len = u16::try_from(payload_len + 2).expect("EXIF segment fits in a JPEG marker");
         jpeg.extend_from_slice(&[0xFF, 0xE1]);
@@ -493,7 +547,12 @@ const TY_UNDEFINED: u16 = 7;
 /// then a data area holding the values too large to sit inline in a 4-byte
 /// field. Pointer fields are written as zero and patched once their target
 /// offset is known — hand-computing them is where these things go wrong.
-fn build_tiff(datetime: NaiveDateTime, gps: Option<(f64, f64)>) -> Vec<u8> {
+fn build_tiff(spec: &ExifSpec<'_>) -> Vec<u8> {
+    let ExifSpec {
+        datetime,
+        offset,
+        gps,
+    } = *spec;
     let mut t: Vec<u8> = Vec::new();
 
     // --- TIFF header: little-endian, magic 42, IFD0 at offset 8 ---
@@ -520,12 +579,19 @@ fn build_tiff(datetime: NaiveDateTime, gps: Option<(f64, f64)>) -> Vec<u8> {
     let exif_ifd_off = u32::try_from(t.len()).unwrap();
     patch_u32(&mut t, exif_ptr_at, exif_ifd_off);
 
-    t.extend_from_slice(&3u16.to_le_bytes());
+    // Entries within an IFD are written in ascending tag order, as the TIFF
+    // specification requires: 0x9000, 0x9003, then 0x9011 when it is present.
+    let exif_entries: u16 = if offset.is_some() { 3 } else { 2 };
+    t.extend_from_slice(&exif_entries.to_le_bytes());
     push_entry(&mut t, 0x9000, TY_UNDEFINED, 4, *b"0231"); // ExifVersion 2.31
     let datetime_ptr_at = t.len() + 8;
     push_entry(&mut t, 0x9003, TY_ASCII, 20, [0; 4]); // DateTimeOriginal
-    let offset_ptr_at = t.len() + 8;
-    push_entry(&mut t, 0x9011, TY_ASCII, 7, [0; 4]); // OffsetTimeOriginal
+    let offset_ptr_at = offset.map(|text| {
+        let at = t.len() + 8;
+        let count = u32::try_from(text.len() + 1).expect("an offset tag is a handful of bytes");
+        push_entry(&mut t, 0x9011, TY_ASCII, count, [0; 4]); // OffsetTimeOriginal
+        at
+    });
     t.extend_from_slice(&0u32.to_le_bytes());
 
     // --- GPS IFD ---
@@ -558,14 +624,22 @@ fn build_tiff(datetime: NaiveDateTime, gps: Option<(f64, f64)>) -> Vec<u8> {
     t.extend_from_slice(stamp.as_bytes());
     t.push(0); // NUL terminator -> 20 bytes, keeping the next offset even
 
-    // OffsetTimeOriginal pins the naive stamp above to UTC. Without it,
-    // `nom-exif` resolves the timestamp against the *machine's* local
-    // timezone, so the same fixture would organise into a different
-    // directory on a developer's laptop than in CI. See the module note.
-    let offset_off = u32::try_from(t.len()).unwrap();
-    patch_u32(&mut t, offset_ptr_at, offset_off);
-    t.extend_from_slice(b"+00:00\0");
-    t.push(0); // pad to 8 bytes so the following offsets stay even
+    // OffsetTimeOriginal, when the caller asked for one, pins the naive stamp
+    // above to a zone. The default fixture writes `+00:00`, without which
+    // `nom-exif` resolves the timestamp against the *machine's* local timezone
+    // and the same fixture organises into a different directory on a
+    // developer's laptop than in CI. A fixture that deliberately omits it is
+    // testing that resolution order — see [`MediaTree::jpeg_with_offset`].
+    if let Some(offset_ptr_at) = offset_ptr_at {
+        let text = offset.unwrap_or_default();
+        let offset_off = u32::try_from(t.len()).unwrap();
+        patch_u32(&mut t, offset_ptr_at, offset_off);
+        t.extend_from_slice(text.as_bytes());
+        t.push(0); // NUL terminator, counted by the entry above
+        if !t.len().is_multiple_of(2) {
+            t.push(0); // pad, so the offsets that follow stay even
+        }
+    }
 
     if let Some((lat_ptr_at, lon_ptr_at, lat, lon)) = gps_value_ptrs {
         let lat_off = u32::try_from(t.len()).unwrap();

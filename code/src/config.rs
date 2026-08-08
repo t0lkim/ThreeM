@@ -523,7 +523,15 @@ pub struct Config {
     /// is filed under exactly the digits the camera wrote, whatever the zone. It
     /// decides the instant the run records, and it does move filesystem-dated
     /// and UTC-stamped video files.
-    #[arg(long, value_name = "TZ")]
+    ///
+    /// `allow_hyphen_values` because half the world's offsets start with one.
+    /// Without it `--timezone -05:30` is refused as an unknown flag `-0`, and
+    /// the only spelling that works is `--timezone=-05:30` — a trap laid for
+    /// exactly the users the flag exists to serve. The cost is that
+    /// `--timezone --commit` takes `--commit` as the value, which then fails as
+    /// "`--commit` is not a timezone" rather than as a missing value; a wrong
+    /// value named in the error is a better failure than a correct one refused.
+    #[arg(long, value_name = "TZ", allow_hyphen_values = true)]
     pub timezone: Option<String>,
 
     /// UNSAFE: do not journal this run — it cannot be undone
