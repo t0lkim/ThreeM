@@ -25,6 +25,73 @@ const PARTIAL_HASH_BYTES: u64 = 64 * 1024; // 64KB
 const STREAM_BUFFER_BYTES: usize = 128 * 1024;
 
 // =====================================================================
+// How much of a file the partial hash actually reads
+// =====================================================================
+
+/// Which bytes of a file of a given length [`partial_hash`] reads.
+///
+/// The rule was two inline comparisons and a comment; it is a named function
+/// because the middle case is a genuine surprise and the promotion in
+/// [`find_duplicates`] now turns on getting it right.
+///
+/// | size            | hashed                     | why                                                        |
+/// |-----------------|----------------------------|------------------------------------------------------------|
+/// | `0 ..= 64 KB`   | the whole file             | the head read reaches the end, so the digest *is* the full hash |
+/// | `64 KB+1 ..= 128 KB` | the first 64 KB only  | a tail read here would overlap the head — see below         |
+/// | `128 KB+1 ..`   | the first and last 64 KB   | two disjoint windows                                        |
+///
+/// **The middle band is the surprising one.** A 100 KB file is fingerprinted on
+/// its first 64 KB and nothing else, so two files of exactly that length that
+/// differ only past that point both reach phase 3 and are separated
+/// there. That is the cascade working — a partial hash is a filter, and a filter
+/// is allowed false positives — but it is the sort of fact that gets discovered
+/// by someone reading a profile rather than the source, so it is written down
+/// and pinned by `test_the_partial_hash_reads_what_the_coverage_rule_says`
+/// rather than left implicit in a `>`.
+///
+/// The band exists because below 128 KB the last 64 KB and the first 64 KB
+/// overlap: the tail read would re-read bytes already hashed and, for a 65 KB
+/// file, would be almost entirely the head again. Hashing the head twice is
+/// harmless but the *read* is not free, and this is the phase whose job is to
+/// avoid reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialCoverage {
+    /// Every byte — so the partial digest is also the full-content digest.
+    WholeFile,
+    /// The first [`PARTIAL_HASH_BYTES`] and no more.
+    HeadOnly,
+    /// The first and last [`PARTIAL_HASH_BYTES`], which do not overlap.
+    HeadAndTail,
+}
+
+/// The coverage rule, applied to one length. See [`PartialCoverage`].
+const fn partial_coverage(size: u64) -> PartialCoverage {
+    if size <= PARTIAL_HASH_BYTES {
+        PartialCoverage::WholeFile
+    } else if size <= PARTIAL_HASH_BYTES * 2 {
+        PartialCoverage::HeadOnly
+    } else {
+        PartialCoverage::HeadAndTail
+    }
+}
+
+/// What [`partial_hash`] returns: the digest, and whether it happens to be the
+/// whole file's digest as well.
+///
+/// The flag is the whole point of the type. Without it phase 3 re-reads every
+/// small file to compute a digest phase 2 already holds — for a library of
+/// thumbnails, sidecars and screenshots that is the entire second read of the
+/// cascade, spent confirming what was already known.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PartialHash {
+    digest: String,
+    /// `true` only for [`PartialCoverage::WholeFile`] — see [`partial_hash`],
+    /// which refuses to return at all if the bytes it read do not account for
+    /// the length it was promised.
+    covers_whole_file: bool,
+}
+
+// =====================================================================
 // What the bar says it is doing
 // =====================================================================
 
@@ -137,9 +204,14 @@ impl HashPool {
 /// The hash is carried rather than recomputed because it is *free*: a file that
 /// reached phase 3 was fully hashed to decide whether it was a duplicate, and
 /// throwing that digest away only to have the journal want it later would mean
-/// reading every such file twice. A file eliminated in phase 1 or 2 has no
-/// digest and gets `None` — establishing one would mean a full read of every
-/// file in the library, which is the cost the cascade exists to avoid.
+/// reading every such file twice. A file small enough that its partial hash
+/// read the whole file — see [`PartialCoverage::WholeFile`] — is free in the
+/// same way and carries its digest too.
+///
+/// `None` is what is left: a file eliminated in phase 1, and one eliminated in
+/// phase 2 whose partial hash was only a head or a head and a tail. Filling
+/// those in would mean a full read of every file in the library, which is the
+/// cost the cascade exists to avoid.
 #[derive(Debug, Clone)]
 pub struct UniqueFile {
     pub file: ScannedFile,
@@ -214,6 +286,16 @@ fn by_depth_then_path(a: &Path, b: &Path) -> Ordering {
 /// 2. Partial BLAKE3 hash (first 64KB + last 64KB), hashed in parallel
 /// 3. Full BLAKE3 hash (only for partial-hash matches), hashed in parallel
 ///
+/// **Phase 3 does not re-read what phase 2 already read end to end.** A file of
+/// 64 KB or less is covered entirely by its partial hash — the head read
+/// reaches the end of the file — so that digest is its full digest, and a group
+/// of such files is a confirmed duplicate group the moment phase 2 buckets it.
+/// Sending it to phase 3 would read every one of those files a second time to
+/// recompute a number already in hand. On a library of screenshots, thumbnails
+/// and sidecars that second read is most of the cascade's IO. See
+/// [`PartialCoverage`] for where the boundary is and why the 64 KB–128 KB band
+/// above it is *not* covered.
+///
 /// Infallible by construction. A file that cannot be read is dropped from the
 /// analysis with a warning and counted in [`DedupResult::skipped`]; it never
 /// takes the rest of the run down with it.
@@ -261,7 +343,8 @@ fn by_depth_then_path(a: &Path, b: &Path) -> Ordering {
 /// **The length is charged pessimistically and refunded, so it only ever
 /// shrinks.** At the start of phase 2 the cascade knows it must partial-hash
 /// `C₂` candidates and that *up to* `C₂` of them will go on to a full read, so
-/// the length is `2 × C₂`. Phase 2 then rules most of them out, and the length
+/// the length is `2 × C₂`. Phase 2 then rules most of them out — and settles
+/// the small ones outright, which refunds their full read too — and the length
 /// drops to `C₂ + C₃` for the phase-3 set it actually produced. Charging the
 /// second read only when it was confirmed would be the same arithmetic run the
 /// other way — the bar would reach 100% at the end of phase 2 and then fall
@@ -322,29 +405,43 @@ pub fn find_duplicates(
     // back together, or every such pair buys a full read it does not need.
     let (partial_groups, mut skipped) = group_by_key(
         &phase2_candidates,
-        |file| partial_hash(&file.path),
-        |file, digest| (file.size, digest),
+        |file| partial_hash(&file.path, file.size),
+        |file, partial| (file.size, partial),
         progress,
         pool,
     );
 
     let mut phase3_candidates: Vec<&ScannedFile> = Vec::new();
-    for pgroup in partial_groups.into_values() {
+    // Groups the partial hash already settled: every member was small enough
+    // that phase 2 read all of it, so the digest bucketing them *is* their full
+    // hash and phase 3 would only read them again to be told so. Whole groups
+    // rather than individual files, because the bucket key includes the size —
+    // every member of a bucket has the same length, so coverage is uniform
+    // across it by construction.
+    let mut settled_by_phase_2: Vec<(String, Vec<&ScannedFile>)> = Vec::new();
+
+    for ((_size, partial), pgroup) in partial_groups {
         if pgroup.len() == 1 {
-            // A *partial* hash is head-plus-tail, not the whole file — it
-            // is not the digest the journal would need, so this one stays
-            // unhashed rather than recording something that only looks like
-            // a full digest.
+            // Nothing else shares this fingerprint, so the file is unique. It
+            // carries a digest only if the partial hash happened to read the
+            // whole file — a head, or a head and a tail, is not the digest the
+            // journal needs and must not be recorded as though it were.
             unique.push(UniqueFile {
                 file: pgroup[0].clone(),
-                known_hash: None,
+                known_hash: partial.covers_whole_file.then_some(partial.digest),
             });
+        } else if partial.covers_whole_file {
+            settled_by_phase_2.push((partial.digest, pgroup));
         } else {
             phase3_candidates.extend(pgroup);
         }
     }
 
-    debug!(phase3_files = phase3_candidates.len(), "phase 2 complete");
+    debug!(
+        phase3_files = phase3_candidates.len(),
+        settled_groups = settled_by_phase_2.len(),
+        "phase 2 complete"
+    );
 
     // Phase 3: Full hash
     //
@@ -365,7 +462,19 @@ pub fn find_duplicates(
     let full = group_by_full_hash(&phase3_candidates, progress, pool);
     skipped += full.skipped;
 
-    for (hash, mut fgroup) in full.groups {
+    // The groups phase 2 settled join the ones phase 3 confirmed, on equal
+    // terms: both are keyed by a full-content digest, so from here down there is
+    // no such thing as a promoted group. Merged through `entry` rather than
+    // inserted, so that two groups arriving with one digest would be one group
+    // and not a lost one — it cannot happen (equal content means equal size, and
+    // a file over 64 KB is never settled by phase 2) but a silent overwrite is
+    // not the way to record that.
+    let mut full_groups = full.groups;
+    for (digest, members) in settled_by_phase_2 {
+        full_groups.entry(digest).or_default().extend(members);
+    }
+
+    for (hash, mut fgroup) in full_groups {
         // Before anything reads `fgroup[0]`, and before the group is
         // emitted: the members arrive here in whatever order phase 3
         // bucketed them, and index 0 is the file that will be left alone.
@@ -431,10 +540,16 @@ pub fn group_by_size(files: &[ScannedFile]) -> HashMap<u64, Vec<ScannedFile>> {
     groups
 }
 
-/// Group files by a partial (head + tail) BLAKE3 hash.
+/// Group files by a partial BLAKE3 hash — see [`PartialCoverage`] for which
+/// bytes that covers at which length.
 ///
 /// A file that cannot be opened, seeked or read is left out of the returned
-/// groups and counted in [`HashGroups::skipped`], with a warning naming it.
+/// groups and counted in [`HashGroups::skipped`], with a warning naming it. So
+/// is one that is no longer the length the scan recorded.
+///
+/// Buckets by digest alone, which is the right key for a caller holding one
+/// size group. [`find_duplicates`] flattens every size group into one call and
+/// so keys by `(size, digest)` instead — it does not go through here.
 ///
 /// `progress` is ticked once per file as its read completes; pass
 /// [`ProgressBar::hidden`] if there is nobody watching.
@@ -446,8 +561,8 @@ pub fn group_by_partial_hash<'a>(
 ) -> HashGroups<'a> {
     let (groups, skipped) = group_by_key(
         files,
-        |file| partial_hash(&file.path),
-        |_, digest| digest,
+        |file| partial_hash(&file.path, file.size),
+        |_, partial: PartialHash| partial.digest,
         progress,
         pool,
     );
@@ -484,7 +599,9 @@ pub fn group_by_full_hash<'a>(
 /// One implementation rather than two, because the interesting behaviour here
 /// is the skip, and two copies of it are two chances for one of them to go
 /// back to `?` unnoticed. `key` exists only so phase 2 can bucket by size *and*
-/// digest while phase 3 buckets by digest alone.
+/// digest while phase 3 buckets by digest alone; `V` is generic for the same
+/// reason, so that phase 2 can carry a [`PartialHash`] — digest plus whether it
+/// covered the whole file — where phase 3 needs no more than the digest.
 ///
 /// # Two halves, and why the split is where it is
 ///
@@ -523,7 +640,7 @@ pub fn group_by_full_hash<'a>(
 ///
 /// [`ProgressBar`] is `Send + Sync` and its position is an atomic, so this needs
 /// no synchronisation of its own; the caller owns the length and the message.
-fn group_by_key<'a, K, H, F>(
+fn group_by_key<'a, K, V, H, F>(
     files: &[&'a ScannedFile],
     hash: H,
     key: F,
@@ -532,10 +649,11 @@ fn group_by_key<'a, K, H, F>(
 ) -> (HashMap<K, Vec<&'a ScannedFile>>, usize)
 where
     K: Eq + Hash,
-    H: Fn(&ScannedFile) -> Result<String> + Sync,
-    F: Fn(&ScannedFile, String) -> K,
+    V: Send,
+    H: Fn(&ScannedFile) -> Result<V> + Sync,
+    F: Fn(&ScannedFile, V) -> K,
 {
-    let digests: Vec<Result<String>> = pool.pool.install(|| {
+    let digests: Vec<Result<V>> = pool.pool.install(|| {
         files
             .par_iter()
             .map(|file| {
@@ -566,15 +684,36 @@ where
     (groups, skipped)
 }
 
-/// Hash first 64KB + last 64KB of a file using BLAKE3.
+/// Fingerprint a file from its first 64 KB and, past 128 KB, its last 64 KB —
+/// see [`PartialCoverage`] for exactly which bytes, at which length.
 ///
-/// The length is taken from the open handle, not from the scan. The old code
-/// sized a `read_exact` from the scan-time figure, so a file that shrank in
-/// between — a camera import still writing, a sync client rewriting a photo —
-/// failed with "failed to fill whole buffer" and took the whole run with it.
-/// Every read here tolerates a short answer, and hashes what was actually
-/// there.
-fn partial_hash(path: &Path) -> Result<String> {
+/// # The file must still be the size the scan recorded
+///
+/// `scanned_size` is what [`crate::scanner`] saw, and a file that no longer
+/// matches it is **skipped**, not hashed. That is a deliberate change of
+/// answer, and the reason is that the scan-time size is not merely a hint here:
+/// phase 1 partitioned by it, phase 2 buckets by it, [`DuplicateGroup::size`]
+/// reports it and the journal records it as the evidence undo checks. Hashing
+/// the new bytes and filing them under the old length would put a file into the
+/// plan under facts that are no longer true — and a file whose length is moving
+/// is usually one that is still being written, which is not a file to be
+/// organising at all. Skipping it costs the operator one line in the summary;
+/// the alternative costs them a plan they cannot trust.
+///
+/// The length is read from the open handle rather than re-`stat`ing the path,
+/// so the check is against the file this function actually read. The two
+/// short-read checks below close the rest of the window: between the `metadata`
+/// call and the reads the file could still change, and a read that does not
+/// return the bytes the length promised is how that shows up. What cannot be
+/// closed is a change *after* the last read returns — no read of a live
+/// filesystem can promise more than "this is what was there".
+///
+/// # Errors
+///
+/// If the file cannot be opened, `stat`ed, seeked or read — and if it is not
+/// the length `scanned_size` says. Every one of those is a per-file skip in
+/// [`group_by_key`], never a failed run.
+fn partial_hash(path: &Path, scanned_size: u64) -> Result<PartialHash> {
     let mut file =
         File::open(path).with_context(|| format!("opening {} for partial hash", path.display()))?;
     let size = file
@@ -582,26 +721,53 @@ fn partial_hash(path: &Path) -> Result<String> {
         .with_context(|| format!("reading the length of {}", path.display()))?
         .len();
 
+    if size != scanned_size {
+        anyhow::bail!(
+            "{} changed size since it was scanned — {scanned_size} bytes then, {size} now",
+            path.display()
+        );
+    }
+
+    let coverage = partial_coverage(size);
     let mut hasher = blake3::Hasher::new();
     let mut buf = Vec::new();
 
-    // Read first chunk
+    // The head: the whole file, or the first 64 KB of it.
     read_up_to(&mut file, PARTIAL_HASH_BYTES, &mut buf)
         .with_context(|| format!("reading first bytes of {}", path.display()))?;
+    let expected_head = size.min(PARTIAL_HASH_BYTES);
+    if buf.len() as u64 != expected_head {
+        anyhow::bail!(
+            "{} changed while it was being read — {expected_head} bytes expected, {} read",
+            path.display(),
+            buf.len()
+        );
+    }
     hasher.update(&buf);
 
-    // Read last chunk (if file is large enough for it to differ from the first)
-    if size > PARTIAL_HASH_BYTES * 2 {
+    // The tail, only where it does not overlap the head.
+    if coverage == PartialCoverage::HeadAndTail {
         let tail_offset = i64::try_from(PARTIAL_HASH_BYTES)
             .context("partial-hash chunk size does not fit in i64")?;
         file.seek(SeekFrom::End(-tail_offset))
             .with_context(|| format!("seeking in {}", path.display()))?;
         read_up_to(&mut file, PARTIAL_HASH_BYTES, &mut buf)
             .with_context(|| format!("reading last bytes of {}", path.display()))?;
+        if buf.len() as u64 != PARTIAL_HASH_BYTES {
+            anyhow::bail!(
+                "{} changed while it was being read — {PARTIAL_HASH_BYTES} trailing bytes \
+                 expected, {} read",
+                path.display(),
+                buf.len()
+            );
+        }
         hasher.update(&buf);
     }
 
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(PartialHash {
+        digest: hasher.finalize().to_hex().to_string(),
+        covers_whole_file: coverage == PartialCoverage::WholeFile,
+    })
 }
 
 /// Read at most `limit` bytes into `buf`, replacing whatever it held.
@@ -863,14 +1029,18 @@ mod tests {
         assert_eq!(fs::read(&dst).unwrap(), b"PRE-EXISTING");
     }
 
-    /// A file that shrank after the scan recorded its size must still hash.
+    /// A file that no longer has the length the scan recorded is refused, and
+    /// the message says both lengths.
     ///
-    /// The old `partial_hash` sized a `read_exact` from the scan-time figure
-    /// and failed with "failed to fill whole buffer", taking the whole dedup
-    /// pass down with it. A photo library being written to during a long run
-    /// is ordinary — a camera import, a sync client, the user themselves.
+    /// It used to be hashed: the digest described the new bytes and the file
+    /// went into the plan under its old size. That is worse than a skip, and
+    /// quietly so — phase 1 partitioned by the old size, the group reports it
+    /// and the journal records it as the evidence undo checks, so every one of
+    /// those is now a fact about a file that does not exist. A file whose
+    /// length is moving is usually one still being written; the run says so and
+    /// leaves it alone.
     #[test]
-    fn test_partial_hash_survives_a_file_that_shrank_since_the_scan() {
+    fn test_partial_hash_refuses_a_file_that_changed_size_since_the_scan() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("shrinking.jpg");
         fs::write(&path, multi_buffer_body()).unwrap();
@@ -878,22 +1048,26 @@ mod tests {
         // The scan saw 300 000 bytes; by the time we read it there are 4.
         fs::write(&path, b"tiny").unwrap();
 
-        assert_eq!(
-            partial_hash(&path).unwrap(),
-            blake3::hash(b"tiny").to_hex().to_string(),
-            "the digest must describe the bytes that were actually there"
+        let error = format!("{:#}", partial_hash(&path, 300_000).unwrap_err());
+        assert!(
+            error.contains("300000") && error.contains('4'),
+            "the operator needs both lengths to know what happened, got {error:?}"
+        );
+
+        assert!(
+            partial_hash(&path, 4).is_ok(),
+            "the same file at the length it is really is must hash normally"
         );
     }
 
     /// For a file large enough to have a distinct tail, the partial hash is
-    /// head-then-tail over the file's *current* length.
+    /// head-then-tail.
     ///
-    /// Pins the digest against an independent one-shot computation so the
-    /// rewrite from `read_exact` to a tolerant read cannot have quietly
-    /// changed which bytes are hashed — that would repartition every existing
+    /// Pins the digest against an independent one-shot computation, because
+    /// changing *which* bytes are hashed would repartition every existing
     /// user's library on upgrade.
     #[test]
-    fn test_partial_hash_is_head_then_tail_of_the_current_file() {
+    fn test_partial_hash_is_head_then_tail() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("big.jpg");
         let size = u32::try_from(PARTIAL_HASH_BYTES).unwrap() * 3;
@@ -906,10 +1080,114 @@ mod tests {
         expected.update(&body[..head]);
         expected.update(&body[size - head..]);
 
-        assert_eq!(
-            partial_hash(&path).unwrap(),
-            expected.finalize().to_hex().to_string()
+        let partial = partial_hash(&path, size as u64).unwrap();
+        assert_eq!(partial.digest, expected.finalize().to_hex().to_string());
+        assert!(
+            !partial.covers_whole_file,
+            "192 KB is not covered by two 64 KB windows"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // How much of a file the partial hash reads, at every boundary
+    // -----------------------------------------------------------------
+
+    /// The coverage rule at the exact sizes where it changes.
+    ///
+    /// Boundaries are where an off-by-one lives, and this one is load-bearing
+    /// twice over: one side of it decides whether a file is read again in phase
+    /// 3, and the other decides whether its partial digest may be recorded as
+    /// its content hash. `<=` slipping to `<` at 64 KB would publish a
+    /// head-only digest as a full one.
+    #[test]
+    fn test_the_coverage_rule_at_every_boundary() {
+        let k64 = PARTIAL_HASH_BYTES;
+        let cases = [
+            (0, PartialCoverage::WholeFile),
+            (1, PartialCoverage::WholeFile),
+            (k64 - 1, PartialCoverage::WholeFile),
+            (k64, PartialCoverage::WholeFile),
+            (k64 + 1, PartialCoverage::HeadOnly),
+            (k64 * 2 - 1, PartialCoverage::HeadOnly),
+            (k64 * 2, PartialCoverage::HeadOnly),
+            (k64 * 2 + 1, PartialCoverage::HeadAndTail),
+        ];
+
+        for (size, expected) in cases {
+            assert_eq!(
+                partial_coverage(size),
+                expected,
+                "a {size}-byte file must be {expected:?}"
+            );
+        }
+    }
+
+    /// And the same boundaries end to end: the digest a file of each length
+    /// actually gets, computed independently from the bytes the rule says are
+    /// read.
+    ///
+    /// The 128 KB case is the one worth staring at. A file of exactly 131 072
+    /// bytes is fingerprinted on its first half and nothing else — two such
+    /// files differing only in their second half both survive phase 2. That is
+    /// the filter working as designed, and it is asserted here so that it is a
+    /// decision rather than a thing somebody discovers.
+    #[test]
+    fn test_the_partial_hash_reads_what_the_coverage_rule_says() {
+        let tmp = TempDir::new().unwrap();
+        let k64 = usize::try_from(PARTIAL_HASH_BYTES).unwrap();
+
+        for size in [0, 1, k64 - 1, k64, k64 + 1, k64 * 2, k64 * 2 + 1] {
+            let body: Vec<u8> = (0..u32::try_from(size).unwrap())
+                .map(|i| (i % 251) as u8)
+                .collect();
+            let path = tmp.path().join(format!("{size}.jpg"));
+            fs::write(&path, &body).unwrap();
+
+            let mut expected = blake3::Hasher::new();
+            let coverage = partial_coverage(size as u64);
+            match coverage {
+                PartialCoverage::WholeFile => {
+                    expected.update(&body);
+                }
+                PartialCoverage::HeadOnly => {
+                    expected.update(&body[..k64]);
+                }
+                PartialCoverage::HeadAndTail => {
+                    expected.update(&body[..k64]);
+                    expected.update(&body[size - k64..]);
+                }
+            }
+
+            let partial = partial_hash(&path, size as u64).unwrap();
+            assert_eq!(
+                partial.digest,
+                expected.finalize().to_hex().to_string(),
+                "wrong bytes hashed for a {size}-byte file ({coverage:?})"
+            );
+            assert_eq!(
+                partial.covers_whole_file,
+                coverage == PartialCoverage::WholeFile,
+                "wrong coverage claim for a {size}-byte file"
+            );
+
+            // The claim that matters: where the flag is set, the digest really
+            // is what a full read would have produced.
+            if partial.covers_whole_file {
+                assert_eq!(
+                    partial.digest,
+                    full_hash(&path).unwrap(),
+                    "a {size}-byte file claimed whole-file coverage, so its partial digest \
+                     must equal its full hash"
+                );
+            } else {
+                assert_ne!(
+                    partial.digest,
+                    full_hash(&path).unwrap(),
+                    "a {size}-byte file's partial digest must not coincide with its full \
+                     hash, or this test proves nothing about the flag"
+                );
+            }
+        }
     }
 
     /// A file the dedup pass cannot read is dropped from the analysis and
@@ -1047,6 +1325,16 @@ mod tests {
         make_scanned(path, body.len() as u64)
     }
 
+    /// A file length that reaches every phase of the cascade.
+    ///
+    /// It has to be over `PARTIAL_HASH_BYTES * 2`, and that is not a detail. A
+    /// file of 64 KB or less is settled by phase 2 — its partial hash covered
+    /// the whole file, so phase 3 never sees it — and a fixture built at 40 KB
+    /// would leave every test below quietly asserting the sort rules of a phase
+    /// that no longer ran. Above 128 KB the partial hash is a head and a tail,
+    /// the middle is unread, and phase 3 does the confirming.
+    const CASCADING_FILE_BYTES: usize = 150_000;
+
     /// A tree with two duplicate groups, a size-collision pair that is not
     /// duplicated, and a file unique by size — laid out so that the correct
     /// answers are *not* the ones any accidental ordering would give.
@@ -1056,10 +1344,10 @@ mod tests {
     /// original and a `HashMap` would pick whichever it felt like. The depth
     /// rule picks `zzz.jpg`, and only the depth rule does.
     fn deterministic_fixture(tmp: &TempDir) -> Vec<ScannedFile> {
-        // 40 KB apiece: over one buffer, under the 64 KB partial-hash window,
-        // so both hashing phases actually run.
-        let a: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
-        let b: Vec<u8> = (0..40_000u32).map(|i| (i % 241) as u8).collect();
+        let n = CASCADING_FILE_BYTES;
+        let span = u32::try_from(n).unwrap();
+        let a: Vec<u8> = (0..span).map(|i| (i % 251) as u8).collect();
+        let b: Vec<u8> = (0..span).map(|i| (i % 241) as u8).collect();
 
         vec![
             // Group A — three copies at three depths.
@@ -1069,11 +1357,13 @@ mod tests {
             // Group B — two copies at the same depth, so the tie-break decides.
             plant(tmp, "ccc/bravo.jpg", &b),
             plant(tmp, "ccc/alpha.jpg", &b),
-            // Same length as group A, different bytes: reaches phase 3 and is
-            // separated there.
+            // Same length as group A and the same head and tail, differing only
+            // in the middle — which the partial hash does not read. It therefore
+            // survives phase 2 and is separated in phase 3, which is the one
+            // job phase 3 has.
             plant(tmp, "ddd/impostor.jpg", &{
                 let mut v = a.clone();
-                v[39_999] ^= 0xFF;
+                v[n / 2] ^= 0xFF;
                 v
             }),
             // Unique by size — eliminated in phase 1.
@@ -1232,18 +1522,29 @@ mod tests {
 
     /// A tree wide enough that the hashing phases really do span threads:
     /// `groups` duplicate groups of three copies each, every file the same
-    /// 40 KB length so all of them survive phase 1 into one enormous phase-2
-    /// candidate set.
+    /// [`CASCADING_FILE_BYTES`] length so all of them survive phase 1 into one
+    /// enormous phase-2 candidate set, and all of them go on to phase 3.
     ///
     /// The narrow fixtures above have four or five files in them, which a
     /// work-stealing pool may well run on one thread — they prove the sort
     /// rules, not the concurrency. This one is here so that "the same tree
     /// gives the same answer" is a claim about parallel execution.
     fn wide_fixture(tmp: &TempDir, groups: u32) -> Vec<ScannedFile> {
+        triplicate_fixture(tmp, groups, CASCADING_FILE_BYTES)
+    }
+
+    /// `groups` duplicate groups of three copies each, every file `size` bytes
+    /// of content distinct to its group.
+    ///
+    /// `size` is a parameter because it is the one thing the cascade's shape
+    /// turns on: at or below 64 KB phase 2 settles the groups on its own, above
+    /// it phase 3 confirms them. The same tree at two lengths is how the tests
+    /// below tell those two paths apart.
+    fn triplicate_fixture(tmp: &TempDir, groups: u32, size: usize) -> Vec<ScannedFile> {
         let mut files = Vec::with_capacity(groups as usize * 3);
         for g in 0..groups {
             // Distinct content per group, identical length across all groups.
-            let body: Vec<u8> = (0..40_000u32)
+            let body: Vec<u8> = (0..u32::try_from(size).unwrap())
                 .map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(g) % 251) as u8)
                 .collect();
             for copy in 0..3 {
@@ -1399,8 +1700,8 @@ mod tests {
         let files = partial_hash_retires_everything_fixture(&tmp);
 
         assert_eq!(
-            partial_hash(&files[0].path).unwrap(),
-            partial_hash(&files[2].path).unwrap(),
+            partial_hash(&files[0].path, files[0].size).unwrap().digest,
+            partial_hash(&files[2].path, files[2].size).unwrap().digest,
             "the fixture is pointless unless the two sizes really do share a partial digest"
         );
 
@@ -1413,6 +1714,169 @@ mod tests {
             "every file was retired by the partial hash, so none of them should have been \
              read end to end"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Files phase 2 read end to end are not read again
+    // -----------------------------------------------------------------
+
+    /// A file small enough to be covered by its partial hash is never opened a
+    /// second time — and the group is still detected.
+    ///
+    /// The evidence is the bar, which counts reads: 24 candidates and a final
+    /// length of 24 means every one of the 24 full reads charged at the start
+    /// of phase 2 was given back, which is only true if phase 3 was handed
+    /// nothing. Asserting the groups alone would not show it — the old code
+    /// found the same groups, it just read the library twice to do it.
+    #[test]
+    fn test_a_small_duplicate_group_is_settled_without_a_second_read() {
+        const SIZE: usize = 40_000;
+        let tmp = TempDir::new().unwrap();
+        let files = triplicate_fixture(&tmp, 8, SIZE);
+        assert_eq!(
+            partial_coverage(SIZE as u64),
+            PartialCoverage::WholeFile,
+            "the fixture only tests anything if its files are covered by the partial hash"
+        );
+
+        let (position, length, _) = bar_after(&files);
+        assert_eq!(
+            length, 24,
+            "24 partial hashes and no full ones — the 24 full reads charged up front must \
+             have been refunded, which they are only if phase 3 got an empty candidate set"
+        );
+        assert_eq!(position, length);
+
+        let result = dedup(&files);
+        assert_eq!(result.duplicate_groups.len(), 8);
+        assert!(result.duplicate_groups.iter().all(|g| g.files.len() == 3));
+        assert_eq!(result.skipped, 0);
+        assert!(result.unique.iter().all(|u| u.known_hash.is_some()));
+    }
+
+    /// The digest a settled group is filed under is the one a full read would
+    /// have produced.
+    ///
+    /// This is the correctness half, and it is the half a shortcut gets wrong:
+    /// a promotion that published a head-and-tail digest as a content hash
+    /// would put a *wrong* number in the journal, where undo later compares
+    /// against it before deleting somebody's file.
+    #[test]
+    fn test_a_settled_groups_digest_is_the_files_full_hash() {
+        let tmp = TempDir::new().unwrap();
+        let files = triplicate_fixture(&tmp, 4, 40_000);
+        let result = dedup(&files);
+
+        assert_eq!(result.duplicate_groups.len(), 4);
+        for group in &result.duplicate_groups {
+            for path in &group.files {
+                assert_eq!(
+                    group.hash,
+                    full_hash(path).unwrap(),
+                    "{} is filed under a digest that is not its content hash",
+                    path.display()
+                );
+            }
+        }
+        for unique in &result.unique {
+            assert_eq!(
+                unique.known_hash.as_deref(),
+                Some(full_hash(&unique.file.path).unwrap().as_str()),
+                "{} was handed on with a digest that is not its content hash",
+                unique.file.path.display()
+            );
+        }
+    }
+
+    /// One byte over the boundary and phase 3 runs again.
+    ///
+    /// The end-to-end control for the promotion: the same tree, the same shape,
+    /// 65 537 bytes instead of 40 000. Its partial hash is a head only, so
+    /// nothing may be settled and every file must be read a second time —
+    /// length `2 × candidates` rather than `candidates`. Without this, a
+    /// promotion that fired on every file regardless of coverage would pass
+    /// every other test in this section.
+    #[test]
+    fn test_a_file_past_the_boundary_is_still_confirmed_by_phase_3() {
+        const SIZE: usize = 64 * 1024 + 1;
+        let tmp = TempDir::new().unwrap();
+        let files = triplicate_fixture(&tmp, 4, SIZE);
+        assert_eq!(partial_coverage(SIZE as u64), PartialCoverage::HeadOnly);
+
+        let (position, length, _) = bar_after(&files);
+        assert_eq!(
+            length,
+            12 + 12,
+            "nothing here is covered by its partial hash, so all twelve files must be read \
+             again in phase 3"
+        );
+        assert_eq!(position, length);
+
+        let result = dedup(&files);
+        assert_eq!(result.duplicate_groups.len(), 4);
+        assert!(result.duplicate_groups.iter().all(|g| g.files.len() == 3));
+    }
+
+    /// A file retired by phase 2 on its own carries a digest exactly when phase
+    /// 2 read all of it.
+    ///
+    /// Two files of one size, differing content, both covered: each is a bucket
+    /// of one, and each is handed to the organiser with a real content hash
+    /// that cost nothing. The journal takes that as the evidence undo checks, so
+    /// it is worth having. The other side of the rule — the same shape above the
+    /// boundary yielding `None` — is
+    /// `test_phase_2_does_not_regroup_files_phase_1_separated_by_size`.
+    #[test]
+    fn test_a_small_unique_file_carries_the_hash_phase_2_already_computed() {
+        let tmp = TempDir::new().unwrap();
+        let files = vec![
+            plant(&tmp, "one.jpg", &vec![0x11u8; 40_000]),
+            plant(&tmp, "two.jpg", &vec![0x22u8; 40_000]),
+        ];
+
+        let result = dedup(&files);
+
+        assert!(result.duplicate_groups.is_empty());
+        assert_eq!(result.unique.len(), 2);
+        for unique in &result.unique {
+            assert_eq!(
+                unique.known_hash.as_deref(),
+                Some(full_hash(&unique.file.path).unwrap().as_str()),
+                "{} was read end to end by phase 2, so its digest is already paid for",
+                unique.file.path.display()
+            );
+        }
+    }
+
+    /// A file that changed length between the scan and the hash is dropped from
+    /// the analysis and counted, exactly as an unreadable one is.
+    ///
+    /// It is not offered to the organiser under either length: not the stale one
+    /// the plan was built from, and not the new one, which nothing else in this
+    /// run has seen.
+    #[test]
+    fn test_a_file_that_changed_size_since_the_scan_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let steady = plant(&tmp, "steady.jpg", &vec![0x33u8; 40_000]);
+        let moving = plant(&tmp, "moving.jpg", &vec![0x44u8; 40_000]);
+
+        // Still being written: the scan saw 40 000 bytes, the hash finds more.
+        fs::write(&moving.path, vec![0x44u8; 41_000]).unwrap();
+
+        let files = vec![steady.clone(), moving.clone()];
+        let result = dedup(&files);
+
+        assert_eq!(result.skipped, 1);
+        assert_eq!(
+            result
+                .unique
+                .iter()
+                .map(|u| &u.file.path)
+                .collect::<Vec<_>>(),
+            vec![&steady.path],
+            "the file that moved under the run must not reach the plan"
+        );
+        assert!(result.duplicate_groups.is_empty());
     }
 
     // -----------------------------------------------------------------
