@@ -51,7 +51,9 @@ use mmm::naming::{
     sanitise_for_filename, year_is_representable, DateDirectoryFormat, FilenameFormat, Layout,
     OutputSubdir, Scheme,
 };
-use mmm::organiser::{build_target_path, collision_candidate, execute_move, PlannedMove};
+use mmm::organiser::{
+    build_target_path, collision_candidate, execute_move, DatePolicy, PlannedMove,
+};
 use mmm::scanner::ScanFilter;
 use mmm::settings::Settings;
 use mmm::timezone::{TimezonePolicy, TimezoneSource};
@@ -85,6 +87,19 @@ fn scheme() -> &'static Layout {
 const STEM: &str = "IMG_0001";
 
 fn dated(date: Option<DateTime<Utc>>, gps: Option<(f64, f64)>) -> FileMetadata {
+    dated_from(date, gps, DateSource::Exif)
+}
+
+/// The same, with the provenance of the date under the caller's control.
+///
+/// Only [`DatePolicy::EmbeddedOnly`] reads it, and it reads it to decide whether
+/// the file is filed at all — so a property about that policy is a property
+/// about this argument, and every other property is entitled to ignore it.
+fn dated_from(
+    date: Option<DateTime<Utc>>,
+    gps: Option<(f64, f64)>,
+    date_source: DateSource,
+) -> FileMetadata {
     FileMetadata {
         // Generated as UTC and read as a local wall clock, which for these
         // properties is the same digits either way: every claim below is about
@@ -94,8 +109,26 @@ fn dated(date: Option<DateTime<Utc>>, gps: Option<(f64, f64)>) -> FileMetadata {
         timezone_source: date.map(|_| TimezoneSource::ExifOffsetTag),
         latitude: gps.map(|(lat, _)| lat),
         longitude: gps.map(|(_, lon)| lon),
-        date_source: DateSource::Exif,
+        date_source,
     }
+}
+
+/// Every way a date can have been established.
+fn date_source() -> impl Strategy<Value = DateSource> {
+    prop::sample::select(
+        &[
+            DateSource::Exif,
+            DateSource::Filesystem,
+            DateSource::Unreadable,
+            DateSource::Unsupported,
+            DateSource::None,
+        ][..],
+    )
+}
+
+/// Both postures a run can take toward where a date came from.
+fn policy() -> impl Strategy<Value = DatePolicy> {
+    prop::sample::select(&[DatePolicy::AnyDate, DatePolicy::EmbeddedOnly][..])
 }
 
 /// `^\d{4}-\d{2}-\d{2}$`, spelled out rather than pulled in.
@@ -216,7 +249,8 @@ proptest! {
         ext in extension(),
         gps in gps(),
     ) {
-        let (dir, filename) = build_target_path(&dated(Some(dt), gps), &ext, STEM, geo(), scheme());
+        let (dir, filename) =
+            build_target_path(&dated(Some(dt), gps), &ext, STEM, geo(), scheme(), DatePolicy::AnyDate);
         let dir = dir.to_string_lossy().into_owned();
 
         prop_assert!(
@@ -253,7 +287,8 @@ proptest! {
     ) {
         prop_assert!(!year_is_representable(dt.year()));
 
-        let (dir, _) = build_target_path(&dated(Some(dt), gps), &ext, STEM, geo(), scheme());
+        let (dir, _) =
+            build_target_path(&dated(Some(dt), gps), &ext, STEM, geo(), scheme(), DatePolicy::AnyDate);
 
         prop_assert_eq!(
             dir,
@@ -309,9 +344,58 @@ proptest! {
         dt in prop::option::of(any_datetime()),
         ext in extension(),
         gps in gps(),
+        source in date_source(),
+        policy in policy(),
     ) {
-        let (_, filename) = build_target_path(&dated(dt, gps), &ext, STEM, geo(), scheme());
+        let (_, filename) =
+            build_target_path(&dated_from(dt, gps, source), &ext, STEM, geo(), scheme(), policy);
         assert_single_safe_component(&filename)?;
+    }
+
+    /// The stem a refused file keeps is still one safe component — and it is
+    /// still *its own*.
+    ///
+    /// `--require-exif` opened the only route by which a source filename reaches
+    /// a destination filename, so the guarantee the rest of this section makes
+    /// about generated *extensions* has to be made about generated stems too:
+    /// arbitrary text, including the empty string and the leading dot.
+    ///
+    /// The second assertion is the one that would catch the flag going quiet. A
+    /// safe-name property alone is satisfied by `unknown.jpg`, which is exactly
+    /// the behaviour this route exists not to have.
+    #[test]
+    fn a_refused_file_keeps_a_safe_name_of_its_own(
+        dt in representable_datetime(),
+        ext in prop::sample::select(KNOWN_EXTENSIONS),
+        stem in arbitrary_text(),
+        gps in gps(),
+        source in date_source().prop_filter("refused only", |s| !s.is_embedded()),
+    ) {
+        let (dir, filename) = build_target_path(
+            &dated_from(Some(dt), gps, source),
+            ext,
+            &stem,
+            geo(),
+            scheme(),
+            DatePolicy::EmbeddedOnly,
+        );
+
+        assert_single_safe_component(&filename)?;
+        prop_assert_eq!(
+            &dir,
+            &PathBuf::from("unsorted"),
+            "a {:?} date must not name a directory under --require-exif",
+            source
+        );
+
+        let sanitised = sanitise_for_filename(&stem);
+        let expected = if sanitised.is_empty() { "unknown" } else { &sanitised };
+        prop_assert_eq!(
+            &filename,
+            &format!("{expected}.{ext}"),
+            "a refused file keeps its own name; {:?} became a different one",
+            stem
+        );
     }
 
     /// The sanitiser on its own, over arbitrary text — the geocoder's output is
@@ -341,7 +425,8 @@ proptest! {
         raw in prop::sample::select(NASTY_STRINGS),
         gps in gps(),
     ) {
-        let (_, filename) = build_target_path(&dated(Some(dt), gps), raw, STEM, geo(), scheme());
+        let (_, filename) =
+            build_target_path(&dated(Some(dt), gps), raw, STEM, geo(), scheme(), DatePolicy::AnyDate);
         assert_single_safe_component(&filename)?;
     }
 }
@@ -359,9 +444,12 @@ proptest! {
         dt in prop::option::of(any_datetime()),
         ext in extension(),
         gps in gps(),
+        source in date_source(),
+        policy in policy(),
     ) {
         let output = Path::new(output);
-        let (dir, filename) = build_target_path(&dated(dt, gps), &ext, STEM, geo(), scheme());
+        let (dir, filename) =
+            build_target_path(&dated_from(dt, gps, source), &ext, STEM, geo(), scheme(), policy);
         let destination = output.join(&dir).join(&filename);
 
         prop_assert!(
@@ -386,12 +474,15 @@ proptest! {
     /// The same property driven from the other end: a real file on disk, whose
     /// *name* is the hostile part, planned through the real code path. This is
     /// the one that would catch the source path leaking into the destination —
-    /// today only its extension does, and that is worth pinning rather than
-    /// assuming.
+    /// and under [`DatePolicy::EmbeddedOnly`] the source's stem genuinely does
+    /// reach the destination, which is why the policy is generated here rather
+    /// than pinned. The fixture is a file of the word `pixels`: no container, so
+    /// no embedded date, so every generated name takes the refused route.
     #[test]
     fn a_hostile_source_filename_cannot_steer_the_destination(
         stem in prop::sample::select(&["..", "...", ".hidden", "a..b", "..%2f..", "n o r m a l"][..]),
         ext in prop::sample::select(KNOWN_EXTENSIONS),
+        policy in policy(),
     ) {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
@@ -416,6 +507,7 @@ proptest! {
             geo(),
             scheme(),
             &TimezonePolicy::default(),
+            policy,
             None,
         )
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
@@ -744,7 +836,8 @@ proptest! {
         stem in extension(),
         gps in gps(),
     ) {
-        let (_, filename) = build_target_path(&dated(Some(dt), gps), &ext, &stem, geo(), &scheme);
+        let (_, filename) =
+            build_target_path(&dated(Some(dt), gps), &ext, &stem, geo(), &scheme, DatePolicy::AnyDate);
         assert_single_safe_component(&filename)?;
         prop_assert!(
             !filename.is_empty(),
@@ -764,9 +857,12 @@ proptest! {
         ext in extension(),
         stem in extension(),
         gps in gps(),
+        source in date_source(),
+        policy in policy(),
     ) {
         let output = Path::new(output);
-        let (dir, filename) = build_target_path(&dated(dt, gps), &ext, &stem, geo(), &scheme);
+        let (dir, filename) =
+            build_target_path(&dated_from(dt, gps, source), &ext, &stem, geo(), &scheme, policy);
         let destination = output.join(&dir).join(&filename);
 
         prop_assert!(

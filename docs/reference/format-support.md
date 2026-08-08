@@ -34,6 +34,11 @@ version 0.1.0 the run says which files this happened to; before that it did not.
 - **Filesystem only** — the container is not one the EXIF parser recognises, so
   the date comes from the file's timestamps. Reported as
   `[FS: UNSUPPORTED]` per file and tallied in the summary.
+- A container `mmm` *does* read, whose metadata will not parse — a truncated
+  write, a corrupted card, a `DateTimeOriginal` that is not a datetime — is a
+  third case, reported `[FS: UNREADABLE]` and tallied on its own line. It is not
+  a property of the format, so it has no column here; it is a property of the
+  individual file.
 - **Untested** — the extension is accepted by the scanner, but no fixture of that
   container exists yet, so nothing here is a claim about it either way.
 
@@ -78,7 +83,10 @@ rows change on their own.
 The consequence to be aware of is that a `.jpg` full of arbitrary bytes — a
 truncated download, a renamed text file — is also reported `Unsupported`, because
 it is not a container the tool can read. A JPEG that is genuinely a JPEG and
-simply has no EXIF in it reports the ordinary filesystem fallback.
+simply has no EXIF in it reports the ordinary filesystem fallback, and a JPEG
+whose EXIF block is there and will not parse reports `Unreadable`. Three
+outcomes, one directory: they are told apart in the report because they are not
+told apart by the output tree.
 
 ## Timezones
 
@@ -104,8 +112,9 @@ order.
   coordinates into a zone needs a boundary database; a place-name lookup is not
   one.
 - **RAW dates are not read at all**, per the table above. A second parser would
-  be needed. Until then, `--require-exif` (planned) is the conservative posture
-  for a RAW library.
+  be needed. Until then, `--require-exif` is the conservative posture for a RAW
+  library: every row marked *filesystem only* goes to `unsorted/` under its own
+  filename rather than being filed under a modification time.
 
 ## Verifying this page
 

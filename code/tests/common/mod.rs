@@ -150,11 +150,7 @@ impl MediaTree {
         gps: Option<(f64, f64)>,
     ) -> Self {
         let bytes = synth_jpeg(
-            Some(ExifSpec {
-                datetime,
-                offset,
-                gps,
-            }),
+            &JpegExif::Present(ExifSpec::new(datetime, offset, gps)),
             rel,
         );
         self.write(rel, &bytes)
@@ -181,15 +177,7 @@ impl MediaTree {
         offset: Option<&str>,
         gps: Option<(f64, f64)>,
     ) -> Self {
-        let bytes = synth_heif(
-            brand,
-            &ExifSpec {
-                datetime,
-                offset,
-                gps,
-            },
-            rel,
-        );
+        let bytes = synth_heif(brand, &ExifSpec::new(datetime, offset, gps), rel);
         self.write(rel, &bytes)
     }
 
@@ -220,14 +208,7 @@ impl MediaTree {
         offset: Option<&str>,
         gps: Option<(f64, f64)>,
     ) -> Self {
-        let tiff = build_tiff(
-            &ExifSpec {
-                datetime,
-                offset,
-                gps,
-            },
-            signature,
-        );
+        let tiff = build_tiff(&ExifSpec::new(datetime, offset, gps), signature);
         // Trailing bytes after the last IFD are ignored by any TIFF reader —
         // the IFD chain says where everything is — so the marker rides along
         // without disturbing the structure.
@@ -255,7 +236,42 @@ impl MediaTree {
     /// same directory and the run reports them differently, so a fixture for
     /// each is the only way to hold that distinction still.
     pub fn jpeg_without_exif(self, rel: &str) -> Self {
-        let bytes = synth_jpeg(None, rel);
+        let bytes = synth_jpeg(&JpegExif::Absent, rel);
+        self.write(rel, &bytes)
+    }
+
+    /// A byte-valid JPEG whose EXIF `DateTimeOriginal` is nineteen characters
+    /// that are not a datetime.
+    ///
+    /// The third of the three ways a file ends up dated from the filesystem, and
+    /// the one that is hardest to build by accident: the container reads, the
+    /// EXIF block reads, the tag is there, and its *value* is rubbish — a
+    /// corrupted card, a camera with a flat clock battery, an editor that wrote
+    /// the field wrong. `nom-exif` drops such an entry's value while still
+    /// yielding the entry, which is the only reason the tool can tell this apart
+    /// from [`Self::jpeg_without_exif`] at all.
+    ///
+    /// `text` must be nineteen characters — see [`ExifSpec::datetime_text`].
+    pub fn jpeg_with_unreadable_date(self, rel: &str, text: &str) -> Self {
+        let spec = ExifSpec {
+            datetime: naive(2024, 3, 15, 23, 30, 0),
+            datetime_text: Some(text),
+            offset: Some("+00:00"),
+            gps: None,
+        };
+        let bytes = synth_jpeg(&JpegExif::Present(spec), rel);
+        self.write(rel, &bytes)
+    }
+
+    /// A byte-valid JPEG whose `APP1` EXIF segment holds a payload that is not a
+    /// TIFF block — a truncated write, a corrupted card.
+    ///
+    /// The other half of "unreadable": here the datetime entry is never reached
+    /// because the block it lives in will not parse. Both must report the same
+    /// thing to the user, and they arrive at it down different code paths, so
+    /// both are fixtures.
+    pub fn jpeg_with_corrupt_exif(self, rel: &str) -> Self {
+        let bytes = synth_jpeg(&JpegExif::Corrupt, rel);
         self.write(rel, &bytes)
     }
 
@@ -573,10 +589,60 @@ pub fn deny_reads(path: &Path) -> Option<RestorePerms> {
 /// nothing about which `None` was meant.
 struct ExifSpec<'a> {
     datetime: NaiveDateTime,
+    /// Written into `DateTimeOriginal` in place of `datetime`, verbatim.
+    ///
+    /// The way to build a file that *has* a date and whose date cannot be read —
+    /// which is a different fixture to one with no date and a different one
+    /// again to a container nothing can parse, and the three are the whole
+    /// subject of [`mmm::metadata::DateSource`].
+    ///
+    /// Must be nineteen characters. The entry declares a count of twenty bytes
+    /// and the builder writes a NUL after it; a fixture whose declared length
+    /// disagreed with its payload would be testing the parser's tolerance of a
+    /// malformed IFD rather than its handling of an unreadable date.
+    datetime_text: Option<&'a str>,
     /// Written verbatim into `OffsetTimeOriginal`; the tag is omitted when
     /// `None`.
     offset: Option<&'a str>,
     gps: Option<(f64, f64)>,
+}
+
+impl<'a> ExifSpec<'a> {
+    /// The ordinary spec: a real datetime, formatted by the builder.
+    fn new(datetime: NaiveDateTime, offset: Option<&'a str>, gps: Option<(f64, f64)>) -> Self {
+        Self {
+            datetime,
+            datetime_text: None,
+            offset,
+            gps,
+        }
+    }
+
+    /// The nineteen characters `DateTimeOriginal` is to carry.
+    fn stamp(&self) -> String {
+        self.datetime_text.map_or_else(
+            || self.datetime.format("%Y:%m:%d %H:%M:%S").to_string(),
+            str::to_owned,
+        )
+    }
+}
+
+/// What EXIF a synthesised JPEG carries.
+///
+/// Three states rather than an `Option`, because "no EXIF at all" and "EXIF that
+/// will not parse" are different files that the tool is now required to report
+/// differently — and a fixture for each is the only way to hold that difference
+/// still.
+enum JpegExif<'a> {
+    /// No `APP1` segment. A scan, a screenshot, a stripped export.
+    Absent,
+    /// A well-formed `APP1` segment carrying the spec.
+    Present(ExifSpec<'a>),
+    /// An `APP1` segment with the `Exif\0\0` preamble and a payload that is not
+    /// a TIFF block — a truncated write, a corrupted card. The JPEG itself still
+    /// decodes, which is the point: the container is ours to read and the
+    /// metadata inside it is not.
+    Corrupt,
 }
 
 /// Assemble a byte-valid 1x1 greyscale baseline JPEG.
@@ -584,17 +650,25 @@ struct ExifSpec<'a> {
 /// Segment order: `SOI`, `APP1` (EXIF, when requested), `COM` (marker),
 /// `DQT`, `SOF0`, `DHT` x2, `SOS`, one byte of entropy-coded data, `EOI`.
 /// The image decodes; it is simply a single black pixel.
-fn synth_jpeg(exif: Option<ExifSpec<'_>>, marker: &str) -> Vec<u8> {
+fn synth_jpeg(exif: &JpegExif<'_>, marker: &str) -> Vec<u8> {
     let mut jpeg: Vec<u8> = vec![0xFF, 0xD8]; // SOI
 
-    if let Some(spec) = exif {
-        let tiff = build_tiff(&spec, None);
-        let payload_len = 6 + tiff.len(); // "Exif\0\0" + TIFF block
+    let payload: Option<Vec<u8>> = match exif {
+        JpegExif::Absent => None,
+        JpegExif::Present(spec) => Some(build_tiff(spec, None)),
+        // Little-endian TIFF byte order and then nothing that follows it: past
+        // the `II` there is no magic 42 and no IFD offset, so the block is
+        // recognised as an attempt at TIFF and refused.
+        JpegExif::Corrupt => Some(b"II\x00\x00not a TIFF block at all".to_vec()),
+    };
+
+    if let Some(payload) = payload {
+        let payload_len = 6 + payload.len(); // "Exif\0\0" + TIFF block
         let seg_len = u16::try_from(payload_len + 2).expect("EXIF segment fits in a JPEG marker");
         jpeg.extend_from_slice(&[0xFF, 0xE1]);
         jpeg.extend_from_slice(&seg_len.to_be_bytes());
         jpeg.extend_from_slice(b"Exif\0\0");
-        jpeg.extend_from_slice(&tiff);
+        jpeg.extend_from_slice(&payload);
     }
 
     // COM — carries the provenance marker without disturbing EXIF.
@@ -666,11 +740,7 @@ const TY_UNDEFINED: u16 = 7;
 /// else. `signature` is the only thing a standalone RAW adds — see
 /// [`MediaTree::tiff_raw`].
 fn build_tiff(spec: &ExifSpec<'_>, signature: Option<&[u8; 4]>) -> Vec<u8> {
-    let ExifSpec {
-        datetime,
-        offset,
-        gps,
-    } = *spec;
+    let ExifSpec { offset, gps, .. } = *spec;
     let mut t: Vec<u8> = Vec::new();
 
     // --- TIFF header: little-endian, magic 42, then IFD0 ---
@@ -741,8 +811,14 @@ fn build_tiff(spec: &ExifSpec<'_>, signature: Option<&[u8; 4]>) -> Vec<u8> {
     // --- Data area ---
     let datetime_off = u32::try_from(t.len()).unwrap();
     patch_u32(&mut t, datetime_ptr_at, datetime_off);
-    let stamp = datetime.format("%Y:%m:%d %H:%M:%S").to_string();
-    debug_assert_eq!(stamp.len(), 19, "EXIF datetime is a fixed 19 chars + NUL");
+    let stamp = spec.stamp();
+    // A real assertion rather than a `debug_assert`, because the text can now
+    // come from a caller: see [`ExifSpec::datetime_text`].
+    assert_eq!(
+        stamp.len(),
+        19,
+        "EXIF datetime is a fixed 19 chars + NUL; {stamp:?} is not"
+    );
     t.extend_from_slice(stamp.as_bytes());
     t.push(0); // NUL terminator -> 20 bytes, keeping the next offset even
 

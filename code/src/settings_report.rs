@@ -226,6 +226,32 @@ pub const KEYS: &[SettingKey] = &[
         value: |settings| settings.default_timezone.clone().map(Value::String),
     },
     SettingKey {
+        name: "require_exif",
+        table: None,
+        summary: "Refuse to file a photograph under a date it did not record itself.\n\
+                  Files dated from the filesystem go to the unsorted directory instead, keeping \
+                  their own names. The posture for a library that has been copied between disks.",
+        unset: None,
+        placeholder: None,
+        claimed: |layer| layer.require_exif.is_some(),
+        value: |settings| Some(Value::Boolean(settings.require_exif)),
+    },
+    SettingKey {
+        name: "filesystem_date_warning_percent",
+        table: None,
+        summary: "Warn when more than this share of dated files took their date from the \
+                  filesystem.\n\
+                  A whole percentage: 0 warns about every single one, 100 never warns.",
+        unset: None,
+        placeholder: None,
+        claimed: |layer| layer.filesystem_date_warning_percent.is_some(),
+        value: |settings| {
+            Some(Value::Integer(i64::from(
+                settings.filesystem_date_warning_percent,
+            )))
+        },
+    },
+    SettingKey {
         name: "image",
         table: Some("extensions"),
         summary: "Which extensions count as photographs — lowercase, no leading dot.\n\
@@ -697,12 +723,14 @@ mod tests {
             extensions: Extensions { image: _, video: _ },
             skip_patterns: _,
             default_timezone: _,
+            require_exif: _,
+            filesystem_date_warning_percent: _,
         } = Settings::default();
 
         assert_eq!(
             KEYS.len(),
-            14,
-            "the thirteen settings, with [extensions] counted as its two keys"
+            16,
+            "the fifteen settings, with [extensions] counted as its two keys"
         );
     }
 
@@ -746,6 +774,8 @@ mod tests {
             }),
             skip_patterns: Some(Vec::new()),
             default_timezone: Some("Asia/Singapore".to_string()),
+            require_exif: Some(true),
+            filesystem_date_warning_percent: Some(50),
         };
         let none = PartialSettings::default();
 

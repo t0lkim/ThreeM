@@ -44,7 +44,7 @@ use common::{
 use mmm::geocoder::GeoLookup;
 use mmm::journal::{IntentKind, Journal, JournalEntry, RunHeader};
 use mmm::metadata::{DateSource, FileMetadata};
-use mmm::organiser::build_target_path;
+use mmm::organiser::{build_target_path, DatePolicy};
 use mmm::reporter::{
     CHUNK_PROMPT_PREFIX, COMMIT_BANNER, DRY_RUN_BANNER, HASH_SKIPPED_LABEL, JOURNAL_LABEL,
     NO_JOURNAL_NOTICE, SCAN_SKIPPED_LABEL, UNPROCESSED_LABEL,
@@ -375,7 +375,14 @@ fn the_unsorted_path_is_used_when_a_file_genuinely_has_no_date() {
     let scheme = Settings::default()
         .layout()
         .expect("the built-in default formats must be valid");
-    let (dir, filename) = build_target_path(&meta, "jpg", "IMG_0001", &GeoLookup::new(), &scheme);
+    let (dir, filename) = build_target_path(
+        &meta,
+        "jpg",
+        "IMG_0001",
+        &GeoLookup::new(),
+        &scheme,
+        DatePolicy::AnyDate,
+    );
     assert_eq!(dir, Path::new("unsorted"));
     assert_eq!(filename, "unknown.jpg");
 }
@@ -1346,7 +1353,14 @@ fn a_config_supplied_unsorted_directory_is_where_an_undateable_file_lands() {
         longitude: None,
         date_source: DateSource::None,
     };
-    let (dir, filename) = build_target_path(&meta, "jpg", "IMG_0001", &GeoLookup::new(), &layout);
+    let (dir, filename) = build_target_path(
+        &meta,
+        "jpg",
+        "IMG_0001",
+        &GeoLookup::new(),
+        &layout,
+        DatePolicy::AnyDate,
+    );
 
     assert_eq!(dir, Path::new("no-date"));
     assert_eq!(filename, "unknown.jpg");

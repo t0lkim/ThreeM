@@ -35,6 +35,8 @@ use thiserror::Error;
 use crate::naming::{
     DateDirectoryFormat, FilenameFormat, FormatError, Layout, OutputSubdir, Scheme,
 };
+use crate::organiser::DatePolicy;
+use crate::reporter::FallbackWarning;
 use crate::scanner::{PatternError, ScanFilter, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS};
 use crate::timezone::{Timezone, TimezoneError, TimezonePolicy};
 
@@ -69,6 +71,14 @@ pub const DEFAULT_DUPLICATES_DIR: &str = "duplicates";
 
 /// Where files with no usable date go, below the output tree.
 pub const DEFAULT_UNSORTED_DIR: &str = "unsorted";
+
+/// How much of a run may be dated from the filesystem before it says so.
+///
+/// A fifth, because a library where one file in five has no readable date is
+/// past the point of being a few stray screenshots — it is either a folder of
+/// scans, or a format this tool cannot read, and both are worth a sentence. Set
+/// it to `0` to hear about every single one, or to `100` never to hear about it.
+pub const DEFAULT_FILESYSTEM_DATE_WARNING_PERCENT: u8 = 20;
 
 /// Which file extensions count as media.
 ///
@@ -169,6 +179,22 @@ pub struct Settings {
     /// configured one", and [`crate::timezone::TimezonePolicy`] takes it from
     /// there.
     pub default_timezone: Option<String>,
+
+    /// Refuse to file any photograph under a date it did not record itself.
+    ///
+    /// Unlike `commit`, this is settable from a config file, and the difference
+    /// is the direction it points. `commit = true` in a file would make a run
+    /// destructive that nobody asked to be; `require_exif = true` makes a run
+    /// more conservative than it would otherwise have been. A setting that can
+    /// only cost you a file staying where it was is one a file may make on your
+    /// behalf.
+    pub require_exif: bool,
+
+    /// The share of dated files that may take their date from the filesystem
+    /// before the run says so, as a whole percentage.
+    ///
+    /// `0` warns whenever a single file fell back, `100` never warns.
+    pub filesystem_date_warning_percent: u8,
 }
 
 impl Default for Settings {
@@ -187,6 +213,8 @@ impl Default for Settings {
             extensions: Extensions::default(),
             skip_patterns: Vec::new(),
             default_timezone: None,
+            require_exif: false,
+            filesystem_date_warning_percent: DEFAULT_FILESYSTEM_DATE_WARNING_PERCENT,
         }
     }
 }
@@ -252,6 +280,9 @@ pub struct PartialSettings {
     pub skip_patterns: Option<Vec<String>>,
     #[serde(default, deserialize_with = "de_default_timezone")]
     pub default_timezone: Option<String>,
+    pub require_exif: Option<bool>,
+    #[serde(default, deserialize_with = "de_percentage")]
+    pub filesystem_date_warning_percent: Option<u8>,
 }
 
 impl PartialSettings {
@@ -281,6 +312,10 @@ impl PartialSettings {
             },
             skip_patterns: higher_priority.skip_patterns.or(self.skip_patterns),
             default_timezone: higher_priority.default_timezone.or(self.default_timezone),
+            require_exif: higher_priority.require_exif.or(self.require_exif),
+            filesystem_date_warning_percent: higher_priority
+                .filesystem_date_warning_percent
+                .or(self.filesystem_date_warning_percent),
         }
     }
 
@@ -383,6 +418,32 @@ where
     Ok(name)
 }
 
+/// Read `filesystem_date_warning_percent`, refusing a value that is not a
+/// percentage.
+///
+/// A `u8` already refuses `300` and `-1` — TOML deserialisation says so in its
+/// own words — but it accepts everything from 101 to 255, and each of those is a
+/// threshold no run can ever cross. Somebody who writes one has asked for the
+/// warning to be off, which `100` already spells, and telling them so is better
+/// than silently agreeing.
+///
+/// See [`de_date_directory_format`] for why this hangs off deserialisation.
+fn de_percentage<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u8>::deserialize(deserializer)?;
+    if let Some(value) = value {
+        if value > 100 {
+            return Err(serde::de::Error::custom(format!(
+                "`filesystem_date_warning_percent` is a percentage, and {value} is not one — use \
+                 100 to turn the warning off"
+            )));
+        }
+    }
+    Ok(value)
+}
+
 /// Read `skip_patterns`, refusing an entry that is not a glob.
 ///
 /// See [`de_date_directory_format`] for why this is a deserialiser. A pattern
@@ -448,6 +509,23 @@ impl Settings {
             .map(str::parse::<Timezone>)
             .transpose()
             .map(TimezonePolicy::new)
+    }
+
+    /// Which dates this run is willing to file a photograph under.
+    #[must_use]
+    pub fn date_policy(&self) -> DatePolicy {
+        DatePolicy::from_require_exif(self.require_exif)
+    }
+
+    /// The share of filesystem dates above which the run says so.
+    ///
+    /// Infallible where [`Self::layout`] and [`Self::timezone_policy`] are not:
+    /// every value a `u8` can hold is one this can act on, and the range check
+    /// on the way in exists to catch a threshold nobody meant rather than one
+    /// nothing could use.
+    #[must_use]
+    pub fn fallback_warning(&self) -> FallbackWarning {
+        FallbackWarning(self.filesystem_date_warning_percent)
     }
 
     /// What the scan admits and what it passes over.
@@ -527,6 +605,10 @@ impl Settings {
             extensions,
             skip_patterns: partial.skip_patterns.unwrap_or(defaults.skip_patterns),
             default_timezone: partial.default_timezone,
+            require_exif: partial.require_exif.unwrap_or(defaults.require_exif),
+            filesystem_date_warning_percent: partial
+                .filesystem_date_warning_percent
+                .unwrap_or(defaults.filesystem_date_warning_percent),
         }
     }
 }
@@ -927,6 +1009,29 @@ where
             "chunk_size" => layer.chunk_size = Some(parse_number(&variable, &value)?),
             "verbose" => layer.verbose = Some(parse_number(&variable, &value)?),
             "no_prompt" => layer.no_prompt = Some(parse_bool(&variable, &value)?),
+            "require_exif" => layer.require_exif = Some(parse_bool(&variable, &value)?),
+            // Range-checked here for the same reason the file layer checks it:
+            // a threshold above 100 is one no run can cross, and agreeing with
+            // it silently would leave somebody waiting for a warning that is
+            // never coming.
+            //
+            // Parsed wide and narrowed afterwards, rather than straight into the
+            // `u8` it is stored as. `"500".parse::<u8>()` fails, and the error it
+            // fails with is "expected a whole number" — which is both wrong and
+            // useless, 500 being very much a whole number. The reader needs to be
+            // told the range, not to be told their arithmetic is not arithmetic.
+            "filesystem_date_warning_percent" => {
+                let percent: u32 = parse_number(&variable, &value)?;
+                let percent = u8::try_from(percent).ok().filter(|p| *p <= 100);
+                layer.filesystem_date_warning_percent =
+                    Some(percent.ok_or_else(|| ConfigError::Environment {
+                        variable: variable.clone(),
+                        message: format!(
+                            "expected a percentage between 0 and 100, got `{value}` — use 100 to \
+                             turn the warning off"
+                        ),
+                    })?);
+            }
             "include_location" => layer.include_location = Some(parse_bool(&variable, &value)?),
             "skip_patterns" => {
                 let patterns = parse_list(&value);

@@ -39,17 +39,64 @@ pub struct PlannedMove {
     pub known_hash: Option<String>,
 }
 
+/// Which dates a run is willing to file a photograph under.
+///
+/// The conservative posture is not the default, and cannot be: a tool that
+/// refused every scan and every screenshot out of the box would be one nobody
+/// could point at their own library. It is the posture of somebody who knows
+/// their files have been copied between disks — where a modification time is the
+/// date of the copy, not of the photograph — and would rather sort those by hand
+/// than have the tool guess confidently on their behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DatePolicy {
+    /// File under the best date available, filesystem timestamps included.
+    #[default]
+    AnyDate,
+    /// `--require-exif`: file only under a date the file itself recorded.
+    /// Everything else goes to `unsorted/`.
+    EmbeddedOnly,
+}
+
+impl DatePolicy {
+    /// The policy `--require-exif` asks for, or the default when it was not
+    /// passed.
+    #[must_use]
+    pub fn from_require_exif(require_exif: bool) -> Self {
+        if require_exif {
+            Self::EmbeddedOnly
+        } else {
+            Self::AnyDate
+        }
+    }
+
+    /// Whether a date established this way may name a dated directory.
+    #[must_use]
+    pub fn admits(self, source: DateSource) -> bool {
+        match self {
+            Self::AnyDate => true,
+            Self::EmbeddedOnly => source.is_embedded(),
+        }
+    }
+}
+
 /// Build the target path for a file based on its metadata
 ///
 /// # Errors
 ///
 /// Returns an error if the file's metadata cannot be extracted.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one independent thing a plan depends on, and folding \
+              them into a context struct would put a layer between a caller and the \
+              decision it is making"
+)]
 pub fn plan_move(
     file: &ScannedFile,
     output_dir: &Path,
     geo: &GeoLookup,
     layout: &Layout,
     tz: &TimezonePolicy,
+    policy: DatePolicy,
     known_hash: Option<String>,
 ) -> Result<PlannedMove> {
     let meta = metadata::extract_metadata(&file.path, file.is_video, tz)?;
@@ -65,7 +112,7 @@ pub fn plan_move(
         .unwrap_or_default();
 
     let (date_dir, filename) =
-        build_target_path(&meta, &file.extension, original_stem, geo, layout);
+        build_target_path(&meta, &file.extension, original_stem, geo, layout, policy);
     let destination = output_dir.join(date_dir).join(filename);
 
     Ok(PlannedMove {
@@ -112,6 +159,11 @@ pub fn plan_move(
 /// something validation can enumerate. The unsorted directory is the bucket that
 /// already means "no filing we can trust", which is better than a directory
 /// named after whatever the default happened to be.
+///
+/// **A date the policy refuses goes there too, keeping its own name.** See
+/// [`unsorted_filename`] — this is the one route into `unsorted/` where the file
+/// had a perfectly good name and a perfectly good date, and only the *provenance*
+/// of the date was rejected.
 // exposed for integration tests
 pub fn build_target_path(
     meta: &FileMetadata,
@@ -119,25 +171,64 @@ pub fn build_target_path(
     original_stem: &str,
     geo: &GeoLookup,
     layout: &Layout,
+    policy: DatePolicy,
 ) -> (PathBuf, String) {
     let extension = sanitise_for_filename(extension);
 
+    // A file that has a date the run will not file under, as distinct from one
+    // that has no date at all. The two go to the same directory and must not
+    // arrive under the same name.
+    let refused = meta.date.is_some() && !policy.admits(meta.date_source);
+
     let dated = match meta.date {
-        Some(dt) if year_is_representable(dt.year()) => layout.date_directory(&dt).map(|dir| {
-            (
-                dir,
-                date_filename(&dt, meta, &extension, original_stem, geo, layout),
-            )
-        }),
+        Some(dt) if !refused && year_is_representable(dt.year()) => {
+            layout.date_directory(&dt).map(|dir| {
+                (
+                    dir,
+                    date_filename(&dt, meta, &extension, original_stem, geo, layout),
+                )
+            })
+        }
         _ => None,
     };
 
     dated.unwrap_or_else(|| {
         (
             layout.unsorted().to_path_buf(),
-            format!("{}.{extension}", crate::naming::UNNAMED),
+            unsorted_filename(refused.then_some(original_stem), &extension),
         )
     })
+}
+
+/// The name a file gets in `unsorted/`.
+///
+/// `keep_stem` is `Some` only for a file [`DatePolicy::EmbeddedOnly`] refused,
+/// and it is the difference between a conservative flag and a destructive one.
+/// Everything else in `unsorted/` is `unknown.jpg` because there is genuinely
+/// nothing to say about it — no date, and by then no reason to trust the name
+/// either. A file `--require-exif` sent here is the opposite case: it is
+/// `IMG_4471.CR2`, it has a filesystem date the run declined to trust, and its
+/// *name* is now the only handle its owner has on it. Throwing that away would
+/// make the safe posture the lossy one.
+///
+/// It is also what makes the flag usable at all. A library of forty thousand
+/// RAW files under `--require-exif` would otherwise be forty thousand files
+/// competing for `unknown.cr2`, and [`MAX_COLLISION_ATTEMPTS`] stops at ten
+/// thousand — so the run would not merely be unhelpful, it would start failing
+/// moves a third of the way in.
+///
+/// Total, like everything else here: [`sanitise_for_filename`] admits only
+/// alphanumerics, `-` and `_`, so the result is one ordinary path component, and
+/// a stem that sanitises to nothing (an empty or non-UTF-8 filename) falls back
+/// to the same [`crate::naming::UNNAMED`] as the undated case.
+fn unsorted_filename(keep_stem: Option<&str>, extension: &str) -> String {
+    let stem = keep_stem
+        .map(sanitise_for_filename)
+        .filter(|stem| !stem.is_empty());
+    format!(
+        "{}.{extension}",
+        stem.as_deref().unwrap_or(crate::naming::UNNAMED)
+    )
 }
 
 /// The name `scheme` gives a file whose date is usable.
@@ -1376,8 +1467,14 @@ mod tests {
     #[test]
     fn test_a_configured_date_directory_format_nests_the_tree() {
         let nested = layout_of("%Y/%m/%d", "{date}-{time}{location}.{ext}", true);
-        let (dir, filename) =
-            build_target_path(&at(2024, 3, 15), "jpg", "IMG_0001", geo(), &nested);
+        let (dir, filename) = build_target_path(
+            &at(2024, 3, 15),
+            "jpg",
+            "IMG_0001",
+            geo(),
+            &nested,
+            DatePolicy::AnyDate,
+        );
         assert_eq!(dir, PathBuf::from("2024/03/15"));
         assert_eq!(filename, "2024-03-15-103000.jpg");
     }
@@ -1386,8 +1483,14 @@ mod tests {
     #[test]
     fn test_a_configured_filename_format_is_applied() {
         let renamed = layout_of("%Y-%m-%d", "{original_stem}-{date}.{ext}", true);
-        let (dir, filename) =
-            build_target_path(&at(2024, 3, 15), "jpg", "IMG_0001", geo(), &renamed);
+        let (dir, filename) = build_target_path(
+            &at(2024, 3, 15),
+            "jpg",
+            "IMG_0001",
+            geo(),
+            &renamed,
+            DatePolicy::AnyDate,
+        );
         assert_eq!(dir, PathBuf::from("2024-03-15"));
         assert_eq!(filename, "IMG_0001-2024-03-15.jpg");
     }
@@ -1401,9 +1504,23 @@ mod tests {
         located.latitude = Some(51.5);
         located.longitude = Some(-0.12);
 
-        let (_, with) = build_target_path(&located, "jpg", "IMG_0001", geo(), &scheme());
+        let (_, with) = build_target_path(
+            &located,
+            "jpg",
+            "IMG_0001",
+            geo(),
+            &scheme(),
+            DatePolicy::AnyDate,
+        );
         let without = layout_of("%Y-%m-%d", "{date}-{time}{location}.{ext}", false);
-        let (_, plain) = build_target_path(&located, "jpg", "IMG_0001", geo(), &without);
+        let (_, plain) = build_target_path(
+            &located,
+            "jpg",
+            "IMG_0001",
+            geo(),
+            &without,
+            DatePolicy::AnyDate,
+        );
 
         assert!(
             with.len() > plain.len(),
@@ -1440,8 +1557,14 @@ mod tests {
     /// documents.
     #[test]
     fn test_a_low_year_is_padded_to_four_digits() {
-        let (dir, filename) =
-            build_target_path(&at(44, 3, 15), "jpg", "IMG_0001", geo(), &scheme());
+        let (dir, filename) = build_target_path(
+            &at(44, 3, 15),
+            "jpg",
+            "IMG_0001",
+            geo(),
+            &scheme(),
+            DatePolicy::AnyDate,
+        );
         assert_eq!(dir, PathBuf::from("0044-03-15"));
         assert_eq!(filename, "0044-03-15-103000.jpg");
     }
@@ -1451,8 +1574,14 @@ mod tests {
     /// every command-line tool that met it would read as a flag.
     #[test]
     fn test_a_year_outside_four_digits_goes_to_unsorted() {
-        let (dir, filename) =
-            build_target_path(&at(-44, 3, 15), "jpg", "IMG_0001", geo(), &scheme());
+        let (dir, filename) = build_target_path(
+            &at(-44, 3, 15),
+            "jpg",
+            "IMG_0001",
+            geo(),
+            &scheme(),
+            DatePolicy::AnyDate,
+        );
         assert_eq!(dir, PathBuf::from("unsorted"));
         assert_eq!(filename, "unknown.jpg");
     }
@@ -1469,6 +1598,7 @@ mod tests {
             "IMG_0001",
             geo(),
             &scheme(),
+            DatePolicy::AnyDate,
         );
         assert_eq!(dir, PathBuf::from("2024-03-15"));
         assert_eq!(filename, "2024-03-15-103000.______etc_passwd");
@@ -2729,7 +2859,14 @@ mod tests {
             longitude: None,
             date_source: DateSource::None,
         };
-        let (dir, name) = build_target_path(&meta, "jpg", "IMG_0001", geo(), &scheme());
+        let (dir, name) = build_target_path(
+            &meta,
+            "jpg",
+            "IMG_0001",
+            geo(),
+            &scheme(),
+            DatePolicy::AnyDate,
+        );
         assert_eq!(dir, PathBuf::from("unsorted"));
         assert_eq!(name, "unknown.jpg");
     }

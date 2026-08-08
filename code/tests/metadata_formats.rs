@@ -139,7 +139,23 @@ fn organise(
 /// Previewing rather than committing on purpose: the tag is a decision *about*
 /// the run, and a user has to be able to see it before agreeing to anything.
 fn preview_listing(input: &Path, extra: &[&str]) -> String {
-    let result = mmm(input)
+    preview_listing_with_env(input, extra, &[])
+}
+
+/// The same, with environment overrides applied on top of the stripped
+/// environment.
+///
+/// The environment is the only layer below the command line these tests can
+/// reach — the file layers are held off by `--no-config`, which is what makes
+/// every other assertion in this suite independent of the machine. Setting a
+/// variable here is therefore how a "a config layer said X, the command line
+/// said Y" precedence claim gets tested at all.
+fn preview_listing_with_env(input: &Path, extra: &[&str], env: &[(&str, &str)]) -> String {
+    let mut cmd = mmm(input);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let result = cmd
         .args(extra)
         .output()
         .expect("running mmm in preview mode");
@@ -739,5 +755,319 @@ fn a_format_the_parser_cannot_read_is_named_in_the_listing_and_the_summary() {
     assert!(
         listing.contains("Date from EXIF: 1"),
         "the JPEG beside it should still have been read from EXIF:\n{listing}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Date-source honesty
+// ---------------------------------------------------------------------------
+//
+// Three of the five `DateSource` variants describe the same visible outcome:
+// the file is filed under its modification time. They are separate variants
+// because the *reasons* are not interchangeable to whoever has to act on them.
+// "This scan records no date" is a fact about the file; "the date in this file
+// would not parse" and "this format is one mmm cannot read" are both admissions
+// about the tool, and they point at different remedies — one at the file, one at
+// us. Before this section they were one word, `Filesystem`, and a person with a
+// corrupted card was told their photographs simply had no dates in them.
+//
+// Every fixture below is a *byte-valid JPEG*: same container, same synthesiser,
+// differing only in what its EXIF block holds. That is what makes the three
+// results a measurement of the extractor rather than of the harness.
+
+/// The four ways a run can establish a date, told apart on four otherwise
+/// identical files.
+///
+/// Asserted through [`extract_metadata`] rather than the binary because the
+/// claim is about the classification itself; the two tests after this one carry
+/// it the rest of the way to what a person actually reads.
+#[test]
+fn the_three_ways_of_falling_back_to_the_filesystem_are_told_apart() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("dated.jpg", naive(2024, 3, 15, 23, 30, 0), None)
+        .jpeg_without_exif("scan.jpg")
+        .jpeg_with_unreadable_date("garbled.jpg", "NOT-A-DATE-AT-ALL!!")
+        .jpeg_with_corrupt_exif("corrupt.jpg")
+        .tiff_raw(
+            "DSC_0001.dng",
+            None,
+            naive(2024, 3, 15, 23, 30, 0),
+            Some("+08:00"),
+            None,
+        );
+
+    for (rel, expected) in [
+        ("dated.jpg", DateSource::Exif),
+        // A real JPEG with nothing in it to read. Nothing is wrong here.
+        ("scan.jpg", DateSource::Filesystem),
+        // The tag is present and its value is not a datetime.
+        ("garbled.jpg", DateSource::Unreadable),
+        // The EXIF block itself will not parse — the same admission, reached
+        // down a different path, and the reason both are fixtures.
+        ("corrupt.jpg", DateSource::Unreadable),
+        // Not a container this tool reads at all.
+        ("DSC_0001.dng", DateSource::Unsupported),
+    ] {
+        let meta = read_image(&tree, rel);
+        assert_eq!(meta.date_source, expected, "{rel} was classified wrongly");
+        assert!(
+            meta.date.is_some(),
+            "{rel}: however the date was established, the file still has to be \
+             organised somewhere"
+        );
+    }
+}
+
+/// The control that stops the two `Unreadable` fixtures being vacuous.
+///
+/// `Unreadable` is what a merely *malformed* fixture would also produce, which
+/// would make the test above an assertion about the harness's own bugs. So both
+/// files are checked to be what they claim: a JPEG the parser recognises, whose
+/// EXIF really does hold the nineteen bytes in question.
+#[test]
+fn the_unreadable_fixtures_are_real_jpegs_carrying_a_real_datetime_entry() {
+    let tree = MediaTree::new()
+        .jpeg_with_unreadable_date("garbled.jpg", "NOT-A-DATE-AT-ALL!!")
+        .jpeg_with_corrupt_exif("corrupt.jpg");
+
+    for rel in ["garbled.jpg", "corrupt.jpg"] {
+        let bytes = std::fs::read(tree.join(rel)).expect("reading the fixture");
+        assert_eq!(&bytes[..2], b"\xFF\xD8", "{rel} is not a JPEG");
+        assert_eq!(&bytes[2..4], b"\xFF\xE1", "{rel} has no APP1 segment");
+        assert!(
+            bytes.windows(6).any(|w| w == b"Exif\0\0"),
+            "{rel} does not declare an EXIF payload at all"
+        );
+    }
+
+    let garbled = std::fs::read(tree.join("garbled.jpg")).expect("reading the fixture");
+    assert!(
+        garbled.windows(19).any(|w| w == b"NOT-A-DATE-AT-ALL!!"),
+        "the unreadable stamp is not in the file, so its unreadability proves nothing"
+    );
+}
+
+/// Each reason gets its own tag in the listing and its own line in the summary.
+///
+/// Both halves matter and they fail differently: a tally with no per-file tag
+/// tells you that eleven files are suspect without saying which, and a tag with
+/// no tally leaves the figure to be counted by hand out of three thousand lines.
+#[test]
+fn each_reason_for_a_filesystem_date_is_tagged_and_counted_separately() {
+    let at = naive(2024, 3, 15, 23, 30, 0);
+    let tree = MediaTree::new()
+        .jpeg_with_offset("shoot/dated.jpg", at, Some("+08:00"), None)
+        .jpeg_without_exif("shoot/scan.jpg")
+        .jpeg_with_unreadable_date("shoot/garbled.jpg", "NOT-A-DATE-AT-ALL!!")
+        .tiff_raw("shoot/DSC_0001.dng", None, at, Some("+08:00"), None);
+
+    let listing = preview_listing(tree.path(), &[]);
+
+    for (rel, tag) in [
+        ("dated.jpg", "[EXIF]"),
+        ("scan.jpg", "[FS]"),
+        ("garbled.jpg", "[FS: UNREADABLE]"),
+        ("DSC_0001.dng", "[FS: UNSUPPORTED]"),
+    ] {
+        let line = listing_line(&listing, rel);
+        assert!(line.contains(tag), "{rel} was not tagged {tag}: {line}");
+    }
+
+    for expected in [
+        "Date from EXIF: 1",
+        "Date from filesystem: 1",
+        "Date from filesystem — metadata unreadable: 1",
+        "Date from filesystem — format not supported: 1",
+    ] {
+        assert!(
+            listing.contains(expected),
+            "the summary is missing `{expected}`:\n{listing}"
+        );
+    }
+}
+
+/// The counts appear on the committing path too, which is the whole point of
+/// moving them into the closing summary.
+///
+/// They used to be printed only by the dry-run block, so the run that actually
+/// moved somebody's library was the one that never said where its dates had come
+/// from — the figure was visible only to whoever thought to preview first.
+#[test]
+fn a_committing_run_reports_where_its_dates_came_from() {
+    let at = naive(2024, 3, 15, 23, 30, 0);
+    let tree = MediaTree::new()
+        .jpeg_with_offset("shoot/dated.jpg", at, Some("+08:00"), None)
+        .jpeg_without_exif("shoot/scan.jpg");
+
+    let out_dir = TempDir::new().expect("creating output TempDir");
+    let result = mmm(tree.path())
+        .arg("-o")
+        .arg(out_dir.path().join("out"))
+        .arg("--commit")
+        .arg("--no-prompt")
+        .output()
+        .expect("running mmm in commit mode");
+    assert!(result.status.success(), "the run failed");
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("Date from EXIF: 1") && stdout.contains("Date from filesystem: 1"),
+        "a committing run said nothing about where its dates came from:\n{stdout}"
+    );
+}
+
+/// Above the threshold the run says so; below it, it stays quiet.
+///
+/// One test for both halves deliberately. A warning that never fires and a
+/// warning that always fires are the same amount of use, and only asserting the
+/// pair distinguishes a threshold that works from a line that is simply always
+/// printed.
+#[test]
+fn a_run_mostly_dated_from_the_filesystem_says_so_above_the_configured_share() {
+    let at = naive(2024, 3, 15, 23, 30, 0);
+    // Three of four files fall back — 75%.
+    let tree = MediaTree::new()
+        .jpeg_with_offset("shoot/dated.jpg", at, Some("+08:00"), None)
+        .jpeg_without_exif("shoot/scan-a.jpg")
+        .jpeg_without_exif("shoot/scan-b.jpg")
+        .jpeg_without_exif("shoot/scan-c.jpg");
+
+    let default = preview_listing(tree.path(), &[]);
+    assert!(
+        default.contains("WARNING:") && default.contains("75% of dated files (3 of 4)"),
+        "a run three-quarters dated from the filesystem said nothing:\n{default}"
+    );
+    assert!(
+        default.contains("--require-exif"),
+        "the warning does not say what to do about it:\n{default}"
+    );
+
+    // Raised above the actual share, the same run stays quiet.
+    let raised = mmm(tree.path())
+        .env("MMM_FILESYSTEM_DATE_WARNING_PERCENT", "80")
+        .output()
+        .expect("running mmm with a raised threshold");
+    assert!(raised.status.success(), "the run failed");
+    let raised = String::from_utf8_lossy(&raised.stdout);
+    assert!(
+        !raised.contains("WARNING:"),
+        "75% tripped a threshold of 80:\n{raised}"
+    );
+    assert!(
+        raised.contains("Date from filesystem: 3"),
+        "sanity: the same three files still fell back:\n{raised}"
+    );
+}
+
+/// A threshold that is not a percentage is refused, rather than accepted as one
+/// no run can ever cross.
+#[test]
+fn a_threshold_above_a_hundred_is_refused() {
+    let tree = MediaTree::new().jpeg_without_exif("scan.jpg");
+
+    let result = mmm(tree.path())
+        .env("MMM_FILESYSTEM_DATE_WARNING_PERCENT", "500")
+        .output()
+        .expect("running mmm with an impossible threshold");
+
+    assert!(!result.status.success(), "500 was accepted as a percentage");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("percentage between 0 and 100"),
+        "the refusal does not say what a percentage is or how to turn the \
+         warning off:\n{stderr}"
+    );
+}
+
+// --- --require-exif -------------------------------------------------------
+
+/// The conservative posture: nothing is filed under a date the file did not
+/// record, and what is refused keeps its own name.
+///
+/// The name is half the point. `unsorted/` is otherwise all `unknown.jpg`,
+/// because a file with no date has nothing to be filed by — but a file
+/// `--require-exif` sent here has a perfectly good name and a date the run
+/// merely declined to trust, and taking the name as well would make the safe
+/// posture the lossy one.
+#[test]
+fn require_exif_sends_every_unverified_date_to_unsorted_under_its_own_name() {
+    let at = naive(2024, 3, 15, 23, 30, 0);
+    let tree = MediaTree::new()
+        .jpeg_with_offset("shoot/dated.jpg", at, Some("+08:00"), None)
+        .jpeg_without_exif("shoot/scan.jpg")
+        .jpeg_with_unreadable_date("shoot/garbled.jpg", "NOT-A-DATE-AT-ALL!!")
+        .tiff_raw("shoot/DSC_0001.dng", None, at, Some("+08:00"), None);
+
+    let (_out, landed) = organise(tree.path(), &["--require-exif"]);
+
+    assert_landed_at(
+        &landed,
+        "shoot/dated.jpg",
+        "2024-03-15/2024-03-15-233000.jpg",
+    );
+    assert_landed_at(&landed, "shoot/scan.jpg", "unsorted/scan.jpg");
+    assert_landed_at(&landed, "shoot/garbled.jpg", "unsorted/garbled.jpg");
+    assert_landed_at(&landed, "shoot/DSC_0001.dng", "unsorted/DSC_0001.dng");
+}
+
+/// The control: without the flag the same four files are all filed by date.
+///
+/// Without this the test above would pass just as well against a tool that sent
+/// everything to `unsorted/` all the time.
+#[test]
+fn the_same_files_are_all_filed_by_date_when_the_flag_is_not_passed() {
+    let at = naive(2024, 3, 15, 23, 30, 0);
+    let tree = MediaTree::new()
+        .jpeg_with_offset("shoot/dated.jpg", at, Some("+08:00"), None)
+        .jpeg_without_exif("shoot/scan.jpg")
+        .tiff_raw("shoot/DSC_0001.dng", None, at, Some("+08:00"), None);
+
+    let (_out, landed) = organise(tree.path(), &[]);
+
+    assert_landed_at(
+        &landed,
+        "shoot/dated.jpg",
+        "2024-03-15/2024-03-15-233000.jpg",
+    );
+    for marker in ["shoot/scan.jpg", "shoot/DSC_0001.dng"] {
+        let where_it_went = landed
+            .get(marker)
+            .unwrap_or_else(|| panic!("{marker} vanished; the tree was {landed:#?}"));
+        assert!(
+            !where_it_went[0].starts_with("unsorted/"),
+            "{marker} went to {} without --require-exif being passed",
+            where_it_went[0]
+        );
+    }
+}
+
+/// A config file may ask for the conservative posture, and the command line may
+/// take it back.
+///
+/// `require_exif` is settable from a file where `commit` is not, and the
+/// difference is the direction each points: a file that made a run *more*
+/// careful can only ever cost you a photograph staying where it was. The `=false`
+/// spelling is what stops that from being a one-way door.
+#[test]
+fn require_exif_is_settable_from_a_config_file_and_answerable_from_the_command_line() {
+    let at = naive(2024, 3, 15, 23, 30, 0);
+    let tree = MediaTree::new()
+        .jpeg_with_offset("shoot/dated.jpg", at, Some("+08:00"), None)
+        .jpeg_without_exif("shoot/scan.jpg");
+
+    let listing = preview_listing_with_env(tree.path(), &[], &[("MMM_REQUIRE_EXIF", "true")]);
+    assert!(
+        listing_line(&listing, "scan.jpg").contains("unsorted"),
+        "a configured require_exif did not reach the plan:\n{listing}"
+    );
+
+    let listing = preview_listing_with_env(
+        tree.path(),
+        &["--require-exif=false"],
+        &[("MMM_REQUIRE_EXIF", "true")],
+    );
+    assert!(
+        !listing_line(&listing, "scan.jpg").contains("unsorted"),
+        "--require-exif=false did not outrank the environment:\n{listing}"
     );
 }

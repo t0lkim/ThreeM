@@ -55,6 +55,12 @@ pub fn print_mode_banner(dry_run: bool) {
 }
 
 /// Print the planned moves for dry-run mode
+///
+/// The per-file date-source tags are here; the totals behind them are not. Both
+/// used to be, which is why a committing run reported neither — see
+/// [`RunSummary::dates`], which now carries them for both postures so there is
+/// one block saying where a run's dates came from rather than one that appears
+/// only when nothing is being moved.
 pub fn print_dry_run(moves: &[PlannedMove]) {
     if moves.is_empty() {
         println!("\nNo files to organise.");
@@ -63,33 +69,10 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
 
     println!("\n═══ Dry Run — Planned Operations ═══\n");
 
-    let mut exif_count = 0;
-    let mut fs_count = 0;
-    let mut unsupported_count = 0;
-    let mut no_date_count = 0;
     let mut with_location = 0;
     let mut timezones = TimezoneTally::default();
 
     for planned in moves {
-        let source_tag = match planned.date_source {
-            DateSource::Exif => {
-                exif_count += 1;
-                "[EXIF]"
-            }
-            DateSource::Filesystem => {
-                fs_count += 1;
-                "[FS]"
-            }
-            DateSource::Unsupported => {
-                unsupported_count += 1;
-                "[FS: UNSUPPORTED]"
-            }
-            DateSource::None => {
-                no_date_count += 1;
-                "[NO DATE]"
-            }
-        };
-
         if planned.has_location {
             with_location += 1;
         }
@@ -98,7 +81,7 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
 
         println!(
             "  {}{} {} → {}",
-            source_tag,
+            date_source_tag(planned.date_source),
             timezone_tag(planned.timezone_source),
             planned.source.display(),
             planned.destination.display()
@@ -107,17 +90,155 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
 
     println!("\n═══ Dry Run Summary ═══");
     println!("  Total files: {}", moves.len());
-    println!("  Date from EXIF: {exif_count}");
-    println!("  Date from filesystem: {fs_count}");
-    // Counted apart from the line above rather than folded into it: both dates
-    // come from the filesystem, but only this one is the tool admitting a gap,
-    // and a figure a person is meant to act on cannot be hidden inside a figure
-    // they are not.
-    println!("  Date from filesystem — format not supported: {unsupported_count}");
-    println!("  No date (unsorted): {no_date_count}");
     println!("  With GPS location: {with_location}");
     timezones.print();
 }
+
+/// The marker beside a planned move saying where its date came from.
+///
+/// Three of the four say "the filesystem" and differ only in why, which is the
+/// whole point: they are indistinguishable in the output tree, so the listing is
+/// the only place the difference can be seen.
+fn date_source_tag(source: DateSource) -> &'static str {
+    match source {
+        DateSource::Exif => "[EXIF]",
+        DateSource::Filesystem => "[FS]",
+        DateSource::Unreadable => "[FS: UNREADABLE]",
+        DateSource::Unsupported => "[FS: UNSUPPORTED]",
+        DateSource::None => "[NO DATE]",
+    }
+}
+
+/// The share of dated files that may take their date from the filesystem before
+/// the run says so out loud.
+///
+/// A named type rather than a bare `u8` because it travels beside four other
+/// counts of the same width, and a percentage transposed with a file count would
+/// compile, run, and either warn on every library or on none.
+///
+/// `0` warns whenever a single file fell back; `100` never warns, since a share
+/// cannot exceed the whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FallbackWarning(pub u8);
+
+/// Where the dates in a run came from, counted.
+///
+/// Built in exactly one place — [`Self::of`] — so the dry-run listing and the
+/// closing summary of a committing run cannot drift into counting the same files
+/// differently. Before this existed only the preview had these figures, which
+/// meant the run that actually moved the library was the one that never
+/// mentioned where its dates had come from.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DateSourceTally {
+    pub exif: usize,
+    pub filesystem: usize,
+    pub unreadable: usize,
+    pub unsupported: usize,
+    pub undated: usize,
+}
+
+impl DateSourceTally {
+    /// Count how each planned move established its date.
+    #[must_use]
+    pub fn of(moves: &[PlannedMove]) -> Self {
+        let mut tally = Self::default();
+        for planned in moves {
+            match planned.date_source {
+                DateSource::Exif => tally.exif += 1,
+                DateSource::Filesystem => tally.filesystem += 1,
+                DateSource::Unreadable => tally.unreadable += 1,
+                DateSource::Unsupported => tally.unsupported += 1,
+                DateSource::None => tally.undated += 1,
+            }
+        }
+        tally
+    }
+
+    /// Files given a filesystem date, for any of the three reasons.
+    #[must_use]
+    pub fn from_filesystem(self) -> usize {
+        self.filesystem + self.unreadable + self.unsupported
+    }
+
+    /// Files given a date at all — the denominator the warning is a share of.
+    ///
+    /// Files with no date are excluded deliberately. They were not filed under a
+    /// timestamp anybody could mistrust; they went to `unsorted/`, which is the
+    /// run already saying so.
+    #[must_use]
+    pub fn dated(self) -> usize {
+        self.exif + self.from_filesystem()
+    }
+
+    /// Whether the filesystem share is above `warn_above`.
+    ///
+    /// Compared by cross-multiplication rather than by dividing first: at 3 files
+    /// in 10 an integer `300 / 10` is exact, but at 1 in 3 a percentage rounded
+    /// down to 33 would sit quietly under a threshold of 33 that the true share
+    /// exceeds.
+    #[must_use]
+    pub fn warrants_warning(self, warn_above: FallbackWarning) -> bool {
+        let dated = self.dated();
+        dated > 0 && self.from_filesystem() * 100 > usize::from(warn_above.0) * dated
+    }
+
+    /// The filesystem share as a whole percentage, for display only.
+    #[must_use]
+    fn percent(self) -> usize {
+        let dated = self.dated();
+        if dated == 0 {
+            return 0;
+        }
+        self.from_filesystem() * 100 / dated
+    }
+
+    /// Print one line per source, then the warning if it is warranted.
+    ///
+    /// Every line is printed even at zero. This block is the answer to "how much
+    /// of this library did you actually read?", and a zero is a real answer to
+    /// that — an absent line would leave a reader unsure whether the case did not
+    /// occur or was not looked for.
+    fn print(self, warn_above: FallbackWarning) {
+        println!("  Date from EXIF: {}", self.exif);
+        println!("  Date from filesystem: {}", self.filesystem);
+        // Counted apart from the line above rather than folded into it: all
+        // three dates come from the filesystem, but only these two are the tool
+        // admitting a gap, and a figure a person is meant to act on cannot be
+        // hidden inside a figure they are not.
+        println!(
+            "  Date from filesystem — metadata unreadable: {}",
+            self.unreadable
+        );
+        println!(
+            "  Date from filesystem — format not supported: {}",
+            self.unsupported
+        );
+        println!("  No date (unsorted): {}", self.undated);
+
+        if self.warrants_warning(warn_above) {
+            println!(
+                "\n  {FALLBACK_WARNING_PREFIX} {}% of dated files ({} of {}) took their date from \
+                 the filesystem rather than from the file's own metadata.",
+                self.percent(),
+                self.from_filesystem(),
+                self.dated()
+            );
+            println!("  {FALLBACK_WARNING_DETAIL}");
+        }
+    }
+}
+
+/// Opens the line warning that too much of a run was dated from the filesystem.
+///
+/// Exported so the integration suite asserts against the string the binary
+/// actually prints.
+pub const FALLBACK_WARNING_PREFIX: &str = "WARNING:";
+
+/// What that warning means, and what to do about it.
+pub const FALLBACK_WARNING_DETAIL: &str =
+    "A filesystem timestamp is when the file was last written, which on a library that has been \
+     copied between disks is the date of the copy — not of the photograph. Pass --require-exif to \
+     send those to unsorted/ instead of filing them under a date nobody recorded.";
 
 /// The timezone marker beside a planned move's date-source tag.
 ///
@@ -198,6 +319,12 @@ pub struct RunSummary {
     /// at a chunk prompt — see [`crate::organiser::MoveRun`].
     pub unprocessed: usize,
     pub errors: usize,
+    /// Where the dates behind the plan came from.
+    ///
+    /// Counted over the files this run *planned*, not the ones it managed to
+    /// move: it describes what was read out of the library, which is settled
+    /// before the first move and unaffected by an operator stopping half way.
+    pub dates: DateSourceTally,
 }
 
 /// Column width of the summary labels, so every figure lines up.
@@ -266,7 +393,11 @@ pub fn print_journal_location(journal: JournalStatus<'_>) {
 /// The journal line answers "how do I undo this?", which is a question every
 /// committing run owes an answer to — including the answer "you cannot". See
 /// [`JournalStatus`].
-pub fn print_summary(summary: &RunSummary, journal: JournalStatus<'_>) {
+pub fn print_summary(
+    summary: &RunSummary,
+    journal: JournalStatus<'_>,
+    warn_above: FallbackWarning,
+) {
     println!("\n═══ Processing Complete ═══");
     println!("  {:<LABEL_WIDTH$}{}", "Files scanned:", summary.scanned);
     println!(
@@ -299,6 +430,11 @@ pub fn print_summary(summary: &RunSummary, journal: JournalStatus<'_>) {
     if summary.errors > 0 {
         println!("  {:<LABEL_WIDTH$}{}", "Errors:", summary.errors);
     }
+    // Printed on the committing path as well as the preview, which is the point
+    // of it living here. A preview that reported "38 of 40 dates came from the
+    // filesystem" and a commit that reported nothing left the figure visible
+    // only to whoever thought to look before moving their library.
+    summary.dates.print(warn_above);
     print_journal_location(journal);
     println!("═══════════════════════════\n");
 }

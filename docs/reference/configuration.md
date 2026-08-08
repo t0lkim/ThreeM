@@ -62,6 +62,9 @@ Nesting in the **Key** column is the TOML table — `extensions.image` is writte
 | `duplicates_dir` | relative path | `"duplicates"` | — | `MMM_DUPLICATES_DIR` |
 | `unsorted_dir` | relative path | `"unsorted"` | — | `MMM_UNSORTED_DIR` |
 | `skip_patterns` | list of globs | `[]` | — | `MMM_SKIP_PATTERNS` |
+| `default_timezone` | fixed offset or IANA zone name | *none* — the machine's own timezone is used, and the run says so | `--timezone` | `MMM_DEFAULT_TIMEZONE` |
+| `require_exif` | boolean | `false` | `--require-exif[=BOOL]` | `MMM_REQUIRE_EXIF` |
+| `filesystem_date_warning_percent` | integer 0–100 | `20` | — | `MMM_FILESYSTEM_DATE_WARNING_PERCENT` |
 | `extensions.image` | list of strings | the 21 built-in image extensions | — | `MMM_EXTENSIONS_IMAGE` |
 | `extensions.video` | list of strings | the 11 built-in video extensions | — | `MMM_EXTENSIONS_VIDEO` |
 
@@ -76,6 +79,9 @@ In the environment, a list is comma-separated and surrounding spaces are trimmed
 - **`include_location = false`** drops the place name from every filename *and* skips the geocoding lookup, rather than performing it and discarding the result.
 - **`duplicates_dir`** and **`unsorted_dir`** are relative to the output tree and may be nested — `duplicates_dir = "_review/copies"`. Absolute paths and `..` are refused: either would file photographs outside the tree the run was pointed at.
 - **`skip_patterns`** excludes paths from the scan. A pattern with **no `/`** matches a path component's own name, so `"*.tmp"` skips those files anywhere and `".thumbnails"` skips that directory wherever it appears. A pattern **containing `/`** matches the path relative to the scan root, so `"raw/**"` skips one subtree rather than every `raw/` in the library. `*` stops at a separator, `**` crosses one, and a matching directory is pruned rather than walked. The run reports `N entries excluded by skip_patterns` so a pattern quietly swallowing a library is visible.
+- **`default_timezone`** decides which wall clock a photo with no recorded offset is read against — a fixed offset (`"+08:00"`, `"-05:30"`) or an IANA zone name (`"Asia/Singapore"`), refused if it is neither. A file that carries its own `OffsetTimeOriginal` tag is unaffected: the file's own record always wins. It does **not** change which day an EXIF-dated photograph is filed under — a wall clock is filed under exactly the digits the camera wrote, on any machine — but it does decide the recorded instant, and it does move filesystem-dated and UTC-stamped video files.
+- **`require_exif = true`** refuses to file anything under a date it did not record itself. A file dated from the filesystem goes to the unsorted directory **keeping its own filename**, unlike the undated files there, which are all `unknown.<ext>` — the point of the setting is that you would rather sort those by hand, and a directory of `unknown-1.cr2` would make that impossible. Settable in a file where `commit` is not, because it can only ever make a run more careful; `--require-exif=false` answers it from the command line.
+- **`filesystem_date_warning_percent`** is the share of *dated* files that may take their date from the filesystem before the run's summary says so out loud. Files with no date at all are not counted either way — they went to the unsorted directory, which is the run already saying so. `0` warns about every single fallback; `100` never warns. A value above 100 is refused rather than accepted as a threshold nothing can cross.
 - **`extensions.image` / `extensions.video`** decide what counts as media, compared case-insensitively. A list **replaces** the built-in one — `image = ["dng", "jpg"]` scans those two and nothing else — which is also how to make the tool stop picking up a format it currently does.
 
 ### What cannot be set here

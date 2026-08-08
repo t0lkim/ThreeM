@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, Utc};
-use nom_exif::{parse_exif, parse_metadata, EntryValue, Exif, ExifTag};
+use nom_exif::{parse_exif, parse_metadata, EntryValue, Exif, ExifIter, ExifTag};
 use tracing::{debug, warn};
 
 use crate::timezone::{attach_offset, TimezonePolicy, TimezoneSource};
@@ -39,21 +39,44 @@ impl FileMetadata {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Where a file's date came from — and, when it did not come from the file, why
+/// not.
+///
+/// Three of the five variants describe the same observable outcome: the file is
+/// filed under its filesystem timestamp. They land in the same directory and
+/// look identical in the output tree, which is exactly why they must not look
+/// identical in the report. "This photograph does not record when it was taken"
+/// is a fact about the photograph; "this tool cannot read the date this
+/// photograph records" is a limitation of the tool, and the person holding a
+/// library of camera RAW files is owed the difference. On a library that has
+/// been copied between disks a modification time and a shutter time are not
+/// close to the same number, so which one every date came from is the first
+/// thing they need to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DateSource {
+    /// The file's own metadata said when it was made.
     Exif,
-    Filesystem,
-    /// A filesystem date, because nothing here could read the file's container.
+    /// A filesystem date, because the file's metadata records no date.
     ///
-    /// Distinct from [`Self::Filesystem`], which means the container *was* read
-    /// and had no date in it. The two land in the same directory and look
-    /// identical in the output tree, which is exactly why they must not look
-    /// identical in the report: the first is a fact about the photograph and the
-    /// second is a limitation of this tool. Somebody organising a library of
-    /// camera RAW files deserves to be told that every date in it came from a
-    /// file's modification time rather than from the shutter, because on a
-    /// library that has been copied between disks those are not close to the
-    /// same number.
+    /// The honest case: a scan, a screenshot, an export that stripped its
+    /// metadata. Nothing is broken and nothing is missing from this tool.
+    Filesystem,
+    /// A filesystem date, because the date the file *does* record could not be
+    /// read.
+    ///
+    /// Either the metadata block itself would not parse, or the datetime entry
+    /// was present and its value was not a datetime. Both mean there is
+    /// something in the file that this tool failed to make use of, which is a
+    /// different thing to tell somebody than "your file has no date in it" — one
+    /// invites them to look at the file, the other to look at us.
+    ///
+    /// The distinction survives only because `nom-exif` still yields an entry
+    /// whose value failed to parse, with `has_value()` false; by the time the
+    /// iterator has been folded into an [`Exif`], a `DateTimeOriginal` of
+    /// nineteen nonsense characters and no `DateTimeOriginal` at all are the
+    /// same `None`. See [`date_entry_is_unreadable`].
+    Unreadable,
+    /// A filesystem date, because nothing here could read the file's container.
     ///
     /// Decided by asking the EXIF parser to identify the container — see
     /// [`fallback_source`] — rather than by matching the extension, so the
@@ -61,6 +84,58 @@ pub enum DateSource {
     /// has to remember to update.
     Unsupported,
     None,
+}
+
+impl DateSource {
+    /// Whether the date came from the file's own metadata.
+    ///
+    /// The question `--require-exif` asks, in one place, so that a variant added
+    /// later cannot answer it two different ways in two different modules.
+    #[must_use]
+    pub fn is_embedded(self) -> bool {
+        matches!(self, Self::Exif)
+    }
+
+    /// Whether the date came from the filesystem — for any of the three reasons.
+    ///
+    /// [`Self::None`] is not one of these: a file with no date at all was not
+    /// given a filesystem date, it was given no date, and counting it among the
+    /// fallbacks would inflate the figure the run warns on.
+    #[must_use]
+    pub fn is_filesystem(self) -> bool {
+        matches!(
+            self,
+            Self::Filesystem | Self::Unreadable | Self::Unsupported
+        )
+    }
+}
+
+/// Why a format-specific extraction produced no date.
+///
+/// Kept apart from [`DateSource`] because it is what the *extractor* knows,
+/// which is less than what the caller reports: an extractor that returned an
+/// error knows only that it failed, and whether that failure is
+/// [`DateSource::Unreadable`] or [`DateSource::Unsupported`] is a question about
+/// the container that [`fallback_source`] has to go and ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoDate {
+    /// The container was read, and it records no date.
+    Absent,
+    /// The container was read, it does record a date, and that date could not be
+    /// turned into one.
+    Unreadable,
+}
+
+/// What one extraction attempt established.
+///
+/// The undated arm carries its reason rather than an empty [`FileMetadata`],
+/// which is what the previous version returned and what made the reason
+/// impossible to keep: the caller discarded the whole struct and re-derived a
+/// single `Filesystem` from the path, so every way of failing arrived at the
+/// same word.
+enum Extracted {
+    Dated(FileMetadata),
+    Undated(NoDate),
 }
 
 /// What a file said about when it was made, before a policy is applied.
@@ -112,49 +187,64 @@ impl Reading {
 /// Returns an error only if the filesystem fallback itself fails — i.e. the
 /// file's own metadata cannot be read.
 pub fn extract_metadata(path: &Path, is_video: bool, tz: &TimezonePolicy) -> Result<FileMetadata> {
-    if is_video {
-        match extract_video_metadata(path, tz) {
-            Ok(meta) if meta.date.is_some() => return Ok(meta),
-            Ok(_) => debug!(path = %path.display(), "video metadata found but no date"),
-            Err(e) => {
-                debug!(path = %path.display(), error = %e, "video metadata extraction failed");
-            }
-        }
+    let attempt = if is_video {
+        extract_video_metadata(path, tz)
     } else {
-        match extract_image_metadata(path, tz) {
-            Ok(meta) if meta.date.is_some() => return Ok(meta),
-            Ok(_) => debug!(path = %path.display(), "EXIF found but no date"),
-            Err(e) => debug!(path = %path.display(), error = %e, "EXIF extraction failed"),
-        }
-    }
+        extract_image_metadata(path, tz)
+    };
 
-    extract_filesystem_metadata(path, tz, fallback_source(path))
+    // `None` here means the parser refused the file outright, which is the one
+    // outcome that does not say whether the container was ours to read.
+    let reason = match attempt {
+        Ok(Extracted::Dated(meta)) => return Ok(meta),
+        Ok(Extracted::Undated(reason)) => {
+            debug!(path = %path.display(), ?reason, "no usable date in the file's metadata");
+            Some(reason)
+        }
+        Err(e) => {
+            debug!(path = %path.display(), error = %e, "metadata extraction failed");
+            None
+        }
+    };
+
+    extract_filesystem_metadata(path, tz, fallback_source(path, reason))
 }
 
 /// Why a file is falling back to its filesystem timestamp.
 ///
-/// Asked only once the format-specific extraction has already come up empty, so
-/// the extra read costs nothing on the path that worked.
+/// An extraction that *returned* has already answered this: it parsed the
+/// container, so the container is one we read, and all that is left is whether
+/// the date inside it was absent or unusable. Only a parse failure leaves the
+/// question open, and only then is the file opened a second time.
 ///
-/// The question is put to the EXIF parser itself — "do you recognise this
+/// That question is put to the EXIF parser itself — "do you recognise this
 /// container?" — because that is the only source of an answer that stays true.
 /// A hard-coded list of unsupported extensions would be a second thing to
 /// maintain, and it would begin lying the day the parser gained a format.
-fn fallback_source(path: &Path) -> DateSource {
+fn fallback_source(path: &Path, reason: Option<NoDate>) -> DateSource {
+    match reason {
+        Some(NoDate::Absent) => return DateSource::Filesystem,
+        Some(NoDate::Unreadable) => return DateSource::Unreadable,
+        None => {}
+    }
+
     let Ok(file) = File::open(path) else {
-        // Unreadable is not unsupported, and this run is about to fail on the
-        // file anyway when it asks the filesystem for a timestamp.
+        // Unreadable-as-in-permissions is not unreadable-as-in-metadata, and
+        // this run is about to fail on the file anyway when it asks the
+        // filesystem for a timestamp.
         return DateSource::Filesystem;
     };
 
     match nom_exif::FileFormat::try_from_read(BufReader::new(file)) {
+        // A container we know, whose metadata would not parse. Something is in
+        // there; we could not use it.
         Ok(format) => {
             debug!(
                 path = %path.display(),
                 %format,
-                "container recognised but carried no usable date"
+                "container recognised but its metadata would not parse"
             );
-            DateSource::Filesystem
+            DateSource::Unreadable
         }
         Err(e) => {
             debug!(
@@ -178,7 +268,7 @@ fn dated(
     tz: &TimezonePolicy,
     latitude: Option<f64>,
     longitude: Option<f64>,
-) -> FileMetadata {
+) -> Extracted {
     let (date, timezone_source) = reading.resolve(tz);
     debug!(
         path = %path.display(),
@@ -187,16 +277,43 @@ fn dated(
         timezone = timezone_source.tag(),
         "resolved the timezone of a metadata date"
     );
-    FileMetadata {
+    Extracted::Dated(FileMetadata {
         date: Some(date),
         timezone_source: Some(timezone_source),
         latitude,
         longitude,
         date_source: DateSource::Exif,
-    }
+    })
 }
 
-fn extract_image_metadata(path: &Path, tz: &TimezonePolicy) -> Result<FileMetadata> {
+/// Whether the EXIF block holds a datetime entry whose value would not parse.
+///
+/// This is the only place the distinction exists. `nom-exif` drops the *value*
+/// of an entry it cannot decode but still yields the entry, with `has_value()`
+/// false — and [`Exif`], which is what the rest of this module reads through,
+/// keeps only the entries that have values. So after the fold, a
+/// `DateTimeOriginal` reading `NOT-A-DATE-AT-ALL!!` and a file with no
+/// `DateTimeOriginal` at all are the same `None`, and the run would tell a
+/// person with a corrupted camera card that their photographs simply have no
+/// dates in them.
+///
+/// Measured against the parser rather than assumed of it — the format-coverage
+/// suite pins both halves, so a `nom-exif` upgrade that started dropping the
+/// entry outright would fail a test rather than quietly collapse the two cases
+/// again.
+///
+/// The clone is shallow: `ExifIter` holds its buffer behind an `Arc` and this
+/// re-walks the IFD chain, so the cost is the entry list and not the file.
+fn date_entry_is_unreadable(iter: &ExifIter<'_>) -> bool {
+    iter.clone().any(|entry| {
+        matches!(
+            entry.tag(),
+            Some(ExifTag::DateTimeOriginal | ExifTag::CreateDate)
+        ) && !entry.has_value()
+    })
+}
+
+fn extract_image_metadata(path: &Path, tz: &TimezonePolicy) -> Result<Extracted> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let reader = BufReader::new(file);
 
@@ -204,8 +321,11 @@ fn extract_image_metadata(path: &Path, tz: &TimezonePolicy) -> Result<FileMetada
         parse_exif(reader, None).with_context(|| format!("parsing EXIF for {}", path.display()))?;
 
     let Some(iter) = iter else {
-        return Ok(FileMetadata::undated(DateSource::None));
+        return Ok(Extracted::Undated(NoDate::Absent));
     };
+
+    // Asked before the fold, because the fold is what destroys the answer.
+    let unreadable_date = date_entry_is_unreadable(&iter);
 
     // Collect into Exif struct for easy tag access
     let exif: Exif = iter.into();
@@ -235,27 +355,42 @@ fn extract_image_metadata(path: &Path, tz: &TimezonePolicy) -> Result<FileMetada
         .or_else(|| exif.get(ExifTag::OffsetTime))
         .and_then(entry_to_offset);
 
-    let Some(reading) = exif
+    // Any coordinates read above are dropped along with this arm. That is the
+    // behaviour as it stands, not a decision taken here: `latitude` and
+    // `longitude` were carried into an undated `FileMetadata` that the caller
+    // then discarded in favour of the filesystem timestamp, so a photograph with
+    // a location and no readable date has never kept its location. Making the
+    // loss visible is as far as this change goes — restoring it would move files
+    // to different names, which belongs to its own change and its own changelog
+    // entry.
+    let Some(naive) = exif
         .get(ExifTag::DateTimeOriginal)
         .or_else(|| exif.get(ExifTag::CreateDate))
         .and_then(entry_to_wall_clock)
-        .filter(|naive| spellable(naive.year()))
-        .map(|naive| match offset_tag {
-            Some(offset) => Reading::Zoned(attach_offset(naive, offset)),
-            None => Reading::WallClock(naive),
-        })
     else {
-        return Ok(FileMetadata {
-            latitude,
-            longitude,
-            ..FileMetadata::undated(DateSource::None)
-        });
+        return Ok(Extracted::Undated(if unreadable_date {
+            NoDate::Unreadable
+        } else {
+            NoDate::Absent
+        }));
+    };
+
+    // A date we read and cannot use is a date we could not read. The alternative
+    // reading — that a year-44 photograph "has no date" — would send somebody
+    // looking at their camera instead of at this line.
+    if !spellable(naive.year()) {
+        return Ok(Extracted::Undated(NoDate::Unreadable));
+    }
+
+    let reading = match offset_tag {
+        Some(offset) => Reading::Zoned(attach_offset(naive, offset)),
+        None => Reading::WallClock(naive),
     };
 
     Ok(dated(path, reading, tz, latitude, longitude))
 }
 
-fn extract_video_metadata(path: &Path, tz: &TimezonePolicy) -> Result<FileMetadata> {
+fn extract_video_metadata(path: &Path, tz: &TimezonePolicy) -> Result<Extracted> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let reader = BufReader::new(file);
 
@@ -271,15 +406,20 @@ fn extract_video_metadata(path: &Path, tz: &TimezonePolicy) -> Result<FileMetada
     let mut container: Option<Reading> = None;
     let mut latitude: Option<f64> = None;
     let mut longitude: Option<f64> = None;
+    // Whether the container said anything about a date at all, which is a
+    // different question to whether we understood what it said.
+    let mut saw_a_date_key = false;
 
     for (key, value) in &entries {
         match key.as_str() {
             "com.apple.quicktime.creationdate" => {
+                saw_a_date_key = true;
                 if recorded.is_none() {
                     recorded = entry_to_reading(value);
                 }
             }
             "CreateDate" | "DateTimeOriginal" => {
+                saw_a_date_key = true;
                 if container.is_none() {
                     container = entry_to_reading(value);
                 }
@@ -296,16 +436,18 @@ fn extract_video_metadata(path: &Path, tz: &TimezonePolicy) -> Result<FileMetada
         }
     }
 
-    let Some(reading) = recorded
-        .or(container)
-        .filter(|reading| spellable(reading_year(*reading)))
-    else {
-        return Ok(FileMetadata {
-            latitude,
-            longitude,
-            ..FileMetadata::undated(DateSource::None)
-        });
+    // As on the image path, coordinates go with this arm; see the note there.
+    let Some(reading) = recorded.or(container) else {
+        return Ok(Extracted::Undated(if saw_a_date_key {
+            NoDate::Unreadable
+        } else {
+            NoDate::Absent
+        }));
     };
+
+    if !spellable(reading_year(reading)) {
+        return Ok(Extracted::Undated(NoDate::Unreadable));
+    }
 
     Ok(dated(path, reading, tz, latitude, longitude))
 }

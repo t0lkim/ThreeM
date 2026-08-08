@@ -166,6 +166,13 @@ impl Cli {
             (organise.chunk_size.is_some(), "--chunk-size"),
             (organise.no_prompt.is_some(), "--no-prompt"),
             (organise.journal_dir.is_some(), "--journal-dir"),
+            // `--timezone` was missing from this list until `--require-exif`
+            // was added beside it. The list is meant to be every settings flag,
+            // and a flag left out of it is one that can be typed before a
+            // subcommand and silently do nothing — which is the exact failure
+            // the whole function exists to refuse.
+            (organise.timezone.is_some(), "--timezone"),
+            (organise.require_exif.is_some(), "--require-exif"),
         ];
         // Flags that are not settings, and that no subcommand can act on.
         let switches = [
@@ -534,6 +541,31 @@ pub struct Config {
     #[arg(long, value_name = "TZ", allow_hyphen_values = true)]
     pub timezone: Option<String>,
 
+    /// Refuse to file any file under a date it did not record itself
+    ///
+    /// A file whose date came from the filesystem — because it holds no
+    /// metadata, because its metadata could not be read, or because its format
+    /// is one mmm cannot read — goes to `unsorted/` instead of being filed under
+    /// a date nobody recorded. It keeps its own filename there, which the
+    /// undated files in `unsorted/` do not: the whole point of the flag is that
+    /// you would rather sort those by hand, and a directory of `unknown-1.cr2`
+    /// would make that impossible.
+    ///
+    /// The posture for a library that has been copied between disks, where a
+    /// modification time is the date of the copy.
+    ///
+    /// `--require-exif=false` exists for the same reason `--no-prompt=false`
+    /// does: a `require_exif = true` in a config file has to be answerable from
+    /// the command line, or it is not a precedence rule.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pub require_exif: Option<bool>,
+
     /// UNSAFE: do not journal this run — it cannot be undone
     ///
     /// Without a journal there is no record of where a file came from, so `mmm
@@ -578,6 +610,7 @@ impl Config {
             no_prompt: self.no_prompt,
             journal_dir: self.journal_dir.clone(),
             default_timezone: self.timezone.clone(),
+            require_exif: self.require_exif,
             ..PartialSettings::default()
         }
     }

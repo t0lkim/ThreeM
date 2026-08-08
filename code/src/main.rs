@@ -389,6 +389,8 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     let layout = settings.layout()?;
     let filter = settings.scan_filter()?;
     let timezone = settings.timezone_policy()?;
+    let date_policy = settings.date_policy();
+    let fallback_warning = settings.fallback_warning();
 
     // Say which posture we are in before doing any work, not after — a user
     // who expected a preview must not learn otherwise from the aftermath.
@@ -484,6 +486,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
             &geo,
             &layout,
             &timezone,
+            date_policy,
             unique.known_hash.clone(),
         ) {
             Ok(planned) => planned_moves.push(planned),
@@ -507,6 +510,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
         hash_skipped: dedup_result.skipped,
         unprocessed: 0,
         errors: plan_errors,
+        dates: reporter::DateSourceTally::of(&planned_moves),
     };
 
     // === DRY RUN (the default): stop here, before anything is moved ===
@@ -514,7 +518,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
         reporter::print_dry_run(&planned_moves);
         // No journal, and none reported: a preview moves nothing, so there is
         // nothing to undo.
-        reporter::print_summary(&summary, JournalStatus::NotNeeded);
+        reporter::print_summary(&summary, JournalStatus::NotNeeded, fallback_warning);
         println!("{}", reporter::DRY_RUN_BANNER);
         return Ok(());
     }
@@ -613,6 +617,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
             ..summary
         },
         journal_status(),
+        fallback_warning,
     );
 
     // A run that stopped because it could not record itself is a failed run,
