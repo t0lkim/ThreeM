@@ -1,10 +1,12 @@
 # mmm User Guide
 
+Every other document in the repository is indexed at [`docs/index.md`](index.md).
+
 ## Overview
 
 `mmm` scans one or more directories for images and videos, detects duplicates, renames files by date and location, and sorts them into one directory per day (`YYYY-MM-DD/`). Both the directory layout and the filenames are configurable — see [Configuration](#configuration). A companion tool, `mmm-dedup-verifier`, independently verifies that flagged duplicates are genuine before you delete them.
 
-Both binaries are installed at `~/bin/`.
+There is no packaged build yet. Both binaries are produced by `cargo build --release` from the `code/` directory, landing at `code/target/release/mmm` and `code/target/release/mmm-dedup-verifier`; `cargo install --path code` puts both on your `PATH` in `~/.cargo/bin`. Every command below assumes they are on it.
 
 > **`mmm` is safe by default.** Every run is a preview until you pass `--commit`. Without it, `mmm` scans, plans, prints and exits without touching a single file. Note that when no `--output` is given, output defaults to the *first input directory* — so `mmm ~/Photos --commit` reorganises `~/Photos` in place.
 
@@ -642,27 +644,31 @@ mmm-dedup-verifier [OPTIONS] <DUPLICATES_DIR>
 
 | Flag | Description |
 |---|---|
-| `--check-originals` | Also verify that the original files still exist at their recorded paths |
+| `--check-originals` | Exit non-zero when an original is missing from its recorded path. A missing original is *always* detected and reported as `[MISSING]`; this flag decides whether it fails the run |
 | `-v, --verbose` | Increase verbosity |
 
 ### What It Does
 
 1. Reads each numbered group directory (`000/`, `001/`, ...).
 2. Parses the `manifest.txt` to find the recorded original file path.
-3. Hashes the original file using BLAKE3 **keyed mode** (a deliberately different algorithm from the main binary — see Technical Documentation).
+3. Hashes the original file using BLAKE3 **keyed mode** (a deliberately different hash from the main binary's unkeyed cascade — see Technical Documentation).
 4. Hashes every duplicate file in the group directory using the same keyed mode.
 5. Compares hashes. If all duplicates match the original, the group is `[OK]`. If any differ, it is `[MISMATCH]`. If the original file no longer exists, it is `[MISSING]`.
-6. Prints a summary and exits with code 1 if any mismatches were found.
+6. Prints a summary and exits with code 1 if any mismatches were found — or, with `--check-originals`, if any original was missing.
+
+A group directory with no `manifest.txt` is warned about and skipped rather than counted either way.
+
+> **Before v0.2.0 this tool called itself SHA-256** — in its `--help`, and in two lines of its output — while it had always computed keyed BLAKE3. Only the labels were wrong; no verdict it printed was affected.
 
 ### Example Output
 
 ```
-Verifying 3 duplicate groups using SHA-256...
+Verifying 3 duplicate groups using keyed BLAKE3...
 
-═══ Verification Results (SHA-256) ═══
+═══ Verification Results (keyed BLAKE3) ═══
 
-  [OK] Group 000: ~/Organised/2024/01/15/2024-01-15-143022.jpg (2 duplicates, hash: 7a3b1c4d5e6f7890...)
-  [OK] Group 001: ~/Organised/2024/03/20/2024-03-20-101500.mp4 (1 duplicates, hash: abc123def456...)
+  [OK] Group 000: ~/Organised/2024-01-15/2024-01-15-143022.jpg (2 duplicates, hash: 7a3b1c4d5e6f7890...)
+  [OK] Group 001: ~/Organised/2024-03-20/2024-03-20-101500.mp4 (1 duplicates, hash: abc123def456...)
   [MISMATCH] Group 002: ~/Organised/unsorted/unknown.bmp (1 duplicates, hash: 999888777666...)
     MISMATCH: ~/Organised/duplicates/002/unknown.bmp (hash: 111222333444...)
 

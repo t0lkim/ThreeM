@@ -1,5 +1,7 @@
 # mmm Technical Documentation
 
+Every other document in the repository is indexed at [`docs/index.md`](index.md).
+
 ## Architecture
 
 The system uses a **two-pass architecture**:
@@ -11,12 +13,16 @@ The system uses a **two-pass architecture**:
 ┌─────────────────────────────────────────────────────────┐
 │                    Phase A: SCAN                        │
 │                                                         │
+│  0. settings.rs   → Resolve the four config layers       │
 │  1. scanner.rs    → Walk dirs, filter by extension      │
-│  2. hasher.rs     → Three-phase dedup cascade           │
-│  3. metadata.rs   → EXIF/video metadata extraction      │
-│  4. geocoder.rs   → Reverse geocode GPS coordinates     │
-│  5. organiser.rs  → Plan target paths for each file     │
-│  6. reporter.rs   → Print the plan (if no --commit)     │
+│  2. sidecar.rs    → Pair .xmp/.aae/.thm with parents    │
+│  3. hasher.rs     → Three-phase dedup cascade           │
+│  4. metadata.rs   → EXIF/video metadata extraction      │
+│     xmp.rs        → …then a sidecar's date, if needed   │
+│     timezone.rs   → Resolve the wall clock to read it   │
+│  5. geocoder.rs   → Reverse geocode GPS coordinates     │
+│  6. organiser.rs  → Plan target paths for each file     │
+│  7. reporter.rs   → Print the plan (if no --commit)     │
 └─────────────────────────────────────────────────────────┘
                           │
                  (without --commit, stops here)
@@ -25,11 +31,16 @@ The system uses a **two-pass architecture**:
 ┌─────────────────────────────────────────────────────────┐
 │                   Phase B: PROCESS                      │
 │                                                         │
-│  7. organiser.rs  → Move duplicates to duplicates/NNN/  │
-│  8. organiser.rs  → Execute planned moves (chunked)     │
-│  9. reporter.rs   → Print summary                       │
+│  8. journal.rs    → Open the journal, before any move   │
+│  9. organiser.rs  → Move duplicates to duplicates/NNN/  │
+│ 10. organiser.rs  → Execute planned moves (chunked)     │
+│ 11. reporter.rs   → Print summary                       │
 └─────────────────────────────────────────────────────────┘
 ```
+
+`mmm undo` is the same shape run backwards: `journal.rs` reads a run back,
+`undo.rs` verifies each destination is still the file the run put there, and the
+restores are previewed unless `--commit` is given.
 
 ---
 
@@ -37,17 +48,25 @@ The system uses a **two-pass architecture**:
 
 | Module | Responsibility |
 |---|---|
-| `config.rs` | CLI argument parsing via clap derive API |
-| `scanner.rs` | Recursive directory traversal, extension filtering, skip-and-count on unreadable entries |
+| `config.rs` | CLI argument parsing via clap derive API; the subcommand layout, and which flags belong to which command |
+| `settings.rs` | The four configuration layers and their precedence, TOML and `MMM_` parsing, validation |
+| `settings_report.rs` | `mmm config show` / `path` / `init` / `validate` — what each layer decided, and where it was found |
+| `scanner.rs` | Recursive directory traversal, extension filtering, `skip_patterns`, skip-and-count on unreadable entries |
+| `sidecar.rs` | Pairing `.xmp`/`.aae`/`.thm` files with their parent under either naming convention; orphan and ambiguity reporting |
+| `xmp.rs` | Reading dates out of an XMP sidecar (RDF/XML) with a `quick-xml` pull parser |
 | `hasher.rs` | Three-phase dedup cascade, BLAKE3 hashing, the bounded `HashPool`, skip-and-count on unhashable files |
-| `metadata.rs` | EXIF extraction (images), container metadata (video), filesystem fallback |
-| `geocoder.rs` | Offline reverse geocoding via GeoNames k-d tree |
-| `naming.rs` | How names are spelled: filename sanitising, the four-digit year range |
-| `organiser.rs` | Target path computation, atomic file moves, duplicate movement, chunked execution |
+| `metadata.rs` | EXIF extraction (images), container metadata (video), filesystem fallback, and the `DateSource` that says which applied |
+| `timezone.rs` | Which wall clock a timestamp is read against, and the `[tz:…]` provenance tag |
+| `geocoder.rs` | Offline reverse geocoding via GeoNames k-d tree, with ISO 6709 bounds checking |
+| `naming.rs` | How names are spelled: filename sanitising, the four-digit year range, format-string tokens |
+| `organiser.rs` | Target path computation, non-clobbering file moves, duplicate movement and manifests, chunked execution |
+| `journal.rs` | The write-ahead run journal: one line per intent, one per outcome, flushed before the file moves |
+| `undo.rs` | Replaying a journal backwards, with per-file verification before anything is moved |
 | `reporter.rs` | Dry-run output, duplicate listing, summary reports, chunk prompts |
+| `fuzz.rs` | The entry points `code/fuzz/` drives, gathered in one documented module so the parsers stay private |
 | `error.rs` | Typed error definitions (thiserror) |
 | `main.rs` | Orchestration, building the hashing pool, progress bars, terminal prompting via `ChunkController` |
-| `bin/dedup_verifier.rs` | Independent verification binary |
+| `bin/mmm_dedup_verifier.rs` | Independent verification binary |
 
 ---
 
@@ -238,7 +257,7 @@ The two binaries use **deliberately different hashing approaches** so that a bug
 |---|---|---|
 | **Purpose** | Detect duplicates, organise files | Verify that flagged duplicates are genuine |
 | **Hash algorithm** | BLAKE3 standard mode (unkeyed) | BLAKE3 keyed mode |
-| **Hash key** | None | `mmm-dedup-verifier-independent-key!!` (32-byte fixed key) |
+| **Hash key** | None | `dedup-verifier-independent-key!!` (32-byte fixed key) |
 | **Hashing strategy** | Three-phase cascade (size → partial → full) | Always full-file hash, no cascade |
 | **Read buffer size** | 128KB | 256KB |
 | **Partial hashing** | Yes (64KB head + 64KB tail in Phase 2) | No — always hashes the entire file |
@@ -255,6 +274,14 @@ Even though both binaries use the BLAKE3 crate, they produce **different hash va
 2. **No shortcut path.** The main binary's three-phase cascade might classify two files as duplicates after only reading 128KB of each (Phase 2). The verifier always reads the entire file. If the cascade's partial hash produced a false match (two files identical in the first and last 64KB but different in the middle), the verifier would catch it.
 
 3. **Different buffer sizes.** The main binary reads in 128KB chunks; the verifier reads in 256KB chunks. While this doesn't affect the final hash value (BLAKE3 is streaming and chunk-size-independent), it means the two binaries exercise different I/O paths.
+
+**The verifier called itself SHA-256 until v0.2.0** — in its `--help` text, its
+module documentation and three lines of its output — while the code had always
+been keyed BLAKE3. Only the labels were wrong; no hash value changed, and no
+verdict a previous run printed was affected. It is corrected here because the
+entire argument for running the verifier is that it does not share the main
+binary's failure modes, and that argument cannot be audited against a label that
+names the wrong algorithm.
 
 ### What the Verifier Proves
 
@@ -278,7 +305,7 @@ Each group directory contains a `manifest.txt`:
 # Duplicate group 000
 # BLAKE3 hash: 7a3b1c4d5e6f7890abcdef1234567890abcdef1234567890abcdef1234567890
 # File size: 4521984 bytes
-# Original kept at: ~/Organised/2024/01/15/2024-01-15-143022.jpg
+# Original kept at: ~/Organised/2024-01-15/2024-01-15-143022.jpg
 # Duplicates intended for this directory: 2
 #
 # The paths below are written before the first move, so an
@@ -309,18 +336,39 @@ If the manifest itself becomes unwritable mid-group (a full disk), the remaining
 
 ```
 Image files:
-  1. EXIF metadata via nom-exif (DateTimeOriginal → CreateDate)
-  2. Filesystem creation date (macOS btime via .created())
-  3. Filesystem modification date (.modified())
-  4. No date → placed in unsorted/
+  1. EXIF metadata via nom-exif (DateTimeOriginal → CreateDate)   [EXIF]
+  2. An .xmp sidecar beside the file, if one is paired with it    [SIDECAR]
+     (exif:DateTimeOriginal → photoshop:DateCreated → xmp:CreateDate)
+  3. Filesystem creation date (macOS btime via .created())        [FS…]
+  4. Filesystem modification date (.modified())                   [FS…]
+  5. No date → placed in unsorted/                                [NO DATE]
 
-Video files (MOV/MP4/3GP/WebM/MKV):
-  1. Container metadata via nom-exif parse_metadata()
+Video files:
+  1. Container metadata via nom-exif parse_metadata()             [EXIF]
      (CreateDate, DateTimeOriginal, com.apple.quicktime.creationdate)
-  2. Filesystem creation date
-  3. Filesystem modification date
-  4. No date → placed in unsorted/
+  2. An .xmp sidecar, as above                                    [SIDECAR]
+  3. Filesystem creation date                                     [FS…]
+  4. Filesystem modification date                                 [FS…]
+  5. No date → placed in unsorted/                                [NO DATE]
 ```
+
+**Only four container families yield step 1** — JPEG, the HEIF family
+(HEIC/HEIF/AVIF), QuickTime and MP4. Every other accepted extension, including
+every TIFF-based RAW, reaches step 2 or step 3 whatever its extension suggests.
+Which is which, and which are verified by fixture rather than assumed, is
+[`docs/reference/format-support.md`](reference/format-support.md).
+
+The three filesystem cases are **not** reported as one. `DateSource`
+distinguishes a file that records no date (`[FS]`), one whose date is there and
+will not parse (`[FS: UNREADABLE]`), and one whose container is not readable at
+all (`[FS: UNSUPPORTED]`) — decided by asking the parser to identify the
+container, not by matching the extension. `--require-exif` sends all three to
+`unsorted/`, under their own filenames, rather than filing them under a date
+nobody recorded.
+
+Which wall clock the resulting timestamp is read against is a separate question,
+answered by `timezone.rs` and tagged `[tz:…]` per file — see
+[ADR-006](decisions/adr-006-timezone-handling.md).
 
 ### GPS and Location
 
@@ -348,11 +396,13 @@ The metadata module handles multiple date formats:
 
 ## Path Derivation
 
-The target path is `<output>/YYYY-MM-DD/YYYY-MM-DD-HHMMSS[-location].ext`, and three invariants hold over it for *any* input, not merely for the inputs the CLI happens to produce:
+The target path is `<output>/YYYY-MM-DD/YYYY-MM-DD-HHMMSS[-location].ext` **by default**. Both halves are configurable — `date_directory_format` and `filename_format` — so `build_target_path` takes a `Layout` and the invariants below are stated over every format the loader accepts, not only over the shipped one. `unsorted_dir` and `duplicates_dir` are configurable too.
+
+Three invariants hold over the result for *any* input, not merely for the inputs the CLI happens to produce:
 
 | Invariant | Why it is not obvious |
 |---|---|
-| The derived directory is either four-two-two ASCII digits or exactly `unsorted` | The year came from `{}`, not `{:04}`, so years under 1000 produced `44/03/15` and negative years `-44/03/15`. |
+| Under the default layout the derived directory is four-two-two ASCII digits, or exactly the configured `unsorted` directory | The year came from `{}`, not `{:04}`, so years under 1000 produced `44/03/15` and negative years `-44/03/15`. "Four ASCII digits" is asserted as such: `٢٠٢٤` is four characters `char::is_numeric` calls digits and that no `YYYY` was meant to admit. |
 | The derived filename is a single ordinary path component — no `/`, no `\`, no `\0`, no leading `.` | The location suffix was sanitised; the extension was pasted in verbatim. |
 | The destination is strictly inside the output directory | Follows from the two above. `build_target_path` is public and its extension argument is arbitrary text: `"../../etc/passwd"` used to land the file outside the output tree entirely. |
 
@@ -366,24 +416,29 @@ These are asserted as property tests in `code/tests/path_properties.rs` rather t
 
 ### Same-Volume Moves
 
-Uses `std::fs::rename()`, which is an atomic operation on POSIX systems. The file's data is never copied — only the directory entry is updated. This is O(1) regardless of file size.
+`link(src, dst)` followed by `unlink(src)` — **not** `std::fs::rename()`. Rename replaces an occupied destination silently and unconditionally, and the stable `std` API has no flag to ask it not to; `link(2)` fails with `EEXIST` if anything at all occupies `dst`, including a dangling symlink, which is precisely the case `Path::exists()` gets wrong. The file's data is never copied — only directory entries are written — so this is O(1) regardless of file size.
+
+It is not atomic the way rename is: there is a window in which both names refer to the file. The window contains no state in which data is missing, and if the `unlink` fails the link is removed again rather than leaving the run with two names for one file — which the dedup pass would later report as a duplicate. The reasoning is [ADR-003](decisions/adr-003-atomic-move-semantics.md).
 
 ### Cross-Volume Moves
 
-When `rename()` fails (different filesystems), the following sequence is used:
+When the link cannot be made because the two paths are on different filesystems — or the filesystem does not support hard links at all — the following sequence is used:
 
 ```
-1. Copy source → temp file (in target directory, same volume as destination)
-2. Verify: compare temp file size against source file size
-3. Rename temp → final destination (atomic, same volume)
+1. Copy source → temp file (in target directory, same volume as destination),
+   hashing the bytes with BLAKE3 on the way through
+2. Verify: hash the file that landed, compare digests — content, not length
+3. Promote temp → final destination (link, same volume, still non-clobbering)
 4. Delete source file
 ```
 
-The temp file is named `.tmp-{unix_timestamp_millis}` and is created in the target directory to ensure the final rename is atomic (same filesystem). The source is only deleted after both the copy and verification succeed. If verification fails, the temp file is deleted and the operation is reported as an error — the source file is untouched.
+The temp file is named `.tmp-{unix_timestamp_millis}-{process_sequence}` and is created in the target directory so the promotion at the end is a link rather than a second copy. The millisecond alone is not unique — a run moving small files clears several per millisecond — and two moves sharing a temp name would have one overwrite the other's copy.
+
+**Verification is by content, and that is the point.** Comparing `metadata().len()` was the earlier behaviour and is the defect this replaces: a copy truncated and padded, a copy off a failing drive, or a copy through a filesystem that silently substituted a block all have the right length and the wrong bytes, and all passed a size check on the way to deleting the original. If the digests differ, the temp file is discarded and the operation is reported as an error — the source file is untouched. Every failure path here leaves the source where it was.
 
 ### Collision Resolution
 
-If the target filename already exists, a numeric suffix is appended:
+If the target filename is already taken, a numeric suffix is appended:
 
 ```
 2024-01-15-143022.jpg       (original)
@@ -392,7 +447,9 @@ If the target filename already exists, a numeric suffix is appended:
 ...
 ```
 
-The resolver checks existence up to 10,000 suffixes, then falls back to a millisecond timestamp suffix.
+`collision_candidate` is a pure function of the path — it asks the filesystem nothing. The previous version called `Path::exists()` and handed its answer to `fs::rename`, which is wrong twice over: the answer is stale the instant it returns, and `exists()` follows symlinks, so a dangling link reads as "nothing here" while the directory entry is very much there. The move itself is now the only authority on whether a candidate is free, and it answers by failing rather than by overwriting.
+
+The walk stops after `MAX_COLLISION_ATTEMPTS` (10,000) candidates and the move is **reported as an error**. There is no timestamp-suffix fallback: the alternative to a bounded search is an unbounded one, and no path in this module ends in "overwrite it anyway".
 
 ---
 
@@ -407,13 +464,25 @@ The resolver checks existence up to 10,000 suffixes, then falls back to a millis
 | `nom-exif` | 1.5 | EXIF metadata (images) and container metadata (video) |
 | `reverse_geocoder` | 4 | Offline GPS reverse geocoding (GeoNames k-d tree) |
 | `chrono` | 0.4 | Date/time parsing and formatting |
+| `chrono-tz` | 0.10 | IANA zone names for `--timezone` / `default_timezone`; default features off — the tz database, not the build-time regeneration machinery |
+| `quick-xml` | 0.41 | XMP sidecars, which are RDF/XML. A pull parser rather than an RDF stack: three date properties out of one description |
+| `toml` | 1.1 | Config file parsing |
+| `serde`, `serde_json` | 1 | Config deserialisation; the journal's JSONL records |
+| `directories` | 6 | Where the per-user config lives on each platform |
+| `globset` | 0.4 | `skip_patterns` matching, including `**` and character classes |
 | `indicatif` | 0.17 | Progress bars and spinners |
 | `anyhow` | 1 | Error handling for binary crate |
 | `thiserror` | 2 | Typed error definitions |
 | `tracing` | 0.1 | Structured logging |
 | `tracing-subscriber` | 0.3 | Log formatting and filtering |
+| `assert_cmd`, `predicates` | 2, 3 | (dev) Driving the real binaries in the integration suites |
+| `proptest` | 1 | (dev) Property tests for path derivation — `code/tests/path_properties.rs` |
 | `tempfile` | 3 | (dev) Temporary directories for tests |
 | `criterion` | 0.8 | (dev) Throughput benchmarks for the dedup cascade — `code/benches/hashing.rs` |
+
+`walkdir` is a normal dependency rather than a dev-dependency because the test
+helpers need it too, and Cargo makes normal dependencies available to test
+targets without a second entry.
 
 ---
 
@@ -423,19 +492,22 @@ The resolver checks existence up to 10,000 suffixes, then falls back to a millis
 |---|---|---|
 | `aarch64-apple-darwin` | Apple Silicon (M1/M2/M3/M4) | Primary development and runtime |
 | `x86_64-apple-darwin` | Intel Mac | Legacy hardware support |
+| `x86_64-unknown-linux-gnu` | Linux | CI runs the full gate here on every push, alongside macOS |
 
-Build commands:
+Every cargo command below is run from `code/`, which is the crate root — the
+repository root holds no `Cargo.toml`.
 
 ```bash
 # Debug (development)
 cargo build
 
-# Release (deployment) — both architectures
+# Release (deployment)
+cargo build --release
 cargo build --target aarch64-apple-darwin --release
 cargo build --target x86_64-apple-darwin --release
 
 # Run tests
-cargo test
+cargo test --all-targets
 
 # Benchmark the dedup cascade (~109 s; see docs/research/hashing-baseline.md)
 cargo bench --bench hashing
@@ -443,8 +515,9 @@ cargo bench --bench hashing
 # Compile and run every benchmark once, without sampling — for CI
 cargo bench -- --test
 
-# Lint
-cargo clippy -- -W clippy::all
+# Lint — the gate CI enforces. `-D warnings` is what makes the pedantic
+# group and the `unwrap_used`/`expect_used` denials in Cargo.toml binding
+cargo clippy --all-targets -- -D warnings
 
 # Format check
 cargo fmt --check

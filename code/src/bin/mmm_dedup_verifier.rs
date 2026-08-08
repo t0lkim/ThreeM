@@ -1,9 +1,18 @@
-//! dedup-verifier: Independent duplicate verification using SHA-256
+//! `mmm-dedup-verifier`: independent duplicate verification using keyed BLAKE3.
 //!
 //! Runs against the duplicates/ directory created by mmm.
-//! Uses SHA-256 (not BLAKE3) to provide an independent hash verification
-//! that the files in each numbered group are truly duplicates of the
-//! original file referenced in the manifest.
+//! Uses BLAKE3 in **keyed** mode, always over the whole file, to verify
+//! independently of the main binary's unkeyed three-phase cascade that the
+//! files in each numbered group are truly duplicates of the original file
+//! referenced in the manifest. See [`verification_hash`] for what "independent"
+//! buys.
+//!
+//! Every string here said SHA-256 until v0.2.0, in the module docs, the `--help`
+//! text and three lines of output, while [`verification_hash`] had always been
+//! keyed BLAKE3. A verification tool that names the wrong algorithm is worse
+//! than one that names none: the whole reason to run it is that it does not
+//! share the main binary's failure modes, and that claim is unauditable if the
+//! label is wrong.
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
@@ -16,8 +25,9 @@ use indicatif::ProgressBar;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "dedup-verifier",
-    about = "Verify duplicate files using SHA-256 (independent of BLAKE3 used by mmm)",
+    name = "mmm-dedup-verifier",
+    about = "Verify duplicate files using keyed BLAKE3 (independent of the unkeyed cascade mmm \
+             uses)",
     version
 )]
 struct Args {
@@ -99,7 +109,7 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "Verifying {} duplicate groups using SHA-256...\n",
+        "Verifying {} duplicate groups using keyed BLAKE3...\n",
         groups.len()
     );
 
@@ -179,7 +189,7 @@ fn main() -> Result<()> {
     pb.finish_with_message("verification complete");
 
     // Print results
-    println!("\n═══ Verification Results (SHA-256) ═══\n");
+    println!("\n═══ Verification Results (keyed BLAKE3) ═══\n");
 
     for result in &results {
         let icon = match result.verdict {
