@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use crate::settings::{LoadOptions, PartialSettings, Settings};
+use crate::settings_report::InitTarget;
 use crate::METADATA_DIR_NAME;
 
 /// The journal directory, below [`METADATA_DIR_NAME`] in the output tree.
@@ -25,12 +26,24 @@ pub fn journal_dir_for(output_dir: &Path) -> PathBuf {
 /// invocation in every script the day it grows an `undo` has not made anyone
 /// safer. So [`Config`] is flattened in as well as being the payload of
 /// `organise`, with `subcommand_negates_reqs` so `mmm undo` is not refused for
-/// naming no directories, and `args_conflicts_with_subcommands` so
-/// `mmm ~/Photos undo` is an error rather than a guess.
+/// naming no directories.
 ///
-/// The one cost is a directory literally named `undo` or `journal`:
+/// The one cost is a directory literally named `undo`, `journal` or `config`:
 /// `mmm undo` reads as the subcommand. `mmm organise undo` says the other
 /// thing, which is why `organise` exists explicitly at all.
+///
+/// # Why there is no `args_conflicts_with_subcommands`
+///
+/// It was here, and it made every *global* flag stop the subcommand being seen:
+/// `mmm --config x.toml undo` parsed as an organise run over a directory called
+/// `undo`, and `mmm -v undo ~/Photos --commit` as an organise run over
+/// `~/Photos` — which would have moved the library of somebody who asked to put
+/// it back. clap conflicts the top-level args with the subcommands as one group,
+/// and a global belongs to that group like any other.
+///
+/// What it bought was a refusal for organise flags typed before a subcommand.
+/// [`Cli::validate_placement`] does that instead, and does it by naming the flag
+/// rather than by silently reinterpreting the command.
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "mmm",
@@ -55,7 +68,6 @@ pub fn journal_dir_for(output_dir: &Path) -> PathBuf {
                   <output>/.mmm/journal/ before it does it, so the run can be reversed with \
                   `mmm undo`. The path is printed in the run summary.",
     version,
-    args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
 pub struct Cli {
@@ -115,6 +127,96 @@ impl Cli {
         LoadOptions::from_process(self.config.clone(), self.no_config)
     }
 
+    /// Refuse organise flags typed before a subcommand that cannot use them.
+    ///
+    /// `mmm --commit undo ~/Photos` reads naturally and means nothing: the
+    /// `--commit` lands on the flattened organise arguments, which a resolved
+    /// `undo` never looks at, so the undo would preview and the operator would
+    /// be told their library was restored by a run that moved nothing.
+    ///
+    /// Refused rather than quietly honoured, because "honour it" would mean
+    /// deciding that a flag typed in one command's position belongs to another,
+    /// and that guess is exactly what the subcommand layout exists to avoid.
+    /// The same reasoning as `deny_unknown_fields` one layer down: a flag that
+    /// silently does nothing is indistinguishable from a flag that is broken.
+    ///
+    /// `--dry-run` is exempt. It is a no-op wherever it appears, so ignoring it
+    /// is not a lie, and refusing it would break the old scripts it exists for.
+    ///
+    /// The one subcommand that *can* use an organise flag is `config`:
+    /// `mmm --chunk-size 7 config show` is the question "what would a run with
+    /// this flag resolve to?", and answering it by naming the command line as
+    /// the deciding layer is the entire point of `config show`. The flags that
+    /// are not settings — `--commit` and the two that go with it — are refused
+    /// there as well, because `config` cannot act on them either.
+    ///
+    /// # Errors
+    ///
+    /// A message naming every misplaced flag and where it belongs.
+    pub fn validate_placement(&self) -> Result<(), String> {
+        let Some(command) = &self.command else {
+            return Ok(());
+        };
+
+        let organise = &self.organise;
+        // Flags that are settings. `config` reports them; nothing else can act
+        // on them, so for every other subcommand they are misplaced.
+        let settings_flags = [
+            (organise.output.is_some(), "--output"),
+            (organise.chunk_size.is_some(), "--chunk-size"),
+            (organise.no_prompt.is_some(), "--no-prompt"),
+            (organise.journal_dir.is_some(), "--journal-dir"),
+        ];
+        // Flags that are not settings, and that no subcommand can act on.
+        let switches = [
+            (organise.commit, "--commit"),
+            (organise.no_journal, "--no-journal"),
+            (organise.i_know_what_im_doing, "--i-know-what-im-doing"),
+        ];
+
+        let reports_settings = matches!(command, Command::Config { .. });
+        let misplaced: Vec<&str> = settings_flags
+            .into_iter()
+            .filter(|_| !reports_settings)
+            .chain(switches)
+            .filter_map(|(given, flag)| given.then_some(flag))
+            .collect();
+
+        if misplaced.is_empty() {
+            return Ok(());
+        }
+
+        Err(format!(
+            "{} belong{} to `mmm organise`, which `{name}` is not. Drop {} to run `mmm {name}`, or \
+             drop `{name}` to organise. A flag a subcommand has of its own goes after it, as in \
+             `mmm undo --journal-dir PATH`.",
+            misplaced.join(" and "),
+            if misplaced.len() == 1 { "s" } else { "" },
+            if misplaced.len() == 1 { "it" } else { "them" },
+            name = command.name(),
+        ))
+    }
+
+    /// The file `mmm config validate <PATH>` was asked about, if that is what
+    /// this invocation is.
+    ///
+    /// It exists because every other command loads the ambient configuration
+    /// first, and a broken user or project config stops the run there — which
+    /// is right for a command that is about to move files, and useless for the
+    /// one command whose entire job is to tell you whether a file is broken.
+    /// So a named path is answered from that path alone, reading nothing else.
+    ///
+    /// `mmm config validate` with no path is the opposite question — "are the
+    /// files this run reads all right?" — and goes through the ordinary load.
+    pub fn standalone_validate(&self) -> Option<&Path> {
+        match &self.command {
+            Some(Command::Config {
+                action: ConfigAction::Validate(args),
+            }) => args.path.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The command line's own layer — the highest-priority one there is.
     ///
     /// Every value the command line supplies that a config file could also
@@ -127,8 +229,14 @@ impl Cli {
             Some(Command::Organise(config)) => config.settings_layer(),
             Some(Command::Undo(args)) => args.location.settings_layer(),
             Some(Command::Journal { action }) => action.location().settings_layer(),
-            // No subcommand named: the organise arguments were given bare.
-            None => self.organise.settings_layer(),
+            // Both read the flattened organise arguments, for different
+            // reasons. `None` because the organise arguments were given bare,
+            // and `config` because `mmm --chunk-size 7 config show` asks what a
+            // run with that flag would resolve to — so the flag has to reach the
+            // layer, or `config show` would describe every layer except the one
+            // that wins most often, and "why did it do that?" would go
+            // unanswered for exactly the runs people ask it about.
+            Some(Command::Config { .. }) | None => self.organise.settings_layer(),
         };
         PartialSettings {
             verbose: (self.verbose > 0).then_some(self.verbose),
@@ -137,7 +245,7 @@ impl Cli {
     }
 }
 
-/// The three things `mmm` does.
+/// The four things `mmm` does.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Organise media into the output tree (the default)
@@ -155,6 +263,82 @@ pub enum Command {
         #[command(subcommand)]
         action: JournalAction,
     },
+
+    /// Inspect, start and check the configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+impl Command {
+    /// The word that names this command on the command line.
+    ///
+    /// Used by [`Cli::validate_placement`] to say where a misplaced flag would
+    /// have to go, which is the only part of a refusal a reader can act on.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Organise(_) => "organise",
+            Self::Undo(_) => "undo",
+            Self::Journal { .. } => "journal",
+            Self::Config { .. } => "config",
+        }
+    }
+}
+
+/// `mmm config …` — read-only, except for `init`, which writes one new file.
+#[derive(Subcommand, Debug, Clone)]
+pub enum ConfigAction {
+    /// Print the resolved settings, each value naming the layer it came from
+    Show,
+
+    /// List every config file location that was searched, and what was there
+    Path,
+
+    /// Write a starter config with every key present and commented out
+    Init(ConfigInitArgs),
+
+    /// Parse a config file and report what is wrong with it, running nothing
+    Validate(ConfigValidateArgs),
+}
+
+/// `mmm config init` — where to put the starter file, and whether to clobber.
+#[derive(Args, Debug, Clone)]
+pub struct ConfigInitArgs {
+    /// Write the per-user config (the default)
+    #[arg(long, conflicts_with = "project")]
+    pub user: bool,
+
+    /// Write mmm.toml in the working directory instead
+    #[arg(long)]
+    pub project: bool,
+
+    /// Overwrite a config that is already there
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl ConfigInitArgs {
+    /// Which file this invocation writes.
+    ///
+    /// The user config is the default because it is the one that stops the
+    /// retyping this whole phase exists to end; a project file is a statement
+    /// about one tree and has to be asked for.
+    pub fn target(&self) -> InitTarget {
+        if self.project {
+            InitTarget::Project
+        } else {
+            InitTarget::User
+        }
+    }
+}
+
+/// `mmm config validate` — one named file, or the ones this run would read.
+#[derive(Args, Debug, Clone)]
+pub struct ConfigValidateArgs {
+    /// The file to check [default: the files this run reads]
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
 }
 
 /// Which library's journals a reading subcommand is about.
@@ -692,7 +876,7 @@ mod tests {
         match Cli::try_parse_from(args).unwrap().resolve() {
             Command::Undo(undo) => undo.location.resolve(&settings),
             Command::Journal { action } => action.location().resolve(&settings),
-            other @ Command::Organise(_) => {
+            other @ (Command::Organise(_) | Command::Config { .. }) => {
                 panic!("expected a journal-reading command, got {other:?}")
             }
         }
@@ -1110,6 +1294,287 @@ mod tests {
 
         let cli = Cli::try_parse_from(["mmm", "/photos", "--no-config"]).unwrap();
         assert!(cli.load_options().no_config);
+    }
+
+    // -----------------------------------------------------------------
+    // The config subcommand family
+    // -----------------------------------------------------------------
+
+    /// The action `args` names, or a panic saying what it got instead.
+    fn config_action(args: &[&str]) -> ConfigAction {
+        match Cli::try_parse_from(args).unwrap().resolve() {
+            Command::Config { action } => action,
+            other => panic!("expected a config command, got {other:?}"),
+        }
+    }
+
+    /// Like `undo`, `config` names no directories and must not be refused for
+    /// it — `subcommand_negates_reqs` is what makes that true.
+    #[test]
+    fn the_config_actions_parse_without_naming_a_directory() {
+        assert!(matches!(
+            config_action(&["mmm", "config", "show"]),
+            ConfigAction::Show
+        ));
+        assert!(matches!(
+            config_action(&["mmm", "config", "path"]),
+            ConfigAction::Path
+        ));
+        assert!(matches!(
+            config_action(&["mmm", "config", "init"]),
+            ConfigAction::Init(_)
+        ));
+        assert!(matches!(
+            config_action(&["mmm", "config", "validate"]),
+            ConfigAction::Validate(_)
+        ));
+    }
+
+    /// `mmm config` alone has no sensible default action — showing the settings
+    /// would be a guess, and writing a file would be a dangerous one.
+    #[test]
+    fn config_requires_an_action() {
+        assert!(Cli::try_parse_from(["mmm", "config"]).is_err());
+    }
+
+    /// The subcommand named `config` and the global flag `--config` are
+    /// different things, and both have to keep working next to each other.
+    #[test]
+    fn the_config_subcommand_and_the_config_flag_coexist() {
+        let cli =
+            Cli::try_parse_from(["mmm", "--config", "/etc/mmm.toml", "config", "show"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/etc/mmm.toml")));
+        assert!(matches!(
+            cli.resolve(),
+            Command::Config {
+                action: ConfigAction::Show
+            }
+        ));
+    }
+
+    /// `mmm config show` on its own reports the files and nothing else.
+    #[test]
+    fn a_bare_config_show_states_no_settings_of_its_own() {
+        assert!(layer_of(&["mmm", "config", "show"]).is_empty());
+        assert_eq!(
+            layer_of(&["mmm", "config", "show", "-vv"]).verbose,
+            Some(2),
+            "except the global verbosity, which is a setting wherever it is typed"
+        );
+    }
+
+    /// And an organise flag typed before it reaches the layer, so `config show`
+    /// can name the command line as the layer that decided a value. Without
+    /// this, the one layer that wins most often would be the one `config show`
+    /// could not describe.
+    #[test]
+    fn an_organise_flag_before_config_show_reaches_the_layer() {
+        let layer = layer_of(&[
+            "mmm",
+            "--chunk-size",
+            "7",
+            "-o",
+            "/sorted",
+            "config",
+            "show",
+        ]);
+        assert_eq!(layer.chunk_size, Some(7));
+        assert_eq!(layer.output_dir, Some(PathBuf::from("/sorted")));
+    }
+
+    #[test]
+    fn init_writes_the_user_config_unless_told_otherwise() {
+        let ConfigAction::Init(args) = config_action(&["mmm", "config", "init"]) else {
+            panic!("expected init");
+        };
+        assert_eq!(args.target(), InitTarget::User);
+        assert!(!args.force);
+
+        let ConfigAction::Init(args) = config_action(&["mmm", "config", "init", "--project"])
+        else {
+            panic!("expected init");
+        };
+        assert_eq!(args.target(), InitTarget::Project);
+    }
+
+    #[test]
+    fn init_takes_force_and_refuses_both_targets_at_once() {
+        let ConfigAction::Init(args) = config_action(&["mmm", "config", "init", "--force"]) else {
+            panic!("expected init");
+        };
+        assert!(args.force);
+        assert!(Cli::try_parse_from(["mmm", "config", "init", "--user", "--project"]).is_err());
+    }
+
+    /// The escape hatch: a named file is answered from that file alone, so a
+    /// broken config elsewhere cannot stop the command that diagnoses broken
+    /// configs.
+    #[test]
+    fn validate_with_a_path_bypasses_the_ambient_load() {
+        let cli = Cli::try_parse_from(["mmm", "config", "validate", "/etc/mmm.toml"]).unwrap();
+        assert_eq!(
+            cli.standalone_validate(),
+            Some(Path::new("/etc/mmm.toml")),
+            "the named file is the whole question"
+        );
+    }
+
+    /// Every other invocation goes through the ordinary load, including
+    /// `config validate` with nothing named — which is the other question, "are
+    /// the files this run reads all right?".
+    #[test]
+    fn nothing_else_bypasses_the_ambient_load() {
+        for args in [
+            vec!["mmm", "config", "validate"],
+            vec!["mmm", "config", "show"],
+            vec!["mmm", "config", "init"],
+            vec!["mmm", "/photos"],
+            vec!["mmm", "undo"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(&args).unwrap().standalone_validate(),
+                None,
+                "{args:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Where a flag may be typed
+    // -----------------------------------------------------------------
+
+    /// The regression that removing `args_conflicts_with_subcommands` fixed.
+    /// With it, a global flag before a subcommand made clap stop looking for
+    /// the subcommand, and `mmm -v undo ~/Photos --commit` became an organise
+    /// run that moved the library of somebody who had asked to put it back.
+    #[test]
+    fn a_global_flag_before_a_subcommand_leaves_it_a_subcommand() {
+        for args in [
+            vec!["mmm", "-vv", "undo", "/photos"],
+            vec!["mmm", "--no-config", "undo", "/photos"],
+            vec!["mmm", "--config", "/etc/mmm.toml", "undo", "/photos"],
+        ] {
+            let resolved = Cli::try_parse_from(&args).unwrap().resolve();
+            assert!(
+                matches!(resolved, Command::Undo(_)),
+                "{args:?} resolved to {resolved:?}"
+            );
+        }
+
+        assert!(matches!(
+            Cli::try_parse_from(["mmm", "-v", "journal", "list", "/photos"])
+                .unwrap()
+                .resolve(),
+            Command::Journal { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mmm", "--no-config", "config", "path"])
+                .unwrap()
+                .resolve(),
+            Command::Config { .. }
+        ));
+    }
+
+    /// And the global still arrives, so it was read rather than merely tolerated.
+    #[test]
+    fn a_global_flag_before_a_subcommand_still_reaches_the_run() {
+        let cli = Cli::try_parse_from(["mmm", "-vv", "--no-config", "undo"]).unwrap();
+        assert_eq!(cli.verbose, 2);
+        assert!(cli.no_config);
+        assert_eq!(cli.settings_layer().verbose, Some(2));
+    }
+
+    /// An organise flag before a subcommand is refused rather than swallowed:
+    /// `mmm --commit undo` would otherwise preview and report success.
+    #[test]
+    fn an_organise_flag_before_a_subcommand_is_refused_and_named() {
+        let refusal = Cli::try_parse_from(["mmm", "--commit", "undo", "/photos"])
+            .unwrap()
+            .validate_placement()
+            .expect_err("a swallowed --commit must not be silent");
+
+        assert!(refusal.contains("--commit"), "{refusal}");
+        assert!(refusal.contains("undo"), "{refusal}");
+        assert!(refusal.contains("organise"), "{refusal}");
+    }
+
+    #[test]
+    fn every_misplaced_flag_is_listed() {
+        let refusal = Cli::try_parse_from([
+            "mmm",
+            "-o",
+            "/sorted",
+            "--no-journal",
+            "journal",
+            "list",
+            "/photos",
+        ])
+        .unwrap()
+        .validate_placement()
+        .expect_err("both flags are misplaced");
+        assert!(refusal.contains("--output"), "{refusal}");
+        assert!(refusal.contains("--no-journal"), "{refusal}");
+        assert!(refusal.contains("journal"), "{refusal}");
+    }
+
+    /// `config` is the exception, and only for the flags that are settings:
+    /// reporting what `--chunk-size 7` resolves to is its job, and `--commit`
+    /// is still something it cannot act on.
+    #[test]
+    fn config_takes_the_settings_flags_and_still_refuses_the_switches() {
+        assert_eq!(
+            Cli::try_parse_from(["mmm", "--chunk-size", "7", "config", "show"])
+                .unwrap()
+                .validate_placement(),
+            Ok(())
+        );
+
+        let refusal = Cli::try_parse_from(["mmm", "--commit", "config", "show"])
+            .unwrap()
+            .validate_placement()
+            .expect_err("`config` cannot commit anything");
+        assert!(refusal.contains("--commit"), "{refusal}");
+    }
+
+    /// The ordinary invocations, which must not be caught by the guard: an
+    /// organise run may say anything it likes, and a subcommand's own flags
+    /// belong to the subcommand.
+    #[test]
+    fn a_flag_in_its_own_place_is_not_misplaced() {
+        for args in [
+            vec!["mmm", "/photos", "--commit", "-o", "/sorted"],
+            vec!["mmm", "organise", "/photos", "--commit"],
+            vec!["mmm", "undo", "/photos", "--commit"],
+            vec!["mmm", "undo", "--journal-dir", "/var/log/mmm"],
+            vec!["mmm", "journal", "list", "/photos"],
+            vec!["mmm", "config", "show"],
+            vec!["mmm", "--chunk-size", "7", "config", "show"],
+            vec!["mmm", "-vv", "--no-config", "undo"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(&args).unwrap().validate_placement(),
+                Ok(()),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// The retired flag is a no-op wherever it lands, so ignoring it is honest
+    /// and refusing it would break the scripts it was kept for.
+    #[test]
+    fn the_deprecated_flag_is_exempt_from_the_placement_rule() {
+        assert_eq!(
+            Cli::try_parse_from(["mmm", "--dry-run", "undo", "/photos"])
+                .unwrap()
+                .validate_placement(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn help_lists_the_config_subcommand() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("config"), "{help}");
     }
 
     #[test]

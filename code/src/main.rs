@@ -6,14 +6,14 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{debug, error, info};
 
-use mmm::{hasher, journal, organiser, reporter, scanner, settings, undo};
+use mmm::{hasher, journal, organiser, reporter, scanner, settings, settings_report, undo};
 
-use mmm::config::{Cli, Command, Config, JournalAction, UndoArgs};
+use mmm::config::{Cli, Command, Config, ConfigAction, JournalAction, UndoArgs};
 use mmm::geocoder::GeoLookup;
 use mmm::journal::{Journal, JournalEntry, RunHeader};
 use mmm::organiser::{ChunkController, MoveRecorder};
 use mmm::reporter::JournalStatus;
-use mmm::settings::Settings;
+use mmm::settings::{Loaded, LoadedLayer, Settings};
 use mmm::undo::RestorePlan;
 
 /// Drives the chunked move phase from the terminal: the progress bar, and the
@@ -272,8 +272,64 @@ fn init_tracing(verbose: u8) {
         .init();
 }
 
+/// `mmm config …` — report the configuration, or start one.
+///
+/// Takes the whole stack rather than the resolved settings alone, because the
+/// question `show` answers is not "what is the value?" but "which layer decided
+/// it?", and only the stack holds that.
+fn run_config(
+    action: &ConfigAction,
+    settings: &Settings,
+    stack: &[LoadedLayer],
+    loaded: &Loaded,
+    no_config: bool,
+) -> Result<()> {
+    match action {
+        ConfigAction::Show => print!("{}", settings_report::render_show(settings, stack)),
+        ConfigAction::Path => print!("{}", settings_report::render_paths(loaded, no_config)),
+        // The no-path form. A named file never reaches here — it is answered
+        // before the ambient load, so that a different broken config cannot
+        // stop the command that diagnoses broken configs.
+        ConfigAction::Validate(_) => print!("{}", settings_report::render_validate(loaded)),
+        ConfigAction::Init(args) => {
+            let path = settings_report::init_path(
+                args.target(),
+                settings::user_config_path(),
+                &std::env::current_dir().context(
+                    "the working directory could not be read, so there is nowhere to \
+                              write a project config",
+                )?,
+            )?;
+            settings_report::write_starter_config(&path, args.force)?;
+            println!("Wrote {}", path.display());
+            println!(
+                "Every key is commented out at its default — uncomment what you want to change."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Before anything is read or done: an organise flag typed before a
+    // subcommand lands on arguments that subcommand never looks at, so
+    // `mmm --commit undo ~/Photos` would preview and report success while
+    // putting nothing back.
+    if let Err(refusal) = cli.validate_placement() {
+        anyhow::bail!(refusal);
+    }
+
+    // Answered before anything else is read: `mmm config validate <PATH>` is a
+    // question about that one file, and loading the ambient configuration first
+    // would let an unrelated broken config stop the command you reach for to
+    // find out what is wrong with a config.
+    if let Some(path) = cli.standalone_validate() {
+        settings::load_file(path)?;
+        println!("ok  {}", path.display());
+        return Ok(());
+    }
 
     // Read before any work starts, and for every subcommand: a config that
     // cannot be understood has to stop the run here rather than be discovered
@@ -289,20 +345,23 @@ fn main() -> Result<()> {
     let loaded = settings::load(&cli.load_options())?;
 
     // The command line goes on last, so it wins: the layers arrive
-    // lowest-priority first and `resolve` folds them in that order.
-    let mut layers = loaded.opinions();
-    layers.push(cli.settings_layer());
-    let settings = Settings::resolve(layers);
+    // lowest-priority first and `resolve` folds them in that order. Kept as a
+    // stack rather than folded away because `mmm config show` has to name the
+    // layer each value came from, and it must be *this* list it names.
+    let stack = loaded.stack(cli.settings_layer());
+    let settings = settings::resolve_stack(&stack);
 
     init_tracing(settings.verbose);
     for layer in &loaded.layers {
         debug!(source = %layer.source, "read config layer");
     }
 
+    let no_config = cli.no_config;
     match cli.resolve() {
         Command::Organise(config) => run_organise(&config, &settings),
         Command::Undo(args) => run_undo(&args, &settings),
         Command::Journal { action } => run_journal(&action, &settings),
+        Command::Config { action } => run_config(&action, &settings, &stack, &loaded, no_config),
     }
 }
 

@@ -842,14 +842,36 @@ pub struct Loaded {
 }
 
 impl Loaded {
-    /// The layers' opinions, ready to hand to [`Settings::resolve`] with the
-    /// command line's own layer appended after them.
-    pub fn opinions(&self) -> Vec<PartialSettings> {
-        self.layers
-            .iter()
-            .map(|layer| layer.settings.clone())
-            .collect()
+    /// Every layer this run has, lowest priority first, with the command line's
+    /// own opinion on top.
+    ///
+    /// The one place the full stack is assembled, and the reason it returns
+    /// [`LoadedLayer`] rather than bare opinions: `mmm config show` answers
+    /// "where did this value come from?" by walking exactly the list that
+    /// [`Settings::resolve`] folded. Two constructions of it would be two
+    /// chances for the explanation to name a layer the run did not use.
+    ///
+    /// The command line goes on unconditionally, even when it said nothing — an
+    /// empty layer claims no key, so it can never be blamed for a value it did
+    /// not set.
+    pub fn stack(&self, command_line: PartialSettings) -> Vec<LoadedLayer> {
+        let mut stack = self.layers.clone();
+        stack.push(LoadedLayer {
+            source: SettingsSource::CommandLine,
+            settings: command_line,
+        });
+        stack
     }
+}
+
+/// Fold a layer stack into the settings a run uses.
+///
+/// The counterpart of [`Loaded::stack`]: it takes the annotated layers so that
+/// the values a run reads and the sources `mmm config show` reports are derived
+/// from the same list.
+#[must_use]
+pub fn resolve_stack(stack: &[LoadedLayer]) -> Settings {
+    Settings::resolve(stack.iter().map(|layer| layer.settings.clone()))
 }
 
 /// Discover, read and order every layer below the command line.
@@ -1540,6 +1562,14 @@ mod tests {
     // Assembling the layers
     // -----------------------------------------------------------------
 
+    /// What a load resolves to with nothing on the command line.
+    ///
+    /// Through [`Loaded::stack`] rather than around it, so these assertions
+    /// cover the same assembly `main` and `mmm config show` use.
+    fn resolved(loaded: &Loaded) -> Settings {
+        resolve_stack(&loaded.stack(PartialSettings::default()))
+    }
+
     /// A tree with a user config and a project config, and the options that
     /// find them — with nothing read from the real environment.
     fn tree_with_both_configs(user: &str, project: &str) -> (TempDir, PathBuf, LoadOptions) {
@@ -1576,7 +1606,7 @@ mod tests {
             ]
         );
 
-        let settings = Settings::resolve(loaded.opinions());
+        let settings = resolved(&loaded);
         assert_eq!(
             settings.chunk_size, 25,
             "the project config outranks the user's"
@@ -1595,7 +1625,7 @@ mod tests {
             loaded.layers.last().unwrap().source,
             SettingsSource::Environment
         );
-        assert_eq!(Settings::resolve(loaded.opinions()).chunk_size, 50);
+        assert_eq!(resolved(&loaded).chunk_size, 50);
     }
 
     #[test]
@@ -1610,7 +1640,7 @@ mod tests {
             loaded.searched.is_empty(),
             "nothing was searched, so nothing is reported"
         );
-        assert_eq!(Settings::resolve(loaded.opinions()), Settings::default());
+        assert_eq!(resolved(&loaded), Settings::default());
     }
 
     /// `--no-config` is a statement about files. The environment belongs to the
@@ -1622,10 +1652,7 @@ mod tests {
         options.no_config = true;
         options.env = env(&[("MMM_CHUNK_SIZE", "50")]);
 
-        assert_eq!(
-            Settings::resolve(load(&options).unwrap().opinions()).chunk_size,
-            50
-        );
+        assert_eq!(resolved(&load(&options).unwrap()).chunk_size, 50);
     }
 
     #[test]
@@ -1646,7 +1673,7 @@ mod tests {
             vec![SettingsSource::ExplicitConfig(explicit)]
         );
 
-        let settings = Settings::resolve(loaded.opinions());
+        let settings = resolved(&loaded);
         assert_eq!(settings.chunk_size, 99);
         assert_eq!(
             settings.verbose, 0,
