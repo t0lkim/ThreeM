@@ -61,6 +61,56 @@ jobs:
         working-directory: code
         run: cargo test --all-targets
 
+  msrv:
+    name: MSRV (from Cargo.toml rust-version)
+    runs-on: ubuntu-latest
+
+    # `rust-version` in `code/Cargo.toml` is a promise to anyone running
+    # `cargo install mmm` on a distribution's Rust rather than the newest one.
+    # A promise nothing checks is a guess: the floor was 1.87 the day it was
+    # measured, and the next dependency bump or `let`-chain can raise it without
+    # anybody noticing on a stable toolchain.
+    #
+    # The number lives in `Cargo.toml` and is read out of it here, so there is
+    # one place to change it. Both halves of the gate run, because the reason the
+    # floor is 1.87 rather than 1.86 is a std method used in the *test* fixtures
+    # — a build-only check would happily pass at a version the suite cannot
+    # compile at.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the MSRV out of Cargo.toml
+        id: msrv
+        working-directory: code
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "::error::no rust-version in code/Cargo.toml"
+            exit 1
+          fi
+          echo "MSRV is $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code
+          # A different compiler produces different artifacts; sharing the
+          # `test` job's entry would thrash it on every run.
+          key: msrv
+
+      - name: cargo build --release
+        working-directory: code
+        run: cargo build --release
+
+      - name: cargo test --all-targets
+        working-directory: code
+        run: cargo test --all-targets
+
   coverage:
     name: coverage floors (organiser · journal)
     runs-on: ubuntu-latest

@@ -5,6 +5,27 @@ edition = "2021"
 description = "Image and video organiser with deduplication, EXIF-based renaming, and date-based directory structure"
 authors = ["Mike Lott <me@t0lkim.dev>"]
 license = "MIT"
+repository = "https://github.com/t0lkim/ThreeM"
+homepage = "https://github.com/t0lkim/ThreeM"
+documentation = "https://github.com/t0lkim/ThreeM/blob/main/docs/index.md"
+# There is no docs.rs page and no separate site: the crate is not published to
+# crates.io, and its documentation is prose in `docs/`, not rustdoc over a
+# library meant for third-party callers. Pointing `documentation` at the docs
+# index is therefore the true answer rather than a placeholder.
+readme = "../README.md"
+keywords = ["photos", "exif", "deduplication", "organiser", "metadata"]
+categories = [
+    "command-line-utilities",
+    "multimedia::images",
+    "multimedia::video",
+    "filesystem",
+]
+# The floor is measured, not guessed, and its own CI job builds and tests here.
+# The library and both binaries compile on 1.86; `tests/common/mod.rs` uses
+# `is_multiple_of`, stabilised in 1.87, so 1.87 is the floor for anything that
+# has to pass the gate. One number that covers building *and* testing beats two
+# that have to be kept in step.
+rust-version = "1.87.0"
 
 [dependencies]
 anyhow = "1"

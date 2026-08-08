@@ -23,6 +23,8 @@ related:
   - '[[fuzzing]]'
   - '[[hashing-baseline]]'
   - '[[CHANGELOG]]'
+  - '[[CONTRIBUTING]]'
+  - '[[SECURITY]]'
 ---
 
 # ThreeM Documentation Index
@@ -77,6 +79,11 @@ it, not a promise about the current commit.
 
 ## Elsewhere in the repository
 
-- [`../CONTRIBUTING.md`](../CONTRIBUTING.md) and [`../SECURITY.md`](../SECURITY.md) — not yet written; they are the next task of the release phase.
+- [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — the layout, the four-command test gate, the CI jobs beyond it, and the rule that a change to a destructive path lands as a failing test first.
+- [`../SECURITY.md`](../SECURITY.md) — how to report a vulnerability, what is in scope for a local tool that opens no sockets, and the hardening already in place.
+- [`../.github/ISSUE_TEMPLATE/bug_report.md`](../.github/ISSUE_TEMPLATE/bug_report.md) — the four things that make a bug report reproducible.
 - [`../code/fuzz/README.md`](../code/fuzz/README.md) — how to run the fuzz targets, and why the toolchain is pinned.
-- [`../.maestro/playbooks/`](../.maestro/playbooks/) — the phased build plan this project was written against, with each phase's outcome recorded under its tasks.
+- The phased build plan this project was written against lives under
+  `.maestro/playbooks/`, with each phase's outcome recorded under its tasks. It
+  is **not in the repository** — `.gitignore` keeps the agent tooling out — so
+  it is named here rather than linked, and a clone will not have it.

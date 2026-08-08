@@ -104,6 +104,12 @@ cargo test --all-targets       # the full suite
 
 There is no installer and no packaged build yet; `cargo install --path code` is the supported way to get `mmm` onto a `PATH`.
 
+Rust **1.87.0** or newer. That floor is declared as `rust-version` in `code/Cargo.toml` and checked by its own CI job, so it is a measurement rather than an aspiration.
+
+## Contributing
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers the `code/` layout, the four-command test gate CI enforces, and the rule that any change to a path which moves, records or restores files lands as a failing test first. Bugs go through the [issue template](.github/ISSUE_TEMPLATE/bug_report.md); vulnerabilities go to the contact in [`SECURITY.md`](SECURITY.md), not the issue tracker.
+
 ## Documentation
 
 Start at [`docs/index.md`](docs/index.md), which links every document in the repository. The two entry points are the [User Guide](docs/USER-GUIDE.md) and the [Technical Documentation](docs/TECHNICAL.md).
