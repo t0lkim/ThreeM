@@ -32,6 +32,13 @@ mmm ~/Photos -vv
 
 # Verify duplicates independently before deleting
 mmm-dedup-verifier ~/Organised/duplicates/
+
+# See what has been run against a library
+mmm journal list ~/Organised
+
+# Put the last run back — preview first, then commit
+mmm undo ~/Organised
+mmm undo ~/Organised --commit
 ```
 
 Review a plain run first, then re-run the same command with `--commit` to apply it.
@@ -46,6 +53,8 @@ Review a plain run first, then re-run the same command with `--commit` to apply 
 - Date-based directory structure (`YYYY-MM-DD/`)
 - Chunked processing with confirmation between batches
 - Safe by default — every run is a preview until you pass `--commit`
+- **`mmm undo`** — every committing run is journalled before it acts, so it can be replayed backwards and the library put back as it was, even after an interrupted run
+- `mmm journal list` / `mmm journal show` to inspect what has been run against a library
 - Independent `mmm-dedup-verifier` binary using keyed BLAKE3 for safety
 
 ## Language

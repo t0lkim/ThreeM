@@ -8,6 +8,7 @@ tags:
   - atomicity
 related:
   - '[[adr-001-dry-run-by-default]]'
+  - '[[adr-004-journal-design]]'
   - '[[CHANGELOG]]'
   - '[[TECHNICAL]]'
 ---
@@ -105,4 +106,4 @@ That `rename` is **the only overwrite left in the module**, and the thing it ove
 - **`execute_move` returns `MoveOutcome { kind, destination }`.** The planned destination is not always the one a file reaches, and a record that cannot name the file's actual path cannot be used to put it back. `move_duplicates` records the reached path; a future journal reads the same field.
 - **The library surface grew** — `copy_verify_delete`, `MoveError`, `MoveKind` and `MoveOutcome` are public because the tests that hold this contract drive them directly. A seam that only production code can reach is a seam no test can hold.
 - **The contract is pinned by `tests/failure_paths.rs` and `tests/path_properties.rs`**, both written before the fixes they cover. Every one of the five original regression tests failed or refused to compile against the code as it stood, and each failure is recorded in the phase document rather than described. The property suite additionally asserts that a contested destination never overwrites its occupant for arbitrary generated collision sets — the generalisation of the two hand-written cases.
-- **This is not an undo log.** The contract says a move never destroys something it did not create, and that a copy is proved before its source is deleted. It says nothing about reversing a completed run, which remains the gap [`adr-001`](adr-001-dry-run-by-default.md) addresses by making preview the default.
+- **This is not an undo log.** The contract says a move never destroys something it did not create, and that a copy is proved before its source is deleted. It says nothing about reversing a completed run — the gap [`adr-001`](adr-001-dry-run-by-default.md) narrowed by making preview the default, and which [`adr-004`](adr-004-journal-design.md) then closed with the run journal and `mmm undo`. The `MoveOutcome` returned here is what that journal records.
