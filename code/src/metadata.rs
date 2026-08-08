@@ -213,6 +213,15 @@ impl Reading {
 /// Returns an error only if the filesystem fallback itself fails — i.e. the
 /// file's own metadata cannot be read.
 pub fn extract_metadata(path: &Path, is_video: bool, tz: &TimezonePolicy) -> Result<FileMetadata> {
+    // Answered before any parser sees the file: see `is_too_short_to_parse`.
+    if is_too_short_to_parse(path) {
+        debug!(
+            path = %path.display(),
+            "too short to hold a container signature; not offered to the parser"
+        );
+        return extract_filesystem_metadata(path, tz, DateSource::Unsupported);
+    }
+
     let attempt = if is_video {
         extract_video_metadata(path, tz)
     } else {
@@ -335,6 +344,30 @@ fn is_xmp(path: &Path) -> bool {
 /// container?" — because that is the only source of an answer that stays true.
 /// A hard-coded list of unsupported extensions would be a second thing to
 /// maintain, and it would begin lying the day the parser gained a format.
+/// The fewest bytes a file must hold before it is worth handing to a parser.
+///
+/// Two, because `nom-exif` 1.5.2 opens its format probe with
+/// `assert!(input.len() >= 2)` (`jpeg.rs:110`) — reached by *every* entry point,
+/// image and video alike, and by `FileFormat::try_from_read` in
+/// [`fallback_source`]. A shorter file does not return an error from that
+/// assertion; it aborts the process.
+///
+/// It is not an arbitrary threshold picked to dodge a crash. No container in the
+/// support matrix has a signature shorter than two bytes — JPEG's is `FF D8`,
+/// PNG's is eight — so a file this short cannot be any format `mmm` reads, and
+/// "there is nothing here to parse" is the true answer rather than a convenient
+/// one.
+const MIN_PARSEABLE_BYTES: u64 = 2;
+
+/// Whether `path` is too short for any parser to attempt.
+///
+/// A file whose length cannot be read is *not* reported as too short: that is a
+/// permissions or races-with-deletion problem, and it belongs to the filesystem
+/// fallback that is about to fail on the same file and say so properly.
+fn is_too_short_to_parse(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() < MIN_PARSEABLE_BYTES)
+}
+
 fn fallback_source(path: &Path, reason: Option<NoDate>) -> DateSource {
     match reason {
         Some(NoDate::Absent) => return DateSource::Filesystem,
@@ -1143,6 +1176,114 @@ mod tests {
         // the figure the run reports.
         assert!(!DateSource::None.is_recorded());
         assert!(!DateSource::None.is_filesystem());
+    }
+
+    // -----------------------------------------------------------------
+    // The sub-two-byte guard
+    // -----------------------------------------------------------------
+
+    /// Write `len` bytes to a temporary file and hand back the handle.
+    ///
+    /// The handle is returned rather than just the path because dropping a
+    /// `NamedTempFile` deletes the file, and a test that only kept the path
+    /// would be asking questions about something that no longer exists.
+    fn min_parseable() -> usize {
+        usize::try_from(MIN_PARSEABLE_BYTES).unwrap()
+    }
+
+    fn file_of_len(len: usize) -> tempfile::NamedTempFile {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), vec![b'a'; len]).unwrap();
+        tmp
+    }
+
+    /// The predicate is exact at its boundary, and total on both sides of it.
+    ///
+    /// Stated over a range rather than at the single interesting value because
+    /// an off-by-one here is invisible from the outside: one byte too generous
+    /// and the panic is back, one byte too strict and a real two-byte container
+    /// is refused a parse it would have survived.
+    #[test]
+    fn the_short_file_guard_is_exact_at_two_bytes() {
+        for len in 0..min_parseable() {
+            let tmp = file_of_len(len);
+            assert!(
+                is_too_short_to_parse(tmp.path()),
+                "{len} bytes cannot hold a container signature and must not reach the parser"
+            );
+        }
+
+        for len in min_parseable()..=8 {
+            let tmp = file_of_len(len);
+            assert!(
+                !is_too_short_to_parse(tmp.path()),
+                "{len} bytes is long enough for the parser to answer for itself"
+            );
+        }
+    }
+
+    /// A path with no file behind it is not "too short".
+    ///
+    /// The distinction matters: a missing or unreadable file is a filesystem
+    /// problem the fallback reports properly, and answering `true` here would
+    /// relabel it as an unsupported format — the wrong word, on a file the run
+    /// is about to fail on anyway.
+    #[test]
+    fn a_path_that_is_not_a_readable_file_is_not_reported_as_too_short() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert!(
+            !is_too_short_to_parse(&tmp.path().join("no-such-file.jpg")),
+            "a missing file is not a short file"
+        );
+        assert!(
+            !is_too_short_to_parse(tmp.path()),
+            "a directory is not a short file, whatever its length reports"
+        );
+    }
+
+    /// The whole point, stated as behaviour rather than as a predicate: a file
+    /// too short to parse comes back undated instead of taking the process
+    /// down, and says *why* in the same word a zero-byte file has always used.
+    ///
+    /// `nom-exif` 1.5.2 asserts `input.len() >= 2` in its format probe, which
+    /// every entry point reaches — image and video alike. Before the guard this
+    /// test did not fail; it aborted the test binary.
+    #[test]
+    fn a_file_too_short_to_parse_is_undated_rather_than_fatal() {
+        for len in 0..min_parseable() {
+            let tmp = file_of_len(len);
+
+            for is_video in [false, true] {
+                let meta = extract_metadata(tmp.path(), is_video, &policy("+08:00")).unwrap();
+
+                assert_eq!(
+                    meta.date_source,
+                    DateSource::Unsupported,
+                    "a {len}-byte file (is_video={is_video}) is not a format we support"
+                );
+                assert!(
+                    meta.date.is_some(),
+                    "it still has a filesystem timestamp, so it is filed rather than lost"
+                );
+            }
+        }
+    }
+
+    /// One byte and zero bytes are the same kind of file, and were not treated
+    /// as such: zero survived by luck — the parser refused it before reaching
+    /// the assertion — while one aborted the run. Pinned together so a future
+    /// change cannot separate them again.
+    #[test]
+    fn zero_and_one_byte_files_are_answered_identically() {
+        let empty = file_of_len(0);
+        let one = file_of_len(1);
+
+        let a = extract_metadata(empty.path(), false, &policy("+08:00")).unwrap();
+        let b = extract_metadata(one.path(), false, &policy("+08:00")).unwrap();
+
+        assert_eq!(a.date_source, b.date_source);
+        assert_eq!(a.date.is_some(), b.date.is_some());
     }
 
     /// The year the spellability check is applied to is the reading's own,

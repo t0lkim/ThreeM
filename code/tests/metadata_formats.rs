@@ -1125,3 +1125,121 @@ fn require_exif_is_settable_from_a_config_file_and_answerable_from_the_command_l
         "--require-exif=false did not outrank the environment:\n{listing}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Files too short to parse
+// ---------------------------------------------------------------------------
+
+/// Write `len` bytes straight into the tree, bypassing the fixture builders.
+///
+/// [`MediaTree`]'s builders append a provenance marker, which is exactly what
+/// these fixtures must not have: the defect lives below two bytes, and a marker
+/// would carry them over it.
+fn write_short(tree: &MediaTree, rel: &str, len: usize) {
+    let path = tree.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, vec![b'a'; len]).unwrap();
+}
+
+/// A tree holding one real photograph and, beside it, every sub-two-byte file
+/// the defect was reachable through.
+///
+/// The real photograph is the point of the fixture rather than scenery: the
+/// claim is that a truncated file does not take *the run* down, and a run with
+/// nothing else in it cannot show that.
+fn tree_with_short_files() -> MediaTree {
+    let tree =
+        MediaTree::new().jpeg_with_exif("shoot/real.jpg", naive(2024, 3, 15, 14, 30, 0), None);
+
+    // Both sides of the boundary, across the image and video paths — the probe
+    // that asserts is `nom-exif`'s format detection, which every entry point
+    // reaches, so the extension decides nothing but which of our two functions
+    // calls it.
+    for ext in ["jpg", "png", "heic", "mov", "mp4"] {
+        write_short(&tree, &format!("truncated/empty.{ext}"), 0);
+        write_short(&tree, &format!("truncated/one-byte.{ext}"), 1);
+    }
+
+    tree
+}
+
+/// A truncated file is filed, not fatal — in the mode that promises to touch
+/// nothing.
+///
+/// `nom-exif` 1.5.2 opens its format probe with `assert!(input.len() >= 2)`
+/// (`jpeg.rs:110`). A one-byte file with a media extension reached it during
+/// *planning*, so `--commit` was irrelevant and the safe-by-default posture
+/// protected nobody: the user got a Rust panic, exit 101, no summary, and no
+/// indication which file did it. An interrupted copy is enough to produce one.
+///
+/// Before the guard this test did not fail — it aborted the test binary.
+#[test]
+fn a_truncated_file_does_not_take_a_preview_down() {
+    let tree = tree_with_short_files();
+
+    let listing = preview_listing(tree.path(), &[]);
+
+    assert!(
+        !listing.contains("panicked"),
+        "the preview panicked instead of reporting:\n{listing}"
+    );
+    assert!(
+        listing.contains("2024-03-15-143000.jpg"),
+        "the real photograph was not planned, so the run did not survive the \
+         truncated files beside it:\n{listing}"
+    );
+}
+
+/// And the same through a committing run, which is the one that moves files.
+///
+/// Asserted separately because the preview returns before the move phase: a
+/// guard that held during planning and not during execution would pass the test
+/// above and still abort a real run half way through somebody's library.
+#[test]
+fn a_truncated_file_does_not_take_a_committing_run_down() {
+    let tree = tree_with_short_files();
+    let (_out, landed) = organise(tree.path(), &[]);
+
+    assert!(
+        landed.contains_key("shoot/real.jpg"),
+        "the real photograph did not land: {landed:?}"
+    );
+}
+
+/// Zero and one byte are the same kind of file and are answered the same way.
+///
+/// They were not: zero survived by luck, refused by the parser before it
+/// reached the assertion, while one aborted the process. Pinned through the
+/// library so the boundary itself is the assertion rather than a side effect
+/// visible in a listing.
+#[test]
+fn the_two_byte_boundary_is_answered_consistently() {
+    let tree = tree_with_short_files();
+    let tz = TimezonePolicy::new(Some(Timezone::from_str("+08:00").unwrap()));
+
+    for ext in ["jpg", "mov"] {
+        let is_video = ext == "mov";
+        let empty =
+            extract_metadata(&tree.join(&format!("truncated/empty.{ext}")), is_video, &tz).unwrap();
+        let one = extract_metadata(
+            &tree.join(&format!("truncated/one-byte.{ext}")),
+            is_video,
+            &tz,
+        )
+        .unwrap();
+
+        assert_eq!(
+            empty.date_source,
+            DateSource::Unsupported,
+            "a zero-byte .{ext} is not a supported format"
+        );
+        assert_eq!(
+            one.date_source, empty.date_source,
+            "a one-byte .{ext} must be answered exactly as a zero-byte one is"
+        );
+        assert!(
+            one.date.is_some(),
+            "it is still filed under its filesystem timestamp rather than lost"
+        );
+    }
+}
