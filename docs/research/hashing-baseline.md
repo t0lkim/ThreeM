@@ -24,8 +24,11 @@ The benchmark lives in `code/benches/hashing.rs` and is run with:
 $ cd code && cargo bench --bench hashing
 ```
 
-Everything below is transcribed from one run of that command. The raw console
-output is not committed; re-running the command reproduces it.
+Everything below is transcribed from runs of that command — one before the
+parallelisation work and one after. The raw console output is not committed;
+re-running the command reproduces it. Sections up to and including
+[Caveats](#caveats) describe the serial baseline; [Parallel
+results](#parallel-results) is the second run, with the speedups.
 
 ## Headline
 
@@ -99,7 +102,7 @@ phase 2 separated nothing and the phase-3 benchmark silently measured 36 files
 instead of 18. The numbers looked entirely plausible. The assertion is what makes
 the next such mistake loud.
 
-## Whole-cascade wall-clock
+## Whole-cascade wall-clock (serial)
 
 `find_duplicates` end to end, including a hidden `ProgressBar`. Criterion reports
 a confidence interval; the middle figure is the point estimate.
@@ -117,7 +120,7 @@ tier has a different ratio of on-disk bytes to bytes actually read.
 without being opened. Read them as "this tier, before and after", never as
 "this tier versus that one".
 
-## Per-phase timing
+## Per-phase timing (serial)
 
 The three phases measured separately over the mixed corpus, so a later run can
 say *which* phase changed rather than only that the total moved. Throughput here
@@ -184,11 +187,143 @@ These bound what the numbers can honestly be used for.
 
 ## Parallel results
 
-_Not yet measured. The remaining tasks in Phase 06 parallelise the cascade and
-append the second column here, with speedup factors per tier, plus an explicit
-note on any tier that shows no improvement or a regression._
+Measured after the whole of Phase 06 landed — the deterministic sorts, the
+`rayon` cascade, the bounded `HashPool`, the per-read progress bar and the
+partial-hash promotion. Same machine, same OS build, same toolchain, same
+corpus, same sampling settings; the only variable is the code.
 
-Small-file workloads are the tier to watch: at ~101 µs per file in phase 2, that
-population is bound by open/close syscalls rather than by hashing, and threads do
-not make a syscall cheaper. If `small_100k` fails to improve, that is the
-explanation to check first — and it should be reported, not quietly shipped.
+Two things this column is *not*. It is not a measurement of `par_iter` alone —
+five commits sit between the two runs and the delta is their sum. And "before"
+means the table above, not criterion's own `change:` line, which compares against
+whatever run last wrote `target/criterion` (task 3's, in practice) and therefore
+understates the distance travelled.
+
+### Whole-cascade wall-clock
+
+| Benchmark | Serial | **Parallel** | Speedup | Conservative | Throughput (on-disk bytes) |
+|---|---|---|---|---|---|
+| `find_duplicates/small_100k` | 2.7948 ms | **1.4233 ms** | **1.96×** | ≥1.86× | 3.2400 GiB/s (was 1.6500) |
+| `find_duplicates/medium_5m` | 15.471 ms | **5.6211 ms** | **2.75×** | ≥2.63× | 13.901 GiB/s (was 5.0505) |
+| `find_duplicates/large_50m` | 73.179 ms | **36.082 ms** | **2.03×** | ≥1.99× | 6.7665 GiB/s (was 3.3363) |
+| `find_duplicates/mixed` | 102.49 ms | **39.174 ms** | **2.62×** | ≥2.46× | 8.3446 GiB/s (was 3.1894) |
+
+Parallel confidence intervals, for completeness: small `[1.3757, 1.4596] ms`,
+medium `[5.4360, 5.7847] ms`, large `[35.915, 36.333] ms`, mixed
+`[38.611, 39.996] ms`.
+
+The **Speedup** column divides point estimate by point estimate.
+**Conservative** divides the serial *lower* bound by the parallel *upper* bound
+and rounds down — the smallest speedup consistent with both intervals. Ten
+samples is not enough to resolve a 5% change (caveat 2), so the conservative
+column is the one to quote if a single number has to be defended.
+
+### Per-phase timing
+
+| Phase | Serial | **Parallel** | Speedup | Share of cascade (was) |
+|---|---|---|---|---|
+| 1 — size grouping | 12.460 µs | **7.7279 µs** | 1.61× † | 0.020% (0.012%) |
+| 2 — partial hash | 3.6495 ms | **1.3194 ms** | **2.77×** | 3.37% (3.56%) |
+| 3 — full hash | 94.347 ms | **37.181 ms** | **2.54×** | 94.91% (92.05%) |
+
+† **Phase 1 did not change and this figure is a baseline artefact, not a win.**
+`group_by_size` is byte-for-byte identical to the version that produced the
+12.460 µs (`git diff d67674c..HEAD -- code/src/hasher.rs` touches its doc comment
+and its callers, never its body), and it is still serial by design. The serial
+interval was `[10.041, 16.070] µs` — a 48% spread that caveat 4 already called
+mostly timer and allocator noise — against a parallel interval of
+`[7.6996, 7.7751] µs`, which is tight. The honest reading is that the *old*
+number was unreliable, not that the phase got faster. Either way it is one part
+in five thousand of the cascade, and no conclusion rests on it.
+
+Phase 3 remains the cascade, and by a slightly larger margin than before: it was
+92.05% of the serial run and is 94.91% of the parallel one, because phase 2
+parallelised marginally better than it did. The prediction from the baseline
+headline held — the parallel version moved phase 3, so it moved something.
+
+Effective rate against **bytes actually read**:
+
+| Phase | Serial | **Parallel** | Speedup |
+|---|---|---|---|
+| 2 — partial hash (3.00 MiB) | 0.803 GiB/s | **2.220 GiB/s** | 2.77× |
+| 3 — full hash (121.21 MiB) | 1.255 GiB/s | **3.184 GiB/s** | 2.54× |
+| Whole cascade (124.21 MiB) | 1.183 GiB/s | **3.096 GiB/s** | 2.62× |
+
+The three phases now sum to 38.51 ms against a measured mixed cascade of
+39.17 ms — 0.67 ms of bookkeeping, where the serial run had 4.48 ms. That gap
+closing is a second, independent confirmation of what the parallel work actually
+did: the serial `find_duplicates` called the grouping helper once per size group
+while the phase benchmarks called it once for the whole set, and the two shapes
+cost measurably different amounts. `find_duplicates` now flattens the candidate
+set into one call as well, so the two measurements have converged on the same
+shape of work.
+
+### Why 2.6× and not 8×
+
+Eight logical cores, a 2.62× mixed speedup. Three reasons, in order of size, and
+none of them is a defect to be fixed:
+
+1. **The corpus is too small at the top end.** Phase 3 reads 18 files, of which
+   two are 50 MiB and four are 5 MiB. The tail of the phase is one thread
+   finishing a 50 MiB file while seven have nothing left to take. `large_50m`
+   is the clearest case — 5 files, 2 of which reach phase 3, so it is a two-way
+   parallel workload on an 8-core machine and it returned 2.03×, which is
+   essentially the whole of the available win. A real library has thousands of
+   files and this ceiling does not apply to it.
+2. **Six of the eight cores are fast and two are not.** The baseline's machine
+   section flagged this in advance: a "one thread per logical core" default
+   cannot scale by eight on this CPU, and a figure below 8× is the expected
+   shape rather than a failure.
+3. **BLAKE3 is memory-bandwidth-bound before it is core-bound.** At 3.18 GiB/s
+   against page-cached bytes, phase 3 is reading from RAM as fast as it hashes;
+   adding threads past that point buys progressively less.
+
+### The small-file tier: the prediction was wrong, in the cautious direction
+
+The baseline section this replaces named `small_100k` as the tier to watch, on
+the argument that at ~101 µs per file phase 2 is bound by `open`/`seek`/`read`/
+`close` rather than by hashing, and that threads do not make a syscall cheaper.
+
+It improved 1.96×, and phase 2 — the phase that argument was about — improved
+2.77×, better than phase 3 did.
+
+The reasoning was right about the cost and wrong about the conclusion. Threads do
+not make a syscall cheaper, but they do let several be in flight at once: the
+kernel work of eight concurrent `open`s overlaps on eight cores much as eight
+concurrent hashes do. Per read across the small tier (36 reads: 24 in phase 2,
+12 in phase 3), the cost fell from 77.6 µs to 39.5 µs; the tier's effective rate
+against the 2.70 MiB it actually reads went from 0.942 GiB/s to 1.849 GiB/s.
+
+No tier regressed, and none failed to improve, so there is nothing here of the
+kind that was to be reported rather than quietly shipped. The one number that
+moved without a cause behind it is phase 1, and it is dissected above rather
+than left in the table to be read as a win.
+
+### What this corpus cannot measure
+
+**There is no sub-64 KiB tier, so the partial-hash promotion scores exactly 0%
+here.** The promotion only fires when a file is no larger than
+`PARTIAL_HASH_BYTES` (64 KiB), and the smallest tier is 100 KiB — the benchmark
+still reports the same `36 files reach phase 2, 18 reach phase 3` it did before
+that change. That is a property of the corpus, not of the change.
+
+**A tier was deliberately not added to fix this.** Every phase benchmark and the
+`mixed` cascade run over the whole corpus, so a new tier changes their input and
+retires the serial column above as a comparison — trading the measurement this
+document exists for against a second measurement of something already measured
+another way. The promotion was instead measured directly, on a tree built for it:
+6 400 duplicate 40 KiB files (250 MB), page-cache warm on this machine, whole-run
+wall clock 0.61 s → 0.52 s (median of seven, interleaved with the control), with
+phase 3 going from 6 400 reads to zero. The deterministic half of that claim —
+that the second read does not happen — is asserted by unit tests rather than
+timed.
+
+If a small-file tier is ever wanted here, add it as a *fourth* tier in a new
+document with its own before/after pair, rather than editing this corpus.
+
+### Verification
+
+`code/tests/dedup.rs` — the eleven end-to-end tests that pin what a user
+actually gets — all pass unchanged: the retained original, the group directories,
+the manifests, and `one_thread_plans_exactly_what_the_parallel_default_plans`.
+The full suite is 566 tests across all targets, all passing. Speed is the only
+thing these numbers were allowed to change.
