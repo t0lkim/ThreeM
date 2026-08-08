@@ -1459,3 +1459,106 @@ fn a_config_file_cannot_turn_on_committing() {
         "the library must be untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The move phase's own failure paths
+// ---------------------------------------------------------------------------
+
+/// `--no-prompt` is what a script passes, and it has to mean "carry on at every
+/// boundary" rather than "there are no boundaries". A run chunked one file at a
+/// time must still reach the end without asking anything.
+#[test]
+fn chunking_without_a_prompt_runs_to_the_end_and_asks_nothing() {
+    let tree = plain_tree();
+    let (_scratch, out_dir) = scratch_output();
+
+    let out = Command::cargo_bin("mmm")
+        .unwrap()
+        .arg(tree.path())
+        .arg("-o")
+        .arg(&out_dir)
+        .arg("--commit")
+        .arg("--no-prompt")
+        .arg("--chunk-size")
+        .arg("1")
+        .output()
+        .expect("running mmm chunked with no prompt");
+
+    assert_ok(&out, "a chunked commit run with --no-prompt");
+    assert!(
+        !stdout_of(&out).contains(CHUNK_PROMPT_PREFIX),
+        "--no-prompt must not reach a prompt:\n{}",
+        stdout_of(&out)
+    );
+    assert_eq!(
+        file_contents_by_marker(&out_dir).len(),
+        3,
+        "every chunk must have been processed"
+    );
+}
+
+/// The duplicate pass failing takes the run down before a single organised file
+/// moves — and the journal still gets its closing line, so `undo` is not left
+/// treating a run that moved nothing as interrupted.
+///
+/// The journal is written outside the library so that the library itself can be
+/// made read-only: with it inside, the run would fail earlier, at the journal,
+/// and this path would never be reached.
+#[test]
+#[cfg(unix)]
+fn a_duplicate_pass_that_cannot_write_stops_the_run_and_closes_the_journal() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("beach.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("copy.jpg", "beach.jpg");
+    let (_scratch, out_dir) = scratch_output();
+    let journal_home = TempDir::new().unwrap();
+    let journal_dir = journal_home.path().join("journal");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let Some(_guard) = common::deny_writes(&out_dir) else {
+        eprintln!(
+            "SKIPPED a_duplicate_pass_that_cannot_write_stops_the_run_and_closes_the_journal: \
+             writes to a 0o555 directory succeeded, so this process ignores permission bits \
+             (running as root?)"
+        );
+        return;
+    };
+
+    let out = Command::cargo_bin("mmm")
+        .unwrap()
+        .arg(tree.path())
+        .arg("-o")
+        .arg(&out_dir)
+        .arg("--commit")
+        .arg("--no-prompt")
+        .arg("--journal-dir")
+        .arg(&journal_dir)
+        .output()
+        .expect("running mmm into a read-only library");
+
+    assert!(
+        !out.status.success(),
+        "a duplicate pass that cannot write must not exit 0:\n{}",
+        stdout_of(&out)
+    );
+
+    let mut journals: Vec<PathBuf> = std::fs::read_dir(&journal_dir)
+        .expect("the journal directory the run was told to use")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .collect();
+    journals.sort();
+    assert_eq!(journals.len(), 1, "the run opened exactly one journal");
+    let (_, entries) = Journal::read(&journals[0]).expect("the journal must be readable");
+    assert!(
+        entries
+            .iter()
+            .any(|e| matches!(e, JournalEntry::RunCompleted { .. })),
+        "the journal owes a closing line even when the run stops early: {entries:?}"
+    );
+    assert!(
+        tree.join("copy.jpg").exists(),
+        "nothing may have moved out of the input tree"
+    );
+}

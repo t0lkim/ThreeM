@@ -115,6 +115,10 @@ fn stdout_of(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn stderr_of(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 /// A scratch directory whose `out` child does not yet exist.
 fn scratch_output() -> (TempDir, PathBuf) {
     let dir = TempDir::new().expect("creating output TempDir");
@@ -782,4 +786,105 @@ fn journal_list_is_newest_first_and_journal_show_renders_a_run() {
         &out_dir.display().to_string(),
     ]);
     assert_failed(&missing, "journal show for a run that was never recorded");
+}
+
+// ---------------------------------------------------------------------------
+// Resolving which run to undo
+//
+// The three ways `mmm undo` can fail to find a run are all in `main`, and all
+// three are the first thing an operator meets when they reach for undo under
+// pressure. A wrong message here sends somebody looking for a journal that was
+// never written, or worse, convinces them a run they did make was not recorded.
+// ---------------------------------------------------------------------------
+
+/// `--run` naming an id that was never recorded is refused, and the refusal
+/// says where to look for the ones that were.
+#[test]
+fn undo_of_a_run_that_was_never_recorded_is_refused() {
+    let tree = nested_tree();
+    let (_out, out_dir) = scratch_output();
+    assert_ok(&organise_commit(tree.path(), &out_dir), "organise --commit");
+
+    let out = undo(&out_dir, &["--run", "20240101-000000-zzzzzz", "--commit"]);
+    assert_failed(&out, "undo of an unrecorded run");
+
+    let text = stderr_of(&out);
+    assert!(
+        text.contains("20240101-000000-zzzzzz") && text.contains("mmm journal list"),
+        "the refusal must name the run and point at the listing:\n{text}"
+    );
+}
+
+/// `--run` naming a run that *was* recorded reverses exactly that run, which is
+/// how an operator undoes something other than the most recent thing they did.
+#[test]
+fn undo_of_a_named_run_reverses_that_run() {
+    let tree = nested_tree();
+    let (_out, out_dir) = scratch_output();
+
+    let before = snapshot_tree_hashed(tree.path());
+    assert_ok(&organise_commit(tree.path(), &out_dir), "organise --commit");
+
+    let ids = run_ids_in(&out_dir);
+    assert_eq!(ids.len(), 1, "one run, one journal: {ids:?}");
+
+    let out = undo(&out_dir, &["--run", &ids[0], "--commit"]);
+    assert_ok(&out, "undo --run of a recorded run");
+
+    assert_eq!(
+        snapshot_tree_hashed(tree.path()),
+        before,
+        "naming the run explicitly must reverse it as completely as --last does"
+    );
+}
+
+/// And a library nobody has ever organised into says so, rather than reporting
+/// an io error about a directory that was never meant to exist yet.
+#[test]
+fn undo_in_a_library_with_no_runs_says_there_is_nothing_to_undo() {
+    let (_out, out_dir) = scratch_output();
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let out = undo(&out_dir, &["--commit"]);
+    assert_failed(&out, "undo in a library with no runs");
+
+    let text = stderr_of(&out);
+    assert!(
+        text.contains("nothing to undo") && text.contains(&out_dir.display().to_string()),
+        "the message must name the library it looked in:\n{text}"
+    );
+}
+
+/// A journal with nothing to reverse is reversed by doing nothing — and
+/// crucially without writing an undo journal of its own, or a library would
+/// accumulate a growing trail of empty undos every time somebody
+/// double-checked it.
+///
+/// The journal is written by hand rather than produced by a run, because a run
+/// that records a header and then moves nothing is exactly what an interruption
+/// between the two leaves behind, and there is no way to ask the binary for one.
+#[test]
+fn undo_of_a_journal_with_no_moves_records_no_undo() {
+    let (_out, out_dir) = scratch_output();
+    let journal_dir = out_dir.join(".mmm/journal");
+    let run_id = "20240315-103000-aaaaaa";
+    drop(
+        Journal::create(
+            &journal_dir,
+            &mmm::journal::RunHeader::new(run_id, &out_dir, vec!["mmm".to_string()]),
+        )
+        .expect("writing a header-only journal"),
+    );
+
+    let before = run_ids_in(&out_dir);
+    assert_eq!(before, vec![run_id.to_string()], "got: {before:?}");
+
+    let out = undo(&out_dir, &["--commit"]);
+    assert_ok(&out, "undo of a journal with no moves");
+
+    assert_eq!(
+        run_ids_in(&out_dir),
+        before,
+        "an undo that reverses nothing must not add a journal of its own"
+    );
 }

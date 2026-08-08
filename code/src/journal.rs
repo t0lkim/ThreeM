@@ -912,4 +912,134 @@ mod tests {
             Vec::<PathBuf>::new()
         );
     }
+
+    /// "Could not look" is not "nothing to look at". A directory that exists
+    /// but refuses to be read has to surface as an error, because the
+    /// alternative — reporting it as an empty list — tells somebody with a
+    /// permissions problem that their run was never recorded, which is exactly
+    /// the moment they most need the journal to still be there.
+    ///
+    /// Unix-only: the mode bits are the portable way to make a readable
+    /// directory unreadable, and Windows has no equivalent that `fs::read_dir`
+    /// honours the same way.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_journal_directory_is_an_error_not_an_empty_list() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("journal");
+        fs::create_dir(&dir).unwrap();
+        drop(Journal::create(&dir, &header("20240315-103000-aaaaaa")).unwrap());
+
+        // Running as root defeats the mode bits entirely — the read succeeds
+        // and there is nothing to assert. Skip rather than fail: a CI image
+        // that runs its tests as root should not turn this into a red build.
+        if nix_is_root() {
+            return;
+        }
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = journals_newest_first(&dir);
+        // Restore before asserting, so a failure does not leave the TempDir
+        // undeletable and take the rest of the suite down with it.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("an unreadable directory must not read as 'no runs'");
+        assert!(
+            format!("{err:#}").contains("reading the journal directory"),
+            "the error must name what could not be read: {err:#}"
+        );
+    }
+
+    /// `geteuid` without a libc dependency: the effective uid is the first
+    /// field of the `Uid:` line in `/proc/self/status` on Linux, and on macOS
+    /// there is no `/proc`, so fall back to `id -u`. Both are cheap and this
+    /// runs once, in one test.
+    #[cfg(unix)]
+    fn nix_is_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .is_some_and(|uid| uid.trim() == "0")
+    }
+
+    /// A blank line inside a journal is skipped rather than treated as a
+    /// corrupt entry. Nothing this tool writes produces one, but a journal is a
+    /// plain text file in somebody's library, and a stray newline from an
+    /// editor must not make the run un-undoable.
+    #[test]
+    fn a_blank_line_inside_a_journal_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let mut journal = Journal::create(tmp.path(), &header("20240315-103000-abc123")).unwrap();
+        journal.append(&intent(0)).unwrap();
+        journal.append(&committed(0)).unwrap();
+        let path = journal.path().to_path_buf();
+        drop(journal);
+
+        // Re-write the same journal with a blank line between the two entries.
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        fs::write(
+            &path,
+            format!("{}\n{}\n\n{}\n", lines[0], lines[1], lines[2]),
+        )
+        .unwrap();
+
+        let (read_header, entries) = Journal::read(&path).unwrap();
+        assert_eq!(read_header.run_id, "20240315-103000-abc123");
+        assert_eq!(entries, vec![intent(0), committed(0)]);
+    }
+
+    /// A corrupt line can be the whole remainder of a large entry. The error an
+    /// operator reads quotes a bounded prefix and says how much it left out,
+    /// rather than pasting kilobytes of JSON into their terminal.
+    #[test]
+    fn a_long_corrupt_line_is_elided_in_the_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut journal = Journal::create(tmp.path(), &header("20240315-103000-abc123")).unwrap();
+        journal.append(&intent(0)).unwrap();
+        let path = journal.path().to_path_buf();
+        drop(journal);
+
+        // Two junk lines: only a truncated *final* line is recoverable, so the
+        // corrupt one has to sit in the middle to be reported at all.
+        let long = "x".repeat(500);
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        fs::write(&path, format!("{}\n{long}\n{}\n", lines[0], lines[1])).unwrap();
+
+        let err = Journal::read(&path).expect_err("a corrupt middle line must not be recovered");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("… (500 bytes)"),
+            "the error must say how much it elided: {text}"
+        );
+        assert!(
+            !text.contains(&long),
+            "the whole 500-byte line must not be quoted back"
+        );
+    }
+
+    /// The other side of the same boundary: a line short enough to read in full
+    /// is quoted in full, so `elide` is not silently truncating everything.
+    #[test]
+    fn a_short_corrupt_line_is_quoted_whole() {
+        let tmp = TempDir::new().unwrap();
+        let mut journal = Journal::create(tmp.path(), &header("20240315-103000-abc123")).unwrap();
+        journal.append(&intent(0)).unwrap();
+        let path = journal.path().to_path_buf();
+        drop(journal);
+
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        fs::write(&path, format!("{}\nnot json\n{}\n", lines[0], lines[1])).unwrap();
+
+        let err = Journal::read(&path).expect_err("a corrupt middle line must not be recovered");
+        let text = format!("{err:#}");
+        assert!(text.contains("not json"), "got: {text}");
+        assert!(!text.contains('…'), "nothing to elide: {text}");
+    }
 }

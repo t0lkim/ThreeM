@@ -248,6 +248,12 @@ impl SidecarIndex {
                     // established; `first` rather than `[0]` because a panicking
                     // index in a library that moves photo libraries is not worth
                     // the character it saves.
+                    //
+                    // The `None` arm of this `if let` is consequently
+                    // unreachable and shows as uncovered. It is deliberate: an
+                    // empty `parents` cannot be constructed here — a key only
+                    // exists once something has been pushed under it — and the
+                    // alternative to stepping over it is an `unwrap`.
                     if let Some(parent) = parents.first() {
                         debug!(
                             sidecar = %sidecar.display(),
@@ -462,6 +468,33 @@ mod tests {
             ["/p/CLIP.mp4.xmp", "/p/CLIP.thm", "/p/CLIP.xmp"],
             "sorted, so two machines walking the same tree journal the same order"
         );
+    }
+
+    /// A path with no parent directory is `/` itself, and nothing about it is
+    /// a photograph. It has to be stepped over rather than indexed under a key
+    /// built from a directory that does not exist — the alternative is a panic
+    /// or a pairing against the root of the volume.
+    #[test]
+    fn a_media_path_with_no_parent_directory_is_stepped_over() {
+        let index = index(&["/", "/p/IMG_1234.cr2"], &["/p/IMG_1234.xmp"]);
+
+        assert_eq!(index.paired(), 1);
+        assert_eq!(
+            paired_with(&index, "/p/IMG_1234.cr2"),
+            [("/p/IMG_1234.xmp".to_string(), Convention::Stem)]
+        );
+    }
+
+    /// And the same on the sidecar side: something with no parent and no stem
+    /// can be paired with nothing, so it is reported as the orphan it is
+    /// rather than silently dropped from the run's tally.
+    #[test]
+    fn a_sidecar_path_with_no_parent_directory_is_an_orphan() {
+        let index = index(&["/p/IMG_1234.cr2"], &["/"]);
+
+        assert_eq!(index.paired(), 0);
+        assert_eq!(index.orphans().len(), 1);
+        assert_eq!(index.orphans()[0].reason, OrphanReason::NoParent);
     }
 
     #[test]

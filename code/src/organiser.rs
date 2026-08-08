@@ -346,6 +346,25 @@ struct GroupManifest {
     path: PathBuf,
 }
 
+// Test-only: how many appends a manifest created on this thread accepts before
+// every subsequent one fails.
+//
+// A write to an already-open file descriptor cannot be made to fail portably
+// from a test — the disk going away mid-group is not reproducible — and "stop
+// the group rather than relocate files nothing is recording" is exactly the
+// behaviour that must not be shipped unexecuted. Same reasoning as
+// `Sink::Failing` for the journal and the injected `copy` parameter on
+// `copy_verify_delete`: the failure is introduced at the seam where a real one
+// would appear.
+//
+// Thread-local rather than a `static`, so one test arming it cannot change what
+// another test executes.
+#[cfg(test)]
+thread_local! {
+    static MANIFEST_APPENDS_ACCEPTED: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl GroupManifest {
     /// Create the manifest and write everything known before the moves begin.
     ///
@@ -396,6 +415,17 @@ impl GroupManifest {
     /// Returns the underlying write or sync error. The caller stops moving the
     /// group rather than continuing without a record.
     fn append(&mut self, line: &str) -> Result<()> {
+        #[cfg(test)]
+        if let Some(remaining) = MANIFEST_APPENDS_ACCEPTED.get() {
+            if remaining == 0 {
+                bail!(
+                    "appending to manifest {}: the disk went away",
+                    self.path.display()
+                );
+            }
+            MANIFEST_APPENDS_ACCEPTED.set(Some(remaining - 1));
+        }
+
         io::Write::write_all(&mut self.file, line.as_bytes())
             .and_then(|()| self.file.sync_data())
             .with_context(|| format!("appending to manifest {}", self.path.display()))
@@ -513,13 +543,19 @@ enum Sink<'a> {
     /// `--no-journal`, and the tests that are not about journalling.
     Off,
     Open(&'a mut Journal),
-    /// Every write fails. An open file descriptor cannot be made to fail from
-    /// a test — the disk going away mid-run is not reproducible — so the one
-    /// behaviour that matters, *stop rather than move unrecorded*, is driven
-    /// through this instead. Same reasoning as the injected `copy` parameter
-    /// on [`copy_verify_delete`].
+    /// Writes fail once `accepted` of them have succeeded. An open file
+    /// descriptor cannot be made to fail from a test — the disk going away
+    /// mid-run is not reproducible — so the one behaviour that matters, *stop
+    /// rather than move unrecorded*, is driven through this instead. Same
+    /// reasoning as the injected `copy` parameter on [`copy_verify_delete`].
+    ///
+    /// The counter is what makes "the journal died *after* the file moved"
+    /// reachable: with `accepted = 1` the intent is written, the move happens,
+    /// and the outcome is refused — the state undo has to survive.
     #[cfg(test)]
-    Failing,
+    Failing {
+        accepted: usize,
+    },
 }
 
 impl<'a> MoveRecorder<'a> {
@@ -536,17 +572,36 @@ impl<'a> MoveRecorder<'a> {
 
     #[cfg(test)]
     fn failing() -> Self {
+        Self::failing_after(0)
+    }
+
+    /// A recorder whose first `accepted` writes succeed and whose every write
+    /// after that fails.
+    #[cfg(test)]
+    fn failing_after(accepted: usize) -> Self {
         Self {
-            sink: Sink::Failing,
+            sink: Sink::Failing { accepted },
         }
     }
 
     fn append(&mut self, entry: &JournalEntry) -> Result<()> {
         match &mut self.sink {
+            // Unreachable in production: `intend` returns before appending when
+            // the sink is off, and `commit`/`failed` return before appending
+            // when there is no sequence number — which there never is. Kept as
+            // the total match it has to be rather than an `unreachable!()`,
+            // because a panic here is a panic in the middle of moving somebody's
+            // photograph.
             Sink::Off => Ok(()),
             Sink::Open(journal) => journal.append(entry),
             #[cfg(test)]
-            Sink::Failing => bail!("the journal is on a disk that went away"),
+            Sink::Failing { accepted } => {
+                if *accepted == 0 {
+                    bail!("the journal is on a disk that went away");
+                }
+                *accepted -= 1;
+                Ok(())
+            }
         }
     }
 
@@ -560,7 +615,7 @@ impl<'a> MoveRecorder<'a> {
             Sink::Off => return Ok(None),
             Sink::Open(journal) => journal.next_seq(),
             #[cfg(test)]
-            Sink::Failing => 0,
+            Sink::Failing { .. } => 0,
         };
 
         // Stat now rather than carrying the scan's figure: undo compares this
@@ -1662,6 +1717,7 @@ fn cross_volume_move(src: &Path, dst: &Path) -> Result<(), MoveError> {
 )]
 mod tests {
     use super::*;
+    use crate::sidecar::Convention;
     use tempfile::TempDir;
 
     /// The layout a run with no config file uses, so that every assertion below
@@ -3112,5 +3168,903 @@ mod tests {
         );
         assert_eq!(dir, PathBuf::from("unsorted"));
         assert_eq!(name, "unknown.jpg");
+    }
+
+    // -----------------------------------------------------------------
+    // The failure paths
+    //
+    // Everything below drives a branch that only runs when something has
+    // already gone wrong. They are the branches that matter most and the ones
+    // a passing run never touches, so without a test here they are shipped
+    // unexecuted — and the code that runs after a photograph has moved but
+    // before it has been recorded is the code with the least room to be wrong.
+    // -----------------------------------------------------------------
+
+    /// Run `f` with a subscriber attached, so the `error!`/`debug!` calls on
+    /// the failure paths actually render their arguments.
+    ///
+    /// Without one, `tracing` short-circuits before evaluating the format
+    /// arguments and a `Display` impl that panicked mid-run would never be
+    /// exercised by the suite. Scoped rather than global: `with_default` is
+    /// thread-local, so one test enabling logging cannot silently change what
+    /// another test executes.
+    ///
+    /// The output goes to `io::sink` — this is about running the formatting
+    /// code, not about reading it.
+    fn with_logs<T>(f: impl FnOnce() -> T) -> T {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f)
+    }
+
+    /// True when the process ignores permission bits, which is what running as
+    /// root means for every test below that revokes them.
+    fn permission_bits_apply(dir: &Path) -> bool {
+        fs::write(dir.join(".probe"), b"p").is_err()
+    }
+
+    /// A planned move carrying one sidecar.
+    fn plan_with_sidecar(src: &Path, dst: &Path, sidecar: &Path) -> PlannedMove {
+        PlannedMove {
+            sidecars: vec![Sidecar {
+                path: sidecar.to_path_buf(),
+                convention: Convention::Stem,
+            }],
+            ..plan(src, dst)
+        }
+    }
+
+    /// A sidecar that will not move is counted and stepped over. The
+    /// photograph has already arrived, and unwinding that to keep the pair
+    /// together would answer a non-destructive problem destructively.
+    #[test]
+    fn a_sidecar_that_cannot_move_is_counted_and_the_photograph_is_left_where_it_landed() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        let src = input.join("photo.jpg");
+        fs::write(&src, b"BODY").unwrap();
+
+        // The sidecar is named but never written, so its move fails at the
+        // link with `ENOENT` — the shape of a file deleted between the scan
+        // and the move.
+        let planned = plan_with_sidecar(&src, &output.join("photo.jpg"), &input.join("photo.xmp"));
+
+        let run = with_logs(|| {
+            process_moves(
+                std::slice::from_ref(&planned),
+                0,
+                &mut ScriptedController::new(&[]),
+                &mut MoveRecorder::disabled(),
+            )
+        });
+
+        assert_eq!((run.moved, run.errors), (1, 0));
+        assert_eq!(
+            (run.sidecars.moved, run.sidecars.errors),
+            (0, 1),
+            "the sidecar failure belongs to the sidecar counts, not the file ones"
+        );
+        assert!(!run.journal_failed);
+        assert!(output.join("photo.jpg").exists(), "the photograph landed");
+    }
+
+    /// The journal refusing a write while a sidecar is in flight stops the run
+    /// — the same rule as for a photograph, because `undo` replays both from
+    /// the same record.
+    #[test]
+    fn a_journal_failure_while_moving_a_sidecar_stops_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        let src = input.join("photo.jpg");
+        let sidecar = input.join("photo.xmp");
+        fs::write(&src, b"BODY").unwrap();
+        fs::write(&sidecar, b"<xmp/>").unwrap();
+
+        let planned = plan_with_sidecar(&src, &output.join("photo.jpg"), &sidecar);
+
+        // Two writes accepted — the photograph's intent and its outcome — then
+        // the sidecar's intent is refused.
+        let run = with_logs(|| {
+            process_moves(
+                std::slice::from_ref(&planned),
+                0,
+                &mut ScriptedController::new(&[]),
+                &mut MoveRecorder::failing_after(2),
+            )
+        });
+
+        assert!(
+            run.sidecars.journal_failed && run.journal_failed,
+            "a sidecar's journal failure must stop the whole run, not just its own loop"
+        );
+        assert_eq!(
+            run.moved, 1,
+            "the photograph did move and is recorded as such"
+        );
+        assert_eq!(run.sidecars.moved, 0);
+        assert!(
+            sidecar.exists(),
+            "the sidecar must not move once its intent was refused"
+        );
+    }
+
+    /// The journal dying between the move and the outcome line is the state
+    /// `undo` exists to survive: the file *has* moved, so it is counted as
+    /// moved, and the run stops rather than accumulating more of them.
+    #[test]
+    fn a_journal_failure_after_the_file_moved_still_counts_the_move() {
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+
+        // One write accepted: the first file's intent. Its outcome is refused.
+        let run = with_logs(|| {
+            process_moves(
+                &planned,
+                0,
+                &mut ScriptedController::new(&[]),
+                &mut MoveRecorder::failing_after(1),
+            )
+        });
+
+        assert!(run.journal_failed);
+        assert_eq!(
+            (run.moved, run.errors, run.unprocessed),
+            (1, 0, 3),
+            "the file that moved is counted, and every other file is accounted for"
+        );
+        assert!(
+            planned[0].destination.exists(),
+            "the first file moved before the journal refused its outcome"
+        );
+        assert!(
+            planned[1].source.exists(),
+            "nothing after the failure was attempted"
+        );
+    }
+
+    /// A move that fails *and* a journal that cannot record the failure is
+    /// reported as the journal failure, because that is the condition that
+    /// stops the run — the failed move on its own would not have.
+    #[test]
+    fn a_journal_that_cannot_record_a_failed_move_reports_the_journal() {
+        let tmp = TempDir::new().unwrap();
+        let planned = plan(
+            &tmp.path().join("gone.jpg"),
+            &tmp.path().join("output/photo.jpg"),
+        );
+
+        // The intent is accepted; the move fails on the missing source; the
+        // `failed` line is refused.
+        let mut recorder = MoveRecorder::failing_after(1);
+        let err = with_logs(|| {
+            recorded_move(
+                &mut recorder,
+                &planned,
+                MovePurpose::Organise { hash: None },
+            )
+            .expect_err("a refused journal write must not report a successful move")
+        });
+
+        match err {
+            RecordedMoveError::Journal { moved, .. } => assert!(
+                !moved,
+                "nothing moved, so the caller must not be told a file is unaccounted for"
+            ),
+            RecordedMoveError::Move(e) => {
+                panic!("the journal failure must win over the move failure: {e}")
+            }
+        }
+    }
+
+    /// The duplicate pass stops the whole run on a journal failure rather than
+    /// relocating the rest of the group into a numbered directory with nothing
+    /// on disk saying where those files came from.
+    #[test]
+    fn a_journal_failure_while_relocating_a_duplicate_abandons_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let output = tmp.path().join("output");
+
+        let kept = input.join("kept.jpg");
+        let copy = input.join("copy.jpg");
+        for path in [&kept, &copy] {
+            fs::write(path, b"BODY").unwrap();
+        }
+        let group = duplicate_group(&[kept, copy.clone()], b"BODY");
+
+        let err = with_logs(|| {
+            move_duplicates(
+                &[group],
+                &output,
+                Path::new("duplicates"),
+                &SidecarIndex::empty(),
+                &mut MoveRecorder::failing(),
+            )
+            .expect_err("a refused journal write must stop the duplicate pass")
+        });
+
+        assert!(
+            format!("{err:#}").contains("left where they are"),
+            "the operator has to be told the rest were not touched; got: {err:#}"
+        );
+        assert!(copy.exists(), "the duplicate must not have moved");
+    }
+
+    /// And the same for a duplicate's sidecar: the photograph reached
+    /// `duplicates/000/`, its `.xmp` could not be recorded, and the pass stops
+    /// rather than carrying on unrecorded.
+    #[test]
+    fn a_journal_failure_while_moving_a_duplicates_sidecar_abandons_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let output = tmp.path().join("output");
+
+        let kept = input.join("kept.jpg");
+        let copy = input.join("copy.jpg");
+        let sidecar = input.join("copy.xmp");
+        for path in [&kept, &copy] {
+            fs::write(path, b"BODY").unwrap();
+        }
+        fs::write(&sidecar, b"<xmp/>").unwrap();
+
+        let group = duplicate_group(&[kept, copy.clone()], b"BODY");
+        let index = SidecarIndex::build(
+            &[ScannedFile {
+                path: copy.clone(),
+                size: 4,
+                extension: "jpg".to_string(),
+                is_video: false,
+            }],
+            std::slice::from_ref(&sidecar),
+        );
+        assert_eq!(index.paired(), 1, "the fixture must actually pair");
+
+        // The duplicate's own intent and outcome are accepted; the sidecar's
+        // intent is refused.
+        let err = with_logs(|| {
+            move_duplicates(
+                &[group],
+                &output,
+                Path::new("duplicates"),
+                &index,
+                &mut MoveRecorder::failing_after(2),
+            )
+            .expect_err("a refused journal write must stop the duplicate pass")
+        });
+
+        assert!(
+            format!("{err:#}").contains("sidecar of duplicate"),
+            "the error must name what was in flight; got: {err:#}"
+        );
+        assert!(sidecar.exists(), "the sidecar must not have moved");
+    }
+
+    /// Arm the manifest failure injection for the duration of `f`, and disarm
+    /// it afterwards however `f` ends.
+    fn with_manifest_failing_after<T>(accepted: usize, f: impl FnOnce() -> T) -> T {
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                MANIFEST_APPENDS_ACCEPTED.set(None);
+            }
+        }
+        MANIFEST_APPENDS_ACCEPTED.set(Some(accepted));
+        let _disarm = Disarm;
+        f()
+    }
+
+    /// A manifest that stops being writable stops its group. The rest of the
+    /// group is left where the user can still find it, and counted as errors
+    /// rather than quietly dropped from the totals — the alternative is files
+    /// relocated into a numbered directory with nothing on disk saying where
+    /// they came from.
+    #[test]
+    fn a_manifest_that_stops_being_writable_abandons_the_rest_of_its_group() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let output = tmp.path().join("output");
+
+        let files: Vec<PathBuf> = (0..4)
+            .map(|i| {
+                let path = input.join(format!("photo-{i}.jpg"));
+                fs::write(&path, b"BODY").unwrap();
+                path
+            })
+            .collect();
+        let group = duplicate_group(&files, b"BODY");
+
+        // One outcome line accepted — the first duplicate's — then the
+        // manifest refuses. Three duplicates are in the group, so two are
+        // abandoned.
+        let run = with_manifest_failing_after(1, || {
+            with_logs(|| {
+                move_duplicates(
+                    &[group],
+                    &output,
+                    Path::new("duplicates"),
+                    &SidecarIndex::empty(),
+                    &mut MoveRecorder::disabled(),
+                )
+            })
+        })
+        .expect("an unwritable manifest stops the group, it does not fail the pass");
+
+        assert_eq!(
+            (run.moved, run.errors),
+            (2, 1),
+            "two moves happened before the manifest refused; the last is counted as abandoned"
+        );
+        assert!(
+            files[3].exists(),
+            "the abandoned duplicate must still be where the user can find it"
+        );
+    }
+
+    /// The manifest refusing the *first* line stops the group before a second
+    /// file moves — the same ordering as the journal's, and for the same
+    /// reason.
+    #[test]
+    fn a_manifest_that_refuses_the_first_outcome_stops_the_group_immediately() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let output = tmp.path().join("output");
+
+        let files: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let path = input.join(format!("photo-{i}.jpg"));
+                fs::write(&path, b"BODY").unwrap();
+                path
+            })
+            .collect();
+        let group = duplicate_group(&files, b"BODY");
+
+        let run = with_manifest_failing_after(0, || {
+            with_logs(|| {
+                move_duplicates(
+                    &[group],
+                    &output,
+                    Path::new("duplicates"),
+                    &SidecarIndex::empty(),
+                    &mut MoveRecorder::disabled(),
+                )
+            })
+        })
+        .expect("an unwritable manifest stops the group, it does not fail the pass");
+
+        assert_eq!((run.moved, run.errors), (1, 1));
+        assert!(
+            files[2].exists(),
+            "nothing after the refused line may be relocated"
+        );
+    }
+
+    /// A sidecar's manifest line is subject to the same rule: the group stops
+    /// rather than carry on with an incomplete record.
+    #[test]
+    fn a_manifest_that_refuses_a_sidecar_line_stops_the_group() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let output = tmp.path().join("output");
+
+        let kept = input.join("kept.jpg");
+        let copy = input.join("copy.jpg");
+        let other = input.join("other.jpg");
+        for path in [&kept, &copy, &other] {
+            fs::write(path, b"BODY").unwrap();
+        }
+        let sidecar = input.join("copy.xmp");
+        fs::write(&sidecar, b"<xmp/>").unwrap();
+
+        let group = duplicate_group(&[kept, copy.clone(), other.clone()], b"BODY");
+        let index = SidecarIndex::build(
+            &[ScannedFile {
+                path: copy,
+                size: 4,
+                extension: "jpg".to_string(),
+                is_video: false,
+            }],
+            &[sidecar],
+        );
+
+        // The duplicate's own line is accepted; its sidecar's is refused.
+        let run = with_manifest_failing_after(1, || {
+            with_logs(|| {
+                move_duplicates(
+                    &[group],
+                    &output,
+                    Path::new("duplicates"),
+                    &index,
+                    &mut MoveRecorder::disabled(),
+                )
+            })
+        })
+        .expect("an unwritable manifest stops the group, it does not fail the pass");
+
+        assert_eq!(run.sidecars.moved, 1, "the sidecar itself did travel");
+        assert!(
+            other.exists(),
+            "the group stops once its record stops being complete"
+        );
+    }
+
+    /// Every candidate name being taken is a hard stop, not a silent skip: the
+    /// alternative is a photograph reported as moved that is still in the
+    /// source tree.
+    ///
+    /// Ten thousand occupied names is the documented cap, so this creates them.
+    #[test]
+    fn a_destination_with_every_candidate_taken_fails_rather_than_overwriting() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+
+        let src = input.join("photo.jpg");
+        fs::write(&src, b"BODY").unwrap();
+
+        let dst = output.join("photo.jpg");
+        fs::write(&dst, b"OCCUPIED").unwrap();
+        for attempt in 1..MAX_COLLISION_ATTEMPTS {
+            fs::write(collision_candidate(&dst, attempt), b"OCCUPIED").unwrap();
+        }
+
+        let err =
+            with_logs(|| execute_move(&plan(&src, &dst)).expect_err("no free name means no move"));
+        let chain = format!("{err:#}");
+
+        assert!(
+            chain.contains("no free destination") && chain.contains(&src.display().to_string()),
+            "the error must name the file that could not be filed; got: {chain}"
+        );
+        assert!(src.exists(), "the source must survive a failed move");
+        assert_eq!(
+            fs::read(&dst).unwrap(),
+            b"OCCUPIED",
+            "nothing may be overwritten"
+        );
+    }
+
+    /// A source `link(2)` cannot handle is answered with a copy, not with a
+    /// failure. Linking a *directory* returns `EPERM` on both Linux and macOS,
+    /// which is the same errno an exFAT card returns for a file — so this
+    /// drives the "link is impossible, copy instead" decision without needing
+    /// a second volume or a FAT filesystem on the machine running the tests.
+    ///
+    /// The copy then fails, because a directory has no bytes to copy. That is
+    /// the assertion: the decision was taken, and the failure that followed
+    /// left nothing behind.
+    #[test]
+    #[cfg(unix)]
+    fn a_source_that_cannot_be_linked_is_answered_with_a_copy() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("not-a-file");
+        fs::create_dir(&src).unwrap();
+        let output = tmp.path().join("output");
+        fs::create_dir_all(&output).unwrap();
+        let dst = output.join("photo.jpg");
+
+        let err = with_logs(|| {
+            execute_move(&plan(&src, &dst)).expect_err("a directory cannot be copied into place")
+        });
+
+        assert!(
+            format!("{err:#}").contains("temp file"),
+            "the copy path must have been taken; got: {err:#}"
+        );
+        let leftovers: Vec<String> = fs::read_dir(&output)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed copy must leave no temp file behind; found {leftovers:?}"
+        );
+    }
+
+    /// Claiming the destination can fail for reasons that are not "the name is
+    /// taken" — a directory that has gone away, most obviously. That must
+    /// surface as fatal rather than as a retryable collision, or the caller
+    /// walks ten thousand candidate names against a directory that is not
+    /// there.
+    #[test]
+    fn reserve_and_rename_reports_a_missing_directory_as_fatal() {
+        let tmp = TempDir::new().unwrap();
+        let temp_file = tmp.path().join("temp");
+        fs::write(&temp_file, b"BODY").unwrap();
+
+        let err = reserve_and_rename(&temp_file, &tmp.path().join("gone/photo.jpg"))
+            .expect_err("a missing destination directory must not read as a free name");
+
+        match err {
+            MoveError::Fatal(e) => assert!(
+                format!("{e:#}").contains("claiming destination"),
+                "got: {e:#}"
+            ),
+            MoveError::DestinationExists(p) => {
+                panic!(
+                    "a missing directory is not an occupied name: {}",
+                    p.display()
+                )
+            }
+        }
+    }
+
+    /// The placeholder `reserve_and_rename` creates is its own to clean up. A
+    /// rename that fails after the claim must not leave an empty file sitting
+    /// where a photograph was meant to go — indistinguishable from a
+    /// zero-length photo to everything except this code.
+    #[test]
+    fn a_failed_rename_removes_the_placeholder_it_claimed() {
+        let tmp = TempDir::new().unwrap();
+        let dst = tmp.path().join("photo.jpg");
+
+        let err = reserve_and_rename(&tmp.path().join("never-written"), &dst)
+            .expect_err("renaming a temp file that does not exist must fail");
+
+        match err {
+            MoveError::Fatal(e) => assert!(
+                format!("{e:#}").contains("renaming the verified copy"),
+                "got: {e:#}"
+            ),
+            MoveError::DestinationExists(p) => panic!("unexpected collision: {}", p.display()),
+        }
+        assert!(
+            !dst.exists(),
+            "the empty placeholder must not be left behind at {}",
+            dst.display()
+        );
+    }
+
+    /// Promotion failing at the link is fatal and says so. The temp file was
+    /// written beside the destination, so there is no second volume to fall
+    /// back to and no honest reason to copy again.
+    #[test]
+    fn promotion_that_cannot_link_is_fatal() {
+        let tmp = TempDir::new().unwrap();
+        let err = promote_into_place(
+            &tmp.path().join("never-written"),
+            &tmp.path().join("dst.jpg"),
+        )
+        .expect_err("promoting a temp file that does not exist must fail");
+
+        match err {
+            MoveError::Fatal(e) => assert!(
+                format!("{e:#}").contains("promoting the verified copy"),
+                "got: {e:#}"
+            ),
+            MoveError::DestinationExists(p) => panic!("unexpected collision: {}", p.display()),
+        }
+    }
+
+    /// Promotion onto an occupied name is a collision, not a failure — the
+    /// caller walks to the next candidate.
+    #[test]
+    fn promotion_onto_an_occupied_name_is_a_collision() {
+        let tmp = TempDir::new().unwrap();
+        let temp_file = tmp.path().join("temp");
+        let dst = tmp.path().join("dst.jpg");
+        fs::write(&temp_file, b"BODY").unwrap();
+        fs::write(&dst, b"OCCUPIED").unwrap();
+
+        match promote_into_place(&temp_file, &dst) {
+            Err(MoveError::DestinationExists(p)) => assert_eq!(p, dst),
+            other => panic!("an occupied destination must be reported as one: {other:?}"),
+        }
+        assert_eq!(fs::read(&dst).unwrap(), b"OCCUPIED");
+    }
+
+    /// A temp file that links into place but will not go away leaves two names
+    /// for one file. `link_and_unlink` drops the new name rather than leave
+    /// that state, and the failure is reported as the source-removal problem
+    /// it is.
+    #[test]
+    #[cfg(unix)]
+    fn promotion_that_cannot_remove_the_temp_file_is_fatal_and_unwinds() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        let output = tmp.path().join("output");
+        fs::create_dir_all(&locked).unwrap();
+        fs::create_dir_all(&output).unwrap();
+
+        let temp_file = locked.join("temp");
+        fs::write(&temp_file, b"BODY").unwrap();
+        let dst = output.join("photo.jpg");
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let applies = permission_bits_apply(&locked);
+        let result = if applies {
+            Some(promote_into_place(&temp_file, &dst))
+        } else {
+            None
+        };
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let Some(result) = result else {
+            eprintln!(
+                "SKIPPED promotion_that_cannot_remove_the_temp_file_is_fatal_and_unwinds: writes \
+                 to a 0o555 directory succeeded, so this process ignores permission bits (running \
+                 as root?)"
+            );
+            return;
+        };
+
+        match result.expect_err("a temp file that will not unlink must not report success") {
+            MoveError::Fatal(e) => assert!(
+                format!("{e:#}").contains("removing the temp file"),
+                "got: {e:#}"
+            ),
+            MoveError::DestinationExists(p) => panic!("unexpected collision: {}", p.display()),
+        }
+        assert!(
+            !dst.exists(),
+            "the link must be undone rather than leave two names for one file"
+        );
+        assert!(temp_file.exists(), "the temp file is still where it was");
+    }
+
+    /// Both kinds of move name themselves. The strings reach the operator via
+    /// the `moved` log line and the journal's rendering, so a `Display` that
+    /// panicked or said the wrong thing would be read as fact about what
+    /// happened to a photograph.
+    #[test]
+    fn both_move_kinds_describe_themselves() {
+        assert_eq!(MoveKind::Renamed.to_string(), "same-volume link");
+        assert_eq!(
+            MoveKind::CrossVolume.to_string(),
+            "cross-volume copy+verify+delete"
+        );
+    }
+
+    /// And both move errors. The occupied-name case is the one an operator
+    /// sees most, since it is what a second photograph with the same computed
+    /// name produces.
+    #[test]
+    fn both_move_errors_describe_themselves() {
+        let taken = MoveError::DestinationExists(PathBuf::from("/photos/2024-03-15/photo.jpg"));
+        assert_eq!(
+            taken.to_string(),
+            "destination /photos/2024-03-15/photo.jpg already exists"
+        );
+
+        let fatal = MoveError::Fatal(anyhow::anyhow!("inner").context("outer"));
+        assert_eq!(
+            fatal.to_string(),
+            "outer: inner",
+            "the whole context chain, because the outermost layer never says what went wrong"
+        );
+    }
+
+    /// The successful paths log too, and a `Display` that panicked while
+    /// rendering a path would take the run down *after* the photograph had
+    /// moved. Driving them with a subscriber attached is the only way the
+    /// suite executes that formatting at all.
+    #[test]
+    fn the_success_paths_render_their_log_lines() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        let src = input.join("photo.jpg");
+        let sidecar = input.join("photo.xmp");
+        fs::write(&src, b"BODY").unwrap();
+        fs::write(&sidecar, b"<xmp/>").unwrap();
+
+        let planned = plan_with_sidecar(&src, &output.join("photo.jpg"), &sidecar);
+        let run = with_logs(|| {
+            process_moves(
+                std::slice::from_ref(&planned),
+                0,
+                &mut ScriptedController::new(&[]),
+                &mut MoveRecorder::disabled(),
+            )
+        });
+
+        assert_eq!((run.moved, run.sidecars.moved), (1, 1));
+        assert!(output.join("photo.xmp").exists());
+    }
+
+    /// A failed move logs what it could not do. Same argument as above: the
+    /// line is rendered on the path where something has already gone wrong.
+    #[test]
+    fn a_failed_move_renders_its_log_line() {
+        let tmp = TempDir::new().unwrap();
+        let planned = plan(
+            &tmp.path().join("gone.jpg"),
+            &tmp.path().join("output/photo.jpg"),
+        );
+
+        let run = with_logs(|| {
+            process_moves(
+                std::slice::from_ref(&planned),
+                0,
+                &mut ScriptedController::new(&[]),
+                &mut MoveRecorder::disabled(),
+            )
+        });
+
+        assert_eq!((run.moved, run.errors), (0, 1));
+    }
+
+    /// A sidecar that moves but whose outcome cannot be recorded is still a
+    /// sidecar that moved, and the count has to say so — the alternative is a
+    /// summary that under-reports what is now in the output tree.
+    #[test]
+    fn a_sidecar_that_moved_before_the_journal_refused_is_still_counted() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        let src = input.join("photo.jpg");
+        let sidecar = input.join("photo.xmp");
+        fs::write(&src, b"BODY").unwrap();
+        fs::write(&sidecar, b"<xmp/>").unwrap();
+
+        let planned = plan_with_sidecar(&src, &output.join("photo.jpg"), &sidecar);
+
+        // Three writes accepted — the photograph's intent and outcome, and the
+        // sidecar's intent — then the sidecar's outcome is refused.
+        let run = with_logs(|| {
+            process_moves(
+                std::slice::from_ref(&planned),
+                0,
+                &mut ScriptedController::new(&[]),
+                &mut MoveRecorder::failing_after(3),
+            )
+        });
+
+        assert!(run.journal_failed);
+        assert_eq!(
+            run.sidecars.moved, 1,
+            "the sidecar reached the output tree and must be counted"
+        );
+        assert!(output.join("photo.xmp").exists());
+    }
+
+    /// A temp file `link(2)` cannot handle falls back to claim-and-rename,
+    /// which is the exFAT/FAT32 route. As with the move path, a directory
+    /// returns the same `EPERM` an unsupported filesystem does.
+    #[test]
+    #[cfg(unix)]
+    fn promotion_falls_back_to_claim_and_rename_when_links_are_unsupported() {
+        let tmp = TempDir::new().unwrap();
+        let temp_dir_as_file = tmp.path().join("temp");
+        fs::create_dir(&temp_dir_as_file).unwrap();
+        let dst = tmp.path().join("photo.jpg");
+
+        // The fallback claims `dst`, then fails to rename a directory over
+        // it — so the assertion is that the claim was cleaned up, which is the
+        // property the fallback owes its caller.
+        let err = promote_into_place(&temp_dir_as_file, &dst)
+            .expect_err("a directory cannot be renamed over a claimed file");
+
+        match err {
+            MoveError::Fatal(e) => assert!(
+                format!("{e:#}").contains("renaming the verified copy"),
+                "the claim-and-rename fallback must have been taken; got: {e:#}"
+            ),
+            MoveError::DestinationExists(p) => panic!("unexpected collision: {}", p.display()),
+        }
+        assert!(
+            !dst.exists(),
+            "the placeholder the fallback claimed must not be left behind"
+        );
+    }
+
+    /// A copy that reports success without writing anything must not be
+    /// believed. The verification reads the file back, and there is no file to
+    /// read — which has to fail loudly rather than delete the source.
+    #[test]
+    fn a_copy_that_wrote_nothing_fails_verification_and_spares_the_source() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("photo.jpg");
+        fs::write(&src, b"BODY").unwrap();
+        let dst = tmp.path().join("output.jpg");
+
+        let err = with_logs(|| {
+            copy_verify_delete(&src, &dst, |_, _| {
+                Ok(blake3::hash(b"BODY").to_hex().to_string())
+            })
+            .expect_err("a copy that wrote no file must not pass verification")
+        });
+
+        match err {
+            MoveError::Fatal(e) => assert!(
+                format!("{e:#}").contains("verifying the copy"),
+                "the failure must name the verification; got: {e:#}"
+            ),
+            MoveError::DestinationExists(p) => panic!("unexpected collision: {}", p.display()),
+        }
+        assert_eq!(fs::read(&src).unwrap(), b"BODY", "the source must survive");
+        assert!(!dst.exists());
+    }
+
+    /// The source is deleted last, and a deletion that fails is reported
+    /// rather than swallowed: the file now exists at both ends, and the next
+    /// run's dedup pass would otherwise "helpfully" find it as a duplicate of
+    /// itself.
+    #[test]
+    #[cfg(unix)]
+    fn a_source_that_cannot_be_removed_after_the_copy_is_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        let output = tmp.path().join("output");
+        fs::create_dir_all(&locked).unwrap();
+        fs::create_dir_all(&output).unwrap();
+
+        let src = locked.join("photo.jpg");
+        fs::write(&src, b"BODY").unwrap();
+        let dst = output.join("photo.jpg");
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let applies = permission_bits_apply(&locked);
+        let result = if applies {
+            Some(with_logs(|| {
+                copy_verify_delete(&src, &dst, crate::hasher::copy_hashing)
+            }))
+        } else {
+            None
+        };
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let Some(result) = result else {
+            eprintln!(
+                "SKIPPED a_source_that_cannot_be_removed_after_the_copy_is_reported: writes to a \
+                 0o555 directory succeeded, so this process ignores permission bits (running as \
+                 root?)"
+            );
+            return;
+        };
+
+        match result.expect_err("a source that will not go away must not report success") {
+            MoveError::Fatal(e) => assert!(
+                format!("{e:#}").contains("removing source file"),
+                "got: {e:#}"
+            ),
+            MoveError::DestinationExists(p) => panic!("unexpected collision: {}", p.display()),
+        }
+        assert_eq!(
+            fs::read(&dst).unwrap(),
+            b"BODY",
+            "the copy is verified and in place; only the removal failed"
+        );
+    }
+
+    /// The trait's defaults are the documented way to drive a run with no
+    /// terminal attached — "implements the trait and writes nothing". A
+    /// default that did not compile, or that answered `false`, would stop
+    /// every such run at the first chunk boundary.
+    #[test]
+    fn a_controller_that_implements_nothing_runs_every_chunk() {
+        struct Silent;
+        impl ChunkController for Silent {}
+
+        let tmp = TempDir::new().unwrap();
+        let planned = four_planned_moves(tmp.path());
+
+        let run = process_moves(&planned, 1, &mut Silent, &mut MoveRecorder::disabled());
+
+        assert_eq!(
+            (run.moved, run.errors, run.unprocessed),
+            (4, 0, 0),
+            "four chunks of one file each, none of them declined"
+        );
+        assert!(!run.stopped_early);
     }
 }

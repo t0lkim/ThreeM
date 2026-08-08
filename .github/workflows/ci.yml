@@ -61,6 +61,71 @@ jobs:
         working-directory: code
         run: cargo test --all-targets
 
+  coverage:
+    name: coverage floors (organiser · journal)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: code
+          # Instrumented builds share nothing with the plain test profile.
+          key: coverage
+
+      - name: cargo llvm-cov
+        working-directory: code
+        run: cargo llvm-cov --json --output-path coverage.json
+
+      - name: Upload the report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-json
+          path: code/coverage.json
+
+      # The two files that move and record other people's photographs. Every
+      # other module is measured and reported; these two are the only ones with
+      # a floor, because a drop here means a destructive branch stopped being
+      # exercised — which is the failure this whole gate exists to catch.
+      #
+      # The floors sit one point under the figures measured when they were set
+      # (organiser.rs 92.76%, journal.rs 96.88% — see
+      # docs/research/coverage-report.md). The margin absorbs the handful of
+      # `#[cfg(unix)]` tests and platform-specific error kinds that genuinely
+      # differ between runners; it is not room to let coverage rot. Raise both
+      # numbers when the real figure rises.
+      - name: Enforce the floors
+        working-directory: code
+        run: |
+          set -euo pipefail
+          check() {
+            file="$1"
+            floor="$2"
+            actual=$(jq -r --arg f "$file" '
+              .data[0].files[]
+              | select(.filename | endswith($f))
+              | .summary.lines.percent
+            ' coverage.json)
+            if [ -z "$actual" ] || [ "$actual" = "null" ]; then
+              echo "::error::$file is absent from the coverage report"
+              exit 1
+            fi
+            printf '%s: %.2f%% (floor %s%%)\n' "$file" "$actual" "$floor"
+            if awk -v a="$actual" -v f="$floor" 'BEGIN { exit !(a < f) }'; then
+              echo "::error::$file line coverage $actual% is below the floor of $floor%"
+              exit 1
+            fi
+          }
+          check src/organiser.rs 92.0
+          check src/journal.rs 96.0
+
   release-build:
     name: release build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
