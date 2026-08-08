@@ -56,6 +56,7 @@ use mmm::organiser::{
 };
 use mmm::scanner::ScanFilter;
 use mmm::settings::Settings;
+use mmm::sidecar::SidecarIndex;
 use mmm::timezone::{TimezonePolicy, TimezoneSource};
 use proptest::prelude::*;
 use tempfile::TempDir;
@@ -508,6 +509,7 @@ proptest! {
             scheme(),
             &TimezonePolicy::default(),
             policy,
+            &SidecarIndex::empty(),
             None,
         )
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
@@ -606,6 +608,7 @@ proptest! {
                 timezone_source: None,
                 has_location: false,
                 known_hash: None,
+                sidecars: Vec::new(),
             })
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
 

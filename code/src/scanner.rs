@@ -8,6 +8,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 use walkdir::{DirEntry, WalkDir};
 
+use crate::sidecar::DEFAULT_SIDECAR_EXTENSIONS;
 use crate::METADATA_DIR_NAME;
 
 /// Known image extensions (lowercase, no dot)
@@ -64,6 +65,11 @@ pub struct PatternError {
 pub struct ScanFilter {
     image: HashSet<String>,
     video: HashSet<String>,
+    /// Extensions that name a companion rather than a photograph — see
+    /// [`crate::sidecar`]. Empty when `--no-sidecars` is in force, which is all
+    /// it takes to make the whole feature disappear: nothing is collected, so
+    /// nothing is paired and nothing is moved.
+    sidecar: HashSet<String>,
     /// Patterns matched against one component's name.
     names: GlobSet,
     /// Patterns matched against the path relative to the scan root.
@@ -77,6 +83,10 @@ impl Default for ScanFilter {
         Self {
             image: IMAGE_EXTENSIONS.iter().map(|s| (*s).to_string()).collect(),
             video: VIDEO_EXTENSIONS.iter().map(|s| (*s).to_string()).collect(),
+            sidecar: DEFAULT_SIDECAR_EXTENSIONS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             names: GlobSet::empty(),
             paths: GlobSet::empty(),
         }
@@ -91,12 +101,20 @@ impl ScanFilter {
     /// compares against a lowercased extension and a config file saying `"JPG"`
     /// would otherwise match nothing at all.
     ///
+    /// An extension named in both a media list and the sidecar list is media.
+    /// The two questions the lists answer are not symmetric — being a
+    /// photograph is a claim about the file itself, being a sidecar is a claim
+    /// about its relationship to another file — so the specific claim wins, and
+    /// a mistyped sidecar list can never make somebody's photographs stop being
+    /// organised.
+    ///
     /// # Errors
     ///
     /// [`PatternError`] naming the first skip pattern that is not a glob.
     pub fn new(
         image: &[String],
         video: &[String],
+        sidecar: &[String],
         skip_patterns: &[String],
     ) -> Result<Self, PatternError> {
         let mut names = GlobSetBuilder::new();
@@ -111,9 +129,17 @@ impl ScanFilter {
             }
         }
 
+        let image: HashSet<String> = image.iter().map(|e| e.to_lowercase()).collect();
+        let video: HashSet<String> = video.iter().map(|e| e.to_lowercase()).collect();
+
         Ok(Self {
-            image: image.iter().map(|e| e.to_lowercase()).collect(),
-            video: video.iter().map(|e| e.to_lowercase()).collect(),
+            sidecar: sidecar
+                .iter()
+                .map(|e| e.to_lowercase())
+                .filter(|e| !image.contains(e) && !video.contains(e))
+                .collect(),
+            image,
+            video,
             names: build(&names, skip_patterns)?,
             paths: build(&paths, skip_patterns)?,
         })
@@ -133,23 +159,32 @@ impl ScanFilter {
         self.paths.is_match(relative)
     }
 
-    /// The kind of media `extension` names, if it names one.
-    fn kind(&self, extension: &str) -> Option<MediaKind> {
+    /// What `extension` names, if it names anything the scan collects.
+    fn kind(&self, extension: &str) -> Option<Admitted> {
         if self.image.contains(extension) {
-            Some(MediaKind::Image)
+            Some(Admitted::Image)
         } else if self.video.contains(extension) {
-            Some(MediaKind::Video)
+            Some(Admitted::Video)
+        } else if self.sidecar.contains(extension) {
+            Some(Admitted::Sidecar)
         } else {
             None
         }
     }
 }
 
-/// Which of the two extension lists admitted a file.
+/// Which of the three extension lists admitted a file.
+///
+/// A sidecar is admitted by the walk and then kept apart from the media: it is
+/// collected because a second pass over the tree to find it would be a second
+/// walk of somebody's entire photo library, and it is kept apart because it is
+/// not a photograph — nothing downstream may deduplicate it, date it, or count
+/// it among the files a run found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MediaKind {
+enum Admitted {
     Image,
     Video,
+    Sidecar,
 }
 
 /// Compile one pattern, naming it if it will not compile.
@@ -197,6 +232,15 @@ pub struct ScannedFile {
 pub struct ScanResult {
     /// Media files successfully discovered, in filesystem walk order.
     pub files: Vec<ScannedFile>,
+    /// Sidecar files discovered, in filesystem walk order — see
+    /// [`crate::sidecar`]. Empty when sidecar handling is off.
+    ///
+    /// Kept out of `files` rather than flagged inside it, because every count,
+    /// every hash and every date derivation downstream treats that list as
+    /// photographs. A sidecar that arrived there would be deduplicated against
+    /// real media, dated from its own filesystem timestamp, and reported in the
+    /// scan totals as a photograph the user does not have.
+    pub sidecars: Vec<PathBuf>,
     /// Entries inside the scanned trees that could not be read and were
     /// passed over — a directory the walk could not descend into, or a file
     /// whose metadata could not be read. Each one is logged at `warn`.
@@ -268,6 +312,7 @@ fn is_skipped(entry: &DirEntry, root: &Path, filter: &ScanFilter) -> bool {
 /// see [`ScanFilter`]. Pass [`ScanFilter::default`] for the built-in lists.
 pub fn scan_directories(dirs: &[PathBuf], filter: &ScanFilter) -> ScanResult {
     let mut files = Vec::new();
+    let mut sidecars = Vec::new();
     let mut skipped = 0;
     // A `Cell` because the count is incremented from inside `filter_entry`'s
     // closure, which is where a pruned directory is decided and the only place
@@ -322,6 +367,17 @@ pub fn scan_directories(dirs: &[PathBuf], filter: &ScanFilter) -> ScanResult {
                 continue;
             };
 
+            // Before the `stat`: a sidecar's size is never read — it is not
+            // hashed, not deduplicated and not dated — so asking the filesystem
+            // for it would be one syscall per sidecar spent on a number nothing
+            // consumes, and would make an unreadable sidecar inflate the count
+            // that tells the operator a *photograph* could not be looked at.
+            if kind == Admitted::Sidecar {
+                debug!(path = %path.display(), "found sidecar file");
+                sidecars.push(path.to_path_buf());
+                continue;
+            }
+
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(e) => {
@@ -341,13 +397,14 @@ pub fn scan_directories(dirs: &[PathBuf], filter: &ScanFilter) -> ScanResult {
                 path: path.to_path_buf(),
                 size: metadata.len(),
                 extension: ext,
-                is_video: kind == MediaKind::Video,
+                is_video: kind == Admitted::Video,
             });
         }
     }
 
     ScanResult {
         files,
+        sidecars,
         skipped,
         excluded: excluded.get(),
     }
@@ -519,7 +576,7 @@ mod tests {
         fs::write(tmp.path().join("keep.dng"), b"data").unwrap();
         fs::write(tmp.path().join("drop.jpg"), b"data").unwrap();
 
-        let filter = ScanFilter::new(&["dng".to_string()], &[], &[]).unwrap();
+        let filter = ScanFilter::new(&["dng".to_string()], &[], &[], &[]).unwrap();
         let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
 
         assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
@@ -534,7 +591,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("photo.JPG"), b"data").unwrap();
 
-        let filter = ScanFilter::new(&["JPG".to_string()], &[], &[]).unwrap();
+        let filter = ScanFilter::new(&["JPG".to_string()], &[], &[], &[]).unwrap();
         assert_eq!(
             scan_directories(&[tmp.path().to_path_buf()], &filter)
                 .files
@@ -550,11 +607,81 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("clip.insv"), b"data").unwrap();
 
-        let filter = ScanFilter::new(&[], &["insv".to_string()], &[]).unwrap();
+        let filter = ScanFilter::new(&[], &["insv".to_string()], &[], &[]).unwrap();
         let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
 
         assert_eq!(scan.files.len(), 1);
         assert!(scan.files[0].is_video);
+    }
+
+    // -----------------------------------------------------------------
+    // ScanFilter: sidecars
+    // -----------------------------------------------------------------
+
+    /// A sidecar is collected and kept apart. Everything downstream treats
+    /// `files` as photographs — it hashes them, dates them, and counts them — so
+    /// a sidecar that arrived there would be deduplicated against real media and
+    /// reported as a photograph the user does not have.
+    #[test]
+    fn a_sidecar_is_collected_separately_from_the_media() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("photo.jpg"), b"data").unwrap();
+        fs::write(tmp.path().join("photo.xmp"), b"<x:xmpmeta/>").unwrap();
+
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &ScanFilter::default());
+
+        assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
+        assert!(scan.files[0].path.ends_with("photo.jpg"));
+        assert_eq!(scan.sidecars.len(), 1);
+        assert!(scan.sidecars[0].ends_with("photo.xmp"));
+        assert_eq!(
+            scan.skipped, 0,
+            "a sidecar the scan collected is not one it could not read"
+        );
+    }
+
+    /// An empty sidecar list is how `--no-sidecars` is expressed, so it has to
+    /// mean "collect none" rather than "collect the built-in ones".
+    #[test]
+    fn an_empty_sidecar_list_collects_none() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("photo.jpg"), b"data").unwrap();
+        fs::write(tmp.path().join("photo.xmp"), b"<x:xmpmeta/>").unwrap();
+
+        let filter = ScanFilter::new(&["jpg".to_string()], &[], &[], &[]).unwrap();
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
+
+        assert_eq!(scan.files.len(), 1);
+        assert!(scan.sidecars.is_empty());
+    }
+
+    /// An extension in both lists is media. Being a photograph is a claim about
+    /// the file; being a sidecar is a claim about its relationship to another
+    /// one — so the specific claim wins, and a mistyped sidecar list can never
+    /// stop somebody's photographs being organised.
+    #[test]
+    fn an_extension_named_as_both_media_and_sidecar_is_media() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("photo.jpg"), b"data").unwrap();
+
+        let filter = ScanFilter::new(&["jpg".to_string()], &[], &["jpg".to_string()], &[]).unwrap();
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
+
+        assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
+        assert!(scan.sidecars.is_empty());
+    }
+
+    /// A sidecar list is lowercased on the way in, like the media lists, or
+    /// `sidecar = ["XMP"]` would match nothing at all.
+    #[test]
+    fn a_configured_sidecar_extension_is_matched_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("edits.PP3"), b"data").unwrap();
+
+        let filter = ScanFilter::new(&[], &[], &["PP3".to_string()], &[]).unwrap();
+        let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
+
+        assert_eq!(scan.sidecars.len(), 1);
     }
 
     // -----------------------------------------------------------------
@@ -571,7 +698,7 @@ mod tests {
         fs::write(tmp.path().join("holiday/thumb_small.jpg"), b"data").unwrap();
 
         let filter =
-            ScanFilter::new(&["jpg".to_string()], &[], &["thumb_*.jpg".to_string()]).unwrap();
+            ScanFilter::new(&["jpg".to_string()], &[], &[], &["thumb_*.jpg".to_string()]).unwrap();
         let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
 
         assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
@@ -596,7 +723,7 @@ mod tests {
         fs::write(tmp.path().join("real.jpg"), b"data").unwrap();
 
         let filter =
-            ScanFilter::new(&["jpg".to_string()], &[], &[".thumbnails".to_string()]).unwrap();
+            ScanFilter::new(&["jpg".to_string()], &[], &[], &[".thumbnails".to_string()]).unwrap();
         let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
 
         assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
@@ -617,7 +744,8 @@ mod tests {
         fs::write(tmp.path().join("raw/2024/a.jpg"), b"data").unwrap();
         fs::write(tmp.path().join("holiday/raw/b.jpg"), b"data").unwrap();
 
-        let filter = ScanFilter::new(&["jpg".to_string()], &[], &["raw/**".to_string()]).unwrap();
+        let filter =
+            ScanFilter::new(&["jpg".to_string()], &[], &[], &["raw/**".to_string()]).unwrap();
         let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
 
         assert_eq!(
@@ -645,7 +773,7 @@ mod tests {
         fs::write(tmp.path().join("raw/2024/deep.jpg"), b"data").unwrap();
 
         let filter =
-            ScanFilter::new(&["jpg".to_string()], &[], &["raw/*.jpg".to_string()]).unwrap();
+            ScanFilter::new(&["jpg".to_string()], &[], &[], &["raw/*.jpg".to_string()]).unwrap();
         let scan = scan_directories(&[tmp.path().to_path_buf()], &filter);
 
         assert_eq!(scan.files.len(), 1, "got {:?}", scan.files);
@@ -665,7 +793,8 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("photo.jpg"), b"data").unwrap();
 
-        let filter = ScanFilter::new(&["jpg".to_string()], &[], &["cache".to_string()]).unwrap();
+        let filter =
+            ScanFilter::new(&["jpg".to_string()], &[], &[], &["cache".to_string()]).unwrap();
         let scan = scan_directories(&[root], &filter);
 
         assert_eq!(scan.files.len(), 1);
@@ -677,7 +806,7 @@ mod tests {
     /// a setting that does not work.
     #[test]
     fn a_pattern_that_is_not_a_glob_is_refused_and_named() {
-        let error = ScanFilter::new(&[], &[], &["[unclosed".to_string()]).unwrap_err();
+        let error = ScanFilter::new(&[], &[], &[], &["[unclosed".to_string()]).unwrap_err();
         assert_eq!(error.pattern, "[unclosed");
         assert!(
             error.to_string().contains("skip_patterns"),

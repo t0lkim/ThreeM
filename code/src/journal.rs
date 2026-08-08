@@ -116,6 +116,17 @@ pub enum IntentKind {
     Duplicate,
     /// A file being put back where it came from by `mmm undo`.
     Restore,
+    /// A sidecar following the media file it belongs to — see
+    /// [`crate::sidecar`].
+    ///
+    /// Recorded as its own kind rather than as an `Organise` move because a
+    /// journal is read by a person as well as replayed by `undo`, and a run
+    /// whose entry count is twice its photograph count needs to say why on the
+    /// line rather than leave it to be worked out from the extensions.
+    ///
+    /// `undo` treats it like any other move: it has a source, a destination and
+    /// an outcome, which is all a reversal needs.
+    Sidecar,
 }
 
 /// One line of the journal after the header.

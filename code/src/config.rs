@@ -173,6 +173,7 @@ impl Cli {
             // the whole function exists to refuse.
             (organise.timezone.is_some(), "--timezone"),
             (organise.require_exif.is_some(), "--require-exif"),
+            (organise.no_sidecars.is_some(), "--no-sidecars"),
         ];
         // Flags that are not settings, and that no subcommand can act on.
         let switches = [
@@ -566,6 +567,31 @@ pub struct Config {
     )]
     pub require_exif: Option<bool>,
 
+    /// Leave XMP, AAE and THM sidecars where they are instead of moving them
+    /// with their parent
+    ///
+    /// By default a sidecar travels with the photograph it belongs to and is
+    /// renamed to match its parent's new name, because the two are bound by
+    /// filename and nothing else: move one without the other and every edit
+    /// recorded in the sidecar is silently detached from the photograph.
+    ///
+    /// Pass this to switch that off entirely — sidecars are then not collected,
+    /// not moved, not journalled and not counted, exactly as before the feature
+    /// existed. The posture of somebody who manages their sidecars by other
+    /// means and would rather this tool did not touch them.
+    ///
+    /// `--no-sidecars=false` exists for the same reason `--no-prompt=false`
+    /// does: a `sidecars = false` in a config file has to be answerable from the
+    /// command line, or it is not a precedence rule.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pub no_sidecars: Option<bool>,
+
     /// UNSAFE: do not journal this run — it cannot be undone
     ///
     /// Without a journal there is no record of where a file came from, so `mmm
@@ -611,6 +637,13 @@ impl Config {
             journal_dir: self.journal_dir.clone(),
             default_timezone: self.timezone.clone(),
             require_exif: self.require_exif,
+            // The one flag whose polarity is the opposite of its setting.
+            // `--no-sidecars` reads as an instruction and `sidecars = false`
+            // reads as a state, which is right for each surface; inverting here
+            // is what lets `--no-sidecars=false` answer a config file that
+            // switched them off, and that round trip is why the flag is a
+            // tri-state rather than a bare switch.
+            sidecars: self.no_sidecars.map(|no| !no),
             ..PartialSettings::default()
         }
     }

@@ -301,6 +301,25 @@ impl MediaTree {
         self.write(rel, &body)
     }
 
+    /// A sidecar file (`.xmp`, `.aae`, `.thm`) with arbitrary contents.
+    ///
+    /// Byte-identical to [`Self::non_media`] and named apart from it on purpose:
+    /// that method's contract is "the organiser must never touch this", and a
+    /// sidecar's is the opposite — it travels with its parent and is renamed on
+    /// the way. Writing one through the other would put a test's intent at odds
+    /// with the method it read as.
+    ///
+    /// The contents are arbitrary because at this stage nothing reads them; the
+    /// pairing is by filename alone. The provenance marker is appended, so a
+    /// test can prove *this* sidecar reached *that* destination rather than
+    /// merely that something of the right name is there — which matters here
+    /// more than anywhere, since the whole point is that a sidecar arrives under
+    /// a name it never had before.
+    pub fn sidecar(self, rel: &str, bytes: &[u8]) -> Self {
+        let body = with_marker(bytes, rel);
+        self.write(rel, &body)
+    }
+
     /// A byte-identical copy of a file already declared at `existing`.
     ///
     /// Being byte-identical, it necessarily carries the *same* marker as its

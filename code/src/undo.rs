@@ -535,6 +535,11 @@ pub fn execute_restore(plan: &RestorePlan, recorder: &mut MoveRecorder<'_>) -> R
             has_location: false,
             // A restore carries its digest on the purpose, below.
             known_hash: None,
+            // A sidecar's own move was journalled as an entry in its own right,
+            // so the plan already holds a step for it. Attaching it here as well
+            // would try to restore the same file twice — the second attempt
+            // finding nothing where the first had already moved it from.
+            sidecars: Vec::new(),
         };
         let purpose = MovePurpose::Restore {
             hash: step.source_hash.as_deref(),

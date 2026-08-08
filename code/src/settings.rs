@@ -38,6 +38,7 @@ use crate::naming::{
 use crate::organiser::DatePolicy;
 use crate::reporter::FallbackWarning;
 use crate::scanner::{PatternError, ScanFilter, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS};
+use crate::sidecar::DEFAULT_SIDECAR_EXTENSIONS;
 use crate::timezone::{Timezone, TimezoneError, TimezonePolicy};
 
 /// Files processed between prompts, when nothing says otherwise.
@@ -80,18 +81,21 @@ pub const DEFAULT_UNSORTED_DIR: &str = "unsorted";
 /// it to `0` to hear about every single one, or to `100` never to hear about it.
 pub const DEFAULT_FILESYSTEM_DATE_WARNING_PERCENT: u8 = 20;
 
-/// Which file extensions count as media.
+/// Which file extensions a run recognises, and as what.
 ///
-/// A pair rather than one list because the two are treated differently
+/// Three lists rather than one because all three are treated differently
 /// downstream — a video's date is read out of a different metadata container
-/// than a photograph's — so a caller adding `.insv` has to say which kind of
-/// thing it is.
+/// than a photograph's, and a sidecar has no date of its own at all — so a
+/// caller adding `.insv` or `.pp3` has to say which kind of thing it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extensions {
     /// Lowercase, no leading dot.
     pub image: Vec<String>,
     /// Lowercase, no leading dot.
     pub video: Vec<String>,
+    /// Files that travel beside a photograph rather than being one — see
+    /// [`crate::sidecar`]. Lowercase, no leading dot.
+    pub sidecar: Vec<String>,
 }
 
 impl Default for Extensions {
@@ -99,6 +103,10 @@ impl Default for Extensions {
         Self {
             image: IMAGE_EXTENSIONS.iter().map(|s| (*s).to_string()).collect(),
             video: VIDEO_EXTENSIONS.iter().map(|s| (*s).to_string()).collect(),
+            sidecar: DEFAULT_SIDECAR_EXTENSIONS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         }
     }
 }
@@ -124,6 +132,15 @@ impl Default for Extensions {
 /// to make an unreversible run harder to ask for, and both would be defeated by
 /// being settable from a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "this type is a config file, field for field — the lint's remedy is to fold \
+              related flags into a state machine, and these are not related: `no_prompt`, \
+              `include_location`, `require_exif` and `sidecars` are four independent \
+              questions a user answers separately. An enum over them would put a \
+              translation layer between a TOML key and the field it sets, which is the one \
+              thing this struct exists not to have"
+)]
 pub struct Settings {
     /// Where organised files are written. `None` means "the first input
     /// directory", which is not knowable until the command line has been
@@ -195,6 +212,17 @@ pub struct Settings {
     ///
     /// `0` warns whenever a single file fell back, `100` never warns.
     pub filesystem_date_warning_percent: u8,
+
+    /// Whether a sidecar travels with the photograph it belongs to.
+    ///
+    /// On by default, which is the direction the safety argument points here.
+    /// Leaving an `.xmp` behind while its RAW file is renamed and moved does
+    /// not lose the file, but it severs the only link between a photograph and
+    /// every edit its owner made to it — and the person it happens to finds out
+    /// months later, in an editor that shows their work gone. Off is the posture
+    /// of somebody who manages sidecars by other means; see
+    /// [`crate::sidecar`].
+    pub sidecars: bool,
 }
 
 impl Default for Settings {
@@ -215,6 +243,7 @@ impl Default for Settings {
             default_timezone: None,
             require_exif: false,
             filesystem_date_warning_percent: DEFAULT_FILESYSTEM_DATE_WARNING_PERCENT,
+            sidecars: true,
         }
     }
 }
@@ -230,6 +259,7 @@ impl Default for Settings {
 pub struct PartialExtensions {
     pub image: Option<Vec<String>>,
     pub video: Option<Vec<String>>,
+    pub sidecar: Option<Vec<String>>,
 }
 
 impl PartialExtensions {
@@ -239,6 +269,7 @@ impl PartialExtensions {
         Self {
             image: higher_priority.image.or(self.image),
             video: higher_priority.video.or(self.video),
+            sidecar: higher_priority.sidecar.or(self.sidecar),
         }
     }
 }
@@ -283,6 +314,7 @@ pub struct PartialSettings {
     pub require_exif: Option<bool>,
     #[serde(default, deserialize_with = "de_percentage")]
     pub filesystem_date_warning_percent: Option<u8>,
+    pub sidecars: Option<bool>,
 }
 
 impl PartialSettings {
@@ -316,6 +348,7 @@ impl PartialSettings {
             filesystem_date_warning_percent: higher_priority
                 .filesystem_date_warning_percent
                 .or(self.filesystem_date_warning_percent),
+            sidecars: higher_priority.sidecars.or(self.sidecars),
         }
     }
 
@@ -457,7 +490,7 @@ where
 {
     let patterns = Option::<Vec<String>>::deserialize(deserializer)?;
     if let Some(patterns) = &patterns {
-        ScanFilter::new(&[], &[], patterns).map_err(serde::de::Error::custom)?;
+        ScanFilter::new(&[], &[], &[], patterns).map_err(serde::de::Error::custom)?;
     }
     Ok(patterns)
 }
@@ -534,6 +567,12 @@ impl Settings {
     /// its own patterns as it was read, so this is the last line of defence
     /// rather than the first.
     ///
+    /// Sidecar handling is switched off by handing the scan an empty sidecar
+    /// list rather than by a flag consulted later. There is then no stage at
+    /// which a sidecar exists to be forgotten about: nothing is collected, so
+    /// nothing is paired, moved, journalled or counted, and `--no-sidecars`
+    /// restores exactly the behaviour of the version before sidecars existed.
+    ///
     /// # Errors
     ///
     /// [`PatternError`] naming the first skip pattern that is not a glob.
@@ -541,6 +580,11 @@ impl Settings {
         ScanFilter::new(
             &self.extensions.image,
             &self.extensions.video,
+            if self.sidecars {
+                &self.extensions.sidecar
+            } else {
+                &[]
+            },
             &self.skip_patterns,
         )
     }
@@ -584,6 +628,7 @@ impl Settings {
             Some(ext) => Extensions {
                 image: ext.image.unwrap_or(default_extensions.image),
                 video: ext.video.unwrap_or(default_extensions.video),
+                sidecar: ext.sidecar.unwrap_or(default_extensions.sidecar),
             },
         };
 
@@ -609,6 +654,7 @@ impl Settings {
             filesystem_date_warning_percent: partial
                 .filesystem_date_warning_percent
                 .unwrap_or(defaults.filesystem_date_warning_percent),
+            sidecars: partial.sidecars.unwrap_or(defaults.sidecars),
         }
     }
 }
@@ -1010,6 +1056,7 @@ where
             "verbose" => layer.verbose = Some(parse_number(&variable, &value)?),
             "no_prompt" => layer.no_prompt = Some(parse_bool(&variable, &value)?),
             "require_exif" => layer.require_exif = Some(parse_bool(&variable, &value)?),
+            "sidecars" => layer.sidecars = Some(parse_bool(&variable, &value)?),
             // Range-checked here for the same reason the file layer checks it:
             // a threshold above 100 is one no run can cross, and agreeing with
             // it silently would leave somebody waiting for a warning that is
@@ -1035,7 +1082,7 @@ where
             "include_location" => layer.include_location = Some(parse_bool(&variable, &value)?),
             "skip_patterns" => {
                 let patterns = parse_list(&value);
-                ScanFilter::new(&[], &[], &patterns)
+                ScanFilter::new(&[], &[], &[], &patterns)
                     .map_err(|error| env_refusal(&variable, &error))?;
                 layer.skip_patterns = Some(patterns);
             }
@@ -1053,6 +1100,10 @@ where
             }
             "extensions_video" => {
                 extensions.video = Some(parse_list(&value));
+                saw_extensions = true;
+            }
+            "extensions_sidecar" => {
+                extensions.sidecar = Some(parse_list(&value));
                 saw_extensions = true;
             }
             _ => {

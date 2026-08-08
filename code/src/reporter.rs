@@ -5,6 +5,7 @@ use crate::hasher::DuplicateGroup;
 use crate::journal::{JournalEntry, RunHeader};
 use crate::metadata::DateSource;
 use crate::organiser::PlannedMove;
+use crate::sidecar::{Orphan, OrphanReason};
 use crate::timezone::TimezoneSource;
 use crate::undo::{
     RestoreOutcome, RestorePlan, RestoreRun, RunRow, UnresolvedIntent, Verification,
@@ -86,12 +87,68 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
             planned.source.display(),
             planned.destination.display()
         );
+
+        // Listed under their parent and indented, which is what they are: a
+        // sidecar has no plan of its own, and printing these as peers would
+        // suggest a run could move one without the other.
+        for sidecar in &planned.sidecars {
+            println!(
+                "    {SIDECAR_TAG} {} → {}",
+                sidecar.path.display(),
+                sidecar.destination_beside(&planned.destination).display()
+            );
+        }
     }
 
     println!("\n═══ Dry Run Summary ═══");
     println!("  Total files: {}", moves.len());
     println!("  With GPS location: {with_location}");
     timezones.print();
+}
+
+/// The marker beside a sidecar in the dry-run listing.
+///
+/// Exported so the integration suite asserts against the string the binary
+/// actually prints.
+pub const SIDECAR_TAG: &str = "[sidecar]";
+
+/// Heading of the section listing sidecars that are staying where they are.
+pub const ORPHAN_SIDECAR_HEADING: &str = "Sidecars left in place";
+
+/// Print the sidecars this run will not move, and why.
+///
+/// Printed on both postures, because both are a moment at which the operator can
+/// still act: on the preview they can go and look before anything moves, and on
+/// a committing run they are being told which files did *not* follow their
+/// photographs out of the source tree. A run that quietly left them would be one
+/// where the next tidy-up deletes somebody's edits.
+///
+/// Silent when there are none. A run with nothing to say here should not invite
+/// a search for something that did not happen.
+pub fn print_sidecar_orphans(orphans: &[Orphan]) {
+    if orphans.is_empty() {
+        return;
+    }
+
+    println!("\n═══ {ORPHAN_SIDECAR_HEADING} ═══\n");
+    for orphan in orphans {
+        println!("  {} — {}", orphan.path.display(), orphan_reason(orphan));
+    }
+}
+
+/// Why one sidecar is staying put, in the words the operator needs to act on it.
+fn orphan_reason(orphan: &Orphan) -> &'static str {
+    match orphan.reason {
+        OrphanReason::NoParent => {
+            "no media file of that name beside it — it was deleted, it was moved, or a \
+             skip_patterns entry passed it over"
+        }
+        OrphanReason::Ambiguous => {
+            "more than one media file of that name beside it, and nothing says which it \
+             belongs to — move it by hand, or rename it to the darktable convention \
+             (IMG_1234.cr2.xmp)"
+        }
+    }
 }
 
 /// The marker beside a planned move saying where its date came from.
@@ -325,6 +382,15 @@ pub struct RunSummary {
     /// move: it describes what was read out of the library, which is settled
     /// before the first move and unaffected by an operator stopping half way.
     pub dates: DateSourceTally,
+    /// Sidecars that found a parent and will travel with it — see
+    /// [`crate::sidecar`].
+    pub sidecars_found: usize,
+    /// Sidecars that actually moved. Zero on the preview path, exactly as
+    /// `organised` is.
+    pub sidecars_moved: usize,
+    /// Sidecars left where they were because nothing beside them answered to
+    /// their name, or because more than one thing did.
+    pub sidecar_orphans: usize,
 }
 
 /// Column width of the summary labels, so every figure lines up.
@@ -342,6 +408,16 @@ pub const HASH_SKIPPED_LABEL: &str = "Unhashable (dedup):";
 
 /// Label for files the run never got to because it was stopped.
 pub const UNPROCESSED_LABEL: &str = "Not processed:";
+
+/// Label for sidecars paired with a photograph. Exported so the integration
+/// suite asserts against the string the binary actually prints.
+pub const SIDECARS_FOUND_LABEL: &str = "Sidecars found:";
+
+/// Label for sidecars that followed their photograph.
+pub const SIDECARS_MOVED_LABEL: &str = "Sidecars moved:";
+
+/// Label for sidecars that stayed where they were.
+pub const SIDECAR_ORPHANS_LABEL: &str = "Sidecars orphaned:";
 
 /// Label for the run journal's location.
 pub const JOURNAL_LABEL: &str = "Journal:";
@@ -422,6 +498,26 @@ pub fn print_summary(
         println!(
             "  {HASH_SKIPPED_LABEL:<LABEL_WIDTH$}{}",
             summary.hash_skipped
+        );
+    }
+    // Conditional on the run having met a sidecar at all, rather than on each
+    // figure being non-zero. Most libraries have none, and three permanent zeros
+    // would be three lines of noise for every one of them; but a run that *did*
+    // find sidecars owes all three figures unconditionally, because "found 40,
+    // moved 40" and "found 40, moved 38" are the same output if a zero can hide
+    // a line.
+    if summary.sidecars_found > 0 || summary.sidecar_orphans > 0 {
+        println!(
+            "  {SIDECARS_FOUND_LABEL:<LABEL_WIDTH$}{}",
+            summary.sidecars_found
+        );
+        println!(
+            "  {SIDECARS_MOVED_LABEL:<LABEL_WIDTH$}{}",
+            summary.sidecars_moved
+        );
+        println!(
+            "  {SIDECAR_ORPHANS_LABEL:<LABEL_WIDTH$}{}",
+            summary.sidecar_orphans
         );
     }
     if summary.unprocessed > 0 {

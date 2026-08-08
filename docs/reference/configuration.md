@@ -64,9 +64,11 @@ Nesting in the **Key** column is the TOML table — `extensions.image` is writte
 | `skip_patterns` | list of globs | `[]` | — | `MMM_SKIP_PATTERNS` |
 | `default_timezone` | fixed offset or IANA zone name | *none* — the machine's own timezone is used, and the run says so | `--timezone` | `MMM_DEFAULT_TIMEZONE` |
 | `require_exif` | boolean | `false` | `--require-exif[=BOOL]` | `MMM_REQUIRE_EXIF` |
+| `sidecars` | boolean | `true` | `--no-sidecars[=BOOL]` (inverted) | `MMM_SIDECARS` |
 | `filesystem_date_warning_percent` | integer 0–100 | `20` | — | `MMM_FILESYSTEM_DATE_WARNING_PERCENT` |
 | `extensions.image` | list of strings | the 21 built-in image extensions | — | `MMM_EXTENSIONS_IMAGE` |
 | `extensions.video` | list of strings | the 11 built-in video extensions | — | `MMM_EXTENSIONS_VIDEO` |
+| `extensions.sidecar` | list of strings | `["xmp", "aae", "thm"]` | — | `MMM_EXTENSIONS_SIDECAR` |
 
 `mmm config show` prints the built-in extension lists in full, so `mmm config show > mmm.toml` gives you them to edit rather than to retype.
 
@@ -82,7 +84,8 @@ In the environment, a list is comma-separated and surrounding spaces are trimmed
 - **`default_timezone`** decides which wall clock a photo with no recorded offset is read against — a fixed offset (`"+08:00"`, `"-05:30"`) or an IANA zone name (`"Asia/Singapore"`), refused if it is neither. A file that carries its own `OffsetTimeOriginal` tag is unaffected: the file's own record always wins. It does **not** change which day an EXIF-dated photograph is filed under — a wall clock is filed under exactly the digits the camera wrote, on any machine — but it does decide the recorded instant, and it does move filesystem-dated and UTC-stamped video files.
 - **`require_exif = true`** refuses to file anything under a date it did not record itself. A file dated from the filesystem goes to the unsorted directory **keeping its own filename**, unlike the undated files there, which are all `unknown.<ext>` — the point of the setting is that you would rather sort those by hand, and a directory of `unknown-1.cr2` would make that impossible. Settable in a file where `commit` is not, because it can only ever make a run more careful; `--require-exif=false` answers it from the command line.
 - **`filesystem_date_warning_percent`** is the share of *dated* files that may take their date from the filesystem before the run's summary says so out loud. Files with no date at all are not counted either way — they went to the unsorted directory, which is the run already saying so. `0` warns about every single fallback; `100` never warns. A value above 100 is refused rather than accepted as a threshold nothing can cross.
-- **`extensions.image` / `extensions.video`** decide what counts as media, compared case-insensitively. A list **replaces** the built-in one — `image = ["dng", "jpg"]` scans those two and nothing else — which is also how to make the tool stop picking up a format it currently does.
+- **`sidecars`** decides whether an `.xmp`, `.aae` or `.thm` travels with the photograph it belongs to, renamed to match its parent's new name. On by default, because a sidecar is bound to its parent by filename alone: leaving one behind does not lose the file, but it detaches every edit recorded in it from the photograph, and the person it happens to finds out months later in an editor. `sidecars = false` switches the whole thing off — sidecars are then not collected, not moved and not reported, and `--no-sidecars=false` answers it from the command line. Note the flag's polarity is inverted from the key's: `--no-sidecars` sets `sidecars = false`.
+- **`extensions.image` / `extensions.video` / `extensions.sidecar`** decide what counts as media and what counts as a companion, compared case-insensitively. A list **replaces** the built-in one — `image = ["dng", "jpg"]` scans those two and nothing else — which is also how to make the tool stop picking up a format it currently does. `sidecar` is where to name the ones this tool does not ship with: `sidecar = ["xmp", "aae", "thm", "pp3", "dop"]`. An extension named both here and in `image` or `video` is treated as media, so a mistyped sidecar list can never stop photographs being organised.
 
 ### What cannot be set here
 

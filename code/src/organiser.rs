@@ -13,6 +13,7 @@ use crate::journal::{IntentKind, Journal, JournalEntry};
 use crate::metadata::{self, DateSource, FileMetadata};
 use crate::naming::{sanitise_for_filename, year_is_representable, FilenameParts, Layout};
 use crate::scanner::ScannedFile;
+use crate::sidecar::{Sidecar, SidecarIndex};
 use crate::timezone::{TimezonePolicy, TimezoneSource};
 
 /// A planned file operation (computed during scan, executed during process)
@@ -37,6 +38,19 @@ pub struct PlannedMove {
     /// run — a check size alone cannot make, because a same-length edit passes
     /// it. `None` where no digest was paid for; undo then falls back to size.
     pub known_hash: Option<String>,
+    /// The companions that travel with this file — see [`crate::sidecar`].
+    ///
+    /// Carried on the plan rather than moved by a pass of their own, because a
+    /// sidecar's destination is not knowable until its parent has actually
+    /// landed: [`execute_move`] resolves collisions, so the photograph planned
+    /// for `photo.jpg` may arrive as `photo-1.jpg` and the sidecar has to follow
+    /// the name it really got. A separate pass would either have to re-read the
+    /// journal to find that out or guess, and guessing here silently unpairs the
+    /// two files.
+    ///
+    /// Empty for a sidecar's own move: a sidecar has no sidecars, and a plan
+    /// that allowed one would be a recursion nothing bounds.
+    pub sidecars: Vec<Sidecar>,
 }
 
 /// Which dates a run is willing to file a photograph under.
@@ -97,6 +111,7 @@ pub fn plan_move(
     layout: &Layout,
     tz: &TimezonePolicy,
     policy: DatePolicy,
+    sidecars: &SidecarIndex,
     known_hash: Option<String>,
 ) -> Result<PlannedMove> {
     let meta = metadata::extract_metadata(&file.path, file.is_video, tz)?;
@@ -122,6 +137,7 @@ pub fn plan_move(
         timezone_source: meta.timezone_source,
         has_location: meta.latitude.is_some() && meta.longitude.is_some(),
         known_hash,
+        sidecars: sidecars.for_parent(&file.path).to_vec(),
     })
 }
 
@@ -401,6 +417,25 @@ impl GroupManifest {
     fn record_failure(&mut self, src: &Path, reason: &str) -> Result<()> {
         self.append(&format!("# FAILED: {}: {reason}\n", src.display()))
     }
+
+    /// Record a sidecar that followed a duplicate into this directory.
+    ///
+    /// A comment line, like every outcome — `mmm-dedup-verifier` reads
+    /// non-`#` lines as intended sources, and a sidecar is not one. It is here
+    /// because the manifest is the record a *person* reads, and a directory
+    /// holding more files than the manifest accounts for is a directory nobody
+    /// can act on.
+    ///
+    /// # Errors
+    ///
+    /// As [`GroupManifest::append`].
+    fn record_sidecar(&mut self, src: &Path, dst: &Path) -> Result<()> {
+        self.append(&format!(
+            "# sidecar: {} -> {}\n",
+            src.display(),
+            dst.display()
+        ))
+    }
 }
 
 /// What a move is for, and therefore what its commit record says.
@@ -426,6 +461,16 @@ pub enum MovePurpose<'a> {
     /// it is reversing did — which is what makes an undo undoable on the same
     /// terms as everything else.
     Restore { hash: Option<&'a str> },
+    /// A sidecar following its parent — see [`crate::sidecar`].
+    ///
+    /// Carries no hash, and not because one is unavailable: a sidecar is never
+    /// hashed, because it is never deduplicated. Two identical `.xmp` files are
+    /// two photographs' worth of edits that happen to agree, and relocating one
+    /// of them to `duplicates/` would detach it from its photograph — which is
+    /// the exact failure this whole module exists to prevent. Undo therefore
+    /// verifies a sidecar by size alone, as it does any move made without a
+    /// digest.
+    Sidecar,
 }
 
 impl MovePurpose<'_> {
@@ -434,6 +479,7 @@ impl MovePurpose<'_> {
             Self::Organise { .. } => IntentKind::Organise,
             Self::Duplicate { .. } => IntentKind::Duplicate,
             Self::Restore { .. } => IntentKind::Restore,
+            Self::Sidecar => IntentKind::Sidecar,
         }
     }
 
@@ -441,6 +487,7 @@ impl MovePurpose<'_> {
         match self {
             Self::Duplicate { hash, .. } => Some(hash.to_string()),
             Self::Organise { hash } | Self::Restore { hash } => hash.map(ToString::to_string),
+            Self::Sidecar => None,
         }
     }
 }
@@ -547,7 +594,7 @@ impl<'a> MoveRecorder<'a> {
             // concerned — its *reason* is already on the intent line, and
             // giving it a record type of its own would mean a third thing
             // `undo` has to recognise to reverse an undo.
-            MovePurpose::Organise { .. } | MovePurpose::Restore { .. } => {
+            MovePurpose::Organise { .. } | MovePurpose::Restore { .. } | MovePurpose::Sidecar => {
                 JournalEntry::MoveCommitted {
                     seq,
                     final_destination: outcome.destination.clone(),
@@ -637,6 +684,104 @@ pub(crate) fn recorded_move(
     }
 }
 
+/// What moving one file's sidecars did.
+///
+/// Separate counts rather than additions to [`MoveRun`]'s, because that type
+/// holds an invariant — `moved + errors + unprocessed == planned.len()` — and a
+/// sidecar was never in `planned`. Folding them in would make the arithmetic
+/// stop meaning anything at exactly the moment a reader most wants to trust it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SidecarRun {
+    /// Sidecars that reached their parent's new directory.
+    pub moved: usize,
+    /// Sidecars whose move failed. Counted, logged, and stepped over — the
+    /// photograph itself has already arrived, and unwinding that to keep the
+    /// pair together would be a destructive answer to a non-destructive
+    /// problem.
+    pub errors: usize,
+    /// Whether the journal refused a write. The caller stops the run.
+    pub journal_failed: bool,
+}
+
+impl SidecarRun {
+    fn add(&mut self, other: Self) {
+        self.moved += other.moved;
+        self.errors += other.errors;
+        self.journal_failed |= other.journal_failed;
+    }
+}
+
+/// Move every sidecar of a file that has just landed at `parent_destination`.
+///
+/// Called after the parent's move has succeeded and never before: a sidecar
+/// whose parent did not move must not move either, or the pairing is broken by
+/// the very code that exists to preserve it. There is no "sidecar moved, parent
+/// failed" state to recover from because there is no way to reach one.
+///
+/// Each sidecar is journalled as its own intent-and-outcome pair, exactly like a
+/// photograph, so `mmm undo` puts both files back with no special case at all.
+fn move_sidecars(
+    recorder: &mut MoveRecorder<'_>,
+    sidecars: &[Sidecar],
+    parent_destination: &Path,
+    mut record: impl FnMut(&Path, &Path),
+) -> SidecarRun {
+    let mut run = SidecarRun::default();
+
+    for sidecar in sidecars {
+        let planned = PlannedMove {
+            source: sidecar.path.clone(),
+            destination: sidecar.destination_beside(parent_destination),
+            // A sidecar is filed by its parent, not by a date: nothing ever read
+            // one out of it, and claiming a source here would put a file in the
+            // date tally that was never dated.
+            date_source: DateSource::None,
+            timezone_source: None,
+            has_location: false,
+            known_hash: None,
+            sidecars: Vec::new(),
+        };
+
+        match recorded_move(recorder, &planned, MovePurpose::Sidecar) {
+            Ok(outcome) => {
+                debug!(
+                    src = %planned.source.display(),
+                    dst = %outcome.destination.display(),
+                    "moved a sidecar with its parent"
+                );
+                record(&planned.source, &outcome.destination);
+                run.moved += 1;
+            }
+            Err(RecordedMoveError::Move(e)) => {
+                error!(
+                    src = %planned.source.display(),
+                    dst = %planned.destination.display(),
+                    error = %format!("{e:#}"),
+                    "a sidecar could not follow its parent; the photograph moved and the \
+                     sidecar did not"
+                );
+                run.errors += 1;
+            }
+            Err(RecordedMoveError::Journal { error, moved }) => {
+                if moved {
+                    run.moved += 1;
+                }
+                error!(
+                    src = %planned.source.display(),
+                    moved,
+                    error = %format!("{error:#}"),
+                    "the run journal could not be written while moving a sidecar; stopping so \
+                     that no further move goes unrecorded"
+                );
+                run.journal_failed = true;
+                break;
+            }
+        }
+    }
+
+    run
+}
+
 /// Move duplicate files into numbered subdirectories under the duplicates
 /// directory — `duplicates/000/`, `duplicates/001/`, and so on, or whatever
 /// `duplicates_dir` renamed it to.
@@ -663,11 +808,13 @@ pub fn move_duplicates(
     groups: &[DuplicateGroup],
     output_dir: &Path,
     duplicates_dir: &Path,
+    sidecars: &SidecarIndex,
     recorder: &mut MoveRecorder<'_>,
-) -> Result<(usize, usize)> {
+) -> Result<DuplicateRun> {
     let dup_base = output_dir.join(duplicates_dir);
     let mut moved = 0;
     let mut errors = 0;
+    let mut sidecar_run = SidecarRun::default();
 
     for (i, group) in groups.iter().enumerate() {
         let group_dir = dup_base.join(format!("{i:03}"));
@@ -700,6 +847,13 @@ pub fn move_duplicates(
                 // The duplicate pass carries its digest on the purpose, which
                 // is where the journal reads it from for this kind of move.
                 known_hash: None,
+                // A duplicate's sidecar travels with it. It is the same argument
+                // as for an organised file and it bites harder here: a
+                // photograph in `duplicates/007/` is already the copy nobody is
+                // looking at, and an `.xmp` left behind in the source tree with
+                // no file to pair against is the one that gets deleted in the
+                // next tidy-up.
+                sidecars: sidecars.for_parent(dup_path).to_vec(),
             };
 
             let purpose = MovePurpose::Duplicate {
@@ -710,7 +864,39 @@ pub fn move_duplicates(
             let manifested = match recorded_move(recorder, &planned, purpose) {
                 Ok(outcome) => {
                     moved += 1;
-                    manifest.record_move(dup_path, &outcome.destination)
+                    // The duplicate's own line first, then its sidecars', so the
+                    // manifest reads in the order things happened. Each is
+                    // appended as it happens, for the same reason the header is
+                    // written before the first move: a record assembled
+                    // afterwards is one an interruption costs entirely.
+                    let listed = manifest.record_move(dup_path, &outcome.destination);
+                    if listed.is_ok() {
+                        let mut manifest_error = None;
+                        sidecar_run.add(move_sidecars(
+                            recorder,
+                            &planned.sidecars,
+                            &outcome.destination,
+                            |src, dst| {
+                                if manifest_error.is_none() {
+                                    manifest_error = manifest.record_sidecar(src, dst).err();
+                                }
+                            },
+                        ));
+                        if sidecar_run.journal_failed {
+                            return Err(anyhow::anyhow!(
+                                "the run journal could not be written while moving a sidecar of \
+                                 duplicate {}; the remaining duplicates have been left where they \
+                                 are",
+                                dup_path.display()
+                            ));
+                        }
+                        match manifest_error {
+                            Some(e) => Err(e),
+                            None => Ok(()),
+                        }
+                    } else {
+                        listed
+                    }
                 }
                 Err(RecordedMoveError::Move(e)) => {
                     error!(path = %dup_path.display(), error = %e, "failed to move duplicate");
@@ -749,7 +935,30 @@ pub fn move_duplicates(
         }
     }
 
-    Ok((moved, errors))
+    Ok(DuplicateRun {
+        moved,
+        errors,
+        sidecars: sidecar_run,
+    })
+}
+
+/// What the duplicate pass did.
+///
+/// A struct rather than the `(usize, usize)` it used to return, because a third
+/// figure arrived and a three-element tuple at a call site says nothing about
+/// which number is which. The sidecar counts are held apart from the duplicate
+/// ones for the reason on [`SidecarRun`]: a sidecar was never a duplicate, and
+/// adding it to a duplicate count would misreport how much of somebody's library
+/// this run considered redundant.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateRun {
+    /// Duplicates relocated into `duplicates/NNN/`.
+    pub moved: usize,
+    /// Duplicates whose move failed, plus those abandoned when a manifest
+    /// stopped being writable.
+    pub errors: usize,
+    /// What became of the sidecars travelling with them.
+    pub sidecars: SidecarRun,
 }
 
 /// What a completed move actually did.
@@ -1068,6 +1277,11 @@ pub struct MoveRun {
     /// Distinct from [`MoveRun::stopped_early`], which is the operator's
     /// decision. This one is a failure, and the caller is expected to say so.
     pub journal_failed: bool,
+    /// What became of the sidecars travelling with those files.
+    ///
+    /// Held apart from the three counts above so their invariant survives — see
+    /// [`SidecarRun`].
+    pub sidecars: SidecarRun,
 }
 
 /// How the caller observes and steers a chunked run.
@@ -1143,7 +1357,23 @@ pub fn process_moves(
                 hash: planned.known_hash.as_deref(),
             };
             match recorded_move(recorder, planned, purpose) {
-                Ok(_) => run.moved += 1,
+                Ok(outcome) => {
+                    run.moved += 1;
+                    // After the photograph has landed, and using where it landed
+                    // rather than where it was planned to: collision resolution
+                    // may have given it a suffix, and a sidecar derived from the
+                    // planned name would be unpaired by the very suffix that
+                    // saved its parent.
+                    run.sidecars.add(move_sidecars(
+                        recorder,
+                        &planned.sidecars,
+                        &outcome.destination,
+                        |_, _| {},
+                    ));
+                    if run.sidecars.journal_failed {
+                        run.journal_failed = true;
+                    }
+                }
                 Err(RecordedMoveError::Move(e)) => {
                     error!(
                         src = %planned.source.display(),
@@ -1615,6 +1845,7 @@ mod tests {
             timezone_source: None,
             has_location: false,
             known_hash: None,
+            sidecars: Vec::new(),
         }
     }
 
@@ -2312,13 +2543,15 @@ mod tests {
         let group = duplicate_group(&[kept, doomed.clone(), survivor.clone()], b"BODY");
         fs::remove_file(&doomed).unwrap();
 
-        let (moved, errors) = move_duplicates(
+        let run = move_duplicates(
             &[group],
             &output,
             Path::new("duplicates"),
+            &SidecarIndex::empty(),
             &mut MoveRecorder::disabled(),
         )
         .unwrap();
+        let (moved, errors) = (run.moved, run.errors);
 
         assert_eq!((moved, errors), (1, 1), "one move must fail, one succeed");
 
@@ -2359,13 +2592,15 @@ mod tests {
         }
 
         let group = duplicate_group(&[kept, first.clone(), second.clone()], b"BODY");
-        let (moved, errors) = move_duplicates(
+        let run = move_duplicates(
             &[group],
             &output,
             Path::new("duplicates"),
+            &SidecarIndex::empty(),
             &mut MoveRecorder::disabled(),
         )
         .unwrap();
+        let (moved, errors) = (run.moved, run.errors);
         assert_eq!((moved, errors), (2, 0));
 
         let group_dir = output.join("duplicates/000");
@@ -2754,14 +2989,15 @@ mod tests {
         let digest = group.hash.clone();
 
         let mut journal = open_journal(tmp.path());
-        let (moved, errors) = move_duplicates(
+        let run = move_duplicates(
             &[group],
             &output,
             Path::new("duplicates"),
+            &SidecarIndex::empty(),
             &mut MoveRecorder::new(Some(&mut journal)),
         )
         .unwrap();
-        assert_eq!((moved, errors), (1, 0));
+        assert_eq!((run.moved, run.errors), (1, 0));
 
         let entries = entries_of(&journal);
         assert!(
@@ -2806,6 +3042,7 @@ mod tests {
             &[group],
             &tmp.path().join("output"),
             Path::new("duplicates"),
+            &SidecarIndex::empty(),
             &mut MoveRecorder::new(Some(&mut journal)),
         )
         .unwrap();

@@ -6,7 +6,9 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{debug, error, info};
 
-use mmm::{hasher, journal, organiser, reporter, scanner, settings, settings_report, undo};
+use mmm::{
+    hasher, journal, organiser, reporter, scanner, settings, settings_report, sidecar, undo,
+};
 
 use mmm::config::{Cli, Command, Config, ConfigAction, JournalAction, UndoArgs};
 use mmm::geocoder::GeoLookup;
@@ -421,10 +423,24 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
 
     let scanner::ScanResult {
         files,
+        sidecars,
         skipped: scan_skipped,
         excluded,
     } = scanner::scan_directories(&config.directories, &filter);
     scan_spinner.finish_with_message(format!("found {} media files", files.len()));
+
+    // Paired before the early return below, so a tree holding nothing but
+    // orphaned sidecars still says so rather than reporting "no media files"
+    // and leaving the operator to guess whether their `.xmp` files were seen.
+    let sidecars = sidecar::SidecarIndex::build(&files, &sidecars);
+    if sidecars.paired() > 0 || !sidecars.orphans().is_empty() {
+        println!(
+            "  {} sidecar file{} paired, {} left in place",
+            sidecars.paired(),
+            if sidecars.paired() == 1 { "" } else { "s" },
+            sidecars.orphans().len()
+        );
+    }
 
     // Printed rather than logged: a `skip_patterns` entry that is quietly
     // excluding half a library should be visible to the operator, not inferred
@@ -438,6 +454,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
 
     if files.is_empty() {
         println!("No media files found in the specified directories.");
+        reporter::print_sidecar_orphans(sidecars.orphans());
         if scan_skipped > 0 {
             // "Nothing here" and "we could not look" must never read the same.
             println!(
@@ -487,6 +504,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
             &layout,
             &timezone,
             date_policy,
+            &sidecars,
             unique.known_hash.clone(),
         ) {
             Ok(planned) => planned_moves.push(planned),
@@ -511,11 +529,17 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
         unprocessed: 0,
         errors: plan_errors,
         dates: reporter::DateSourceTally::of(&planned_moves),
+        // Counted over the whole index rather than over `planned_moves`: a
+        // duplicate's sidecar travels too, and duplicates are not in that list.
+        sidecars_found: sidecars.paired(),
+        sidecars_moved: 0,
+        sidecar_orphans: sidecars.orphans().len(),
     };
 
     // === DRY RUN (the default): stop here, before anything is moved ===
     if config.is_dry_run() {
         reporter::print_dry_run(&planned_moves);
+        reporter::print_sidecar_orphans(sidecars.orphans());
         // No journal, and none reported: a preview moves nothing, so there is
         // nothing to undo.
         reporter::print_summary(&summary, JournalStatus::NotNeeded, fallback_warning);
@@ -532,8 +556,8 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     };
 
     // === Move duplicates to duplicates/ directory ===
-    let (dup_moved, dup_errors) = if dedup_result.duplicate_groups.is_empty() {
-        (0, 0)
+    let duplicates = if dedup_result.duplicate_groups.is_empty() {
+        organiser::DuplicateRun::default()
     } else {
         println!(
             "\nMoving duplicates to {}/ directory...",
@@ -544,11 +568,15 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
             &dedup_result.duplicate_groups,
             output_dir,
             layout.duplicates(),
+            &sidecars,
             &mut recorder,
         ) {
-            Ok((dm, de)) => {
-                println!("  Moved {dm} duplicate files ({de} errors)");
-                (dm, de)
+            Ok(run) => {
+                println!(
+                    "  Moved {} duplicate files ({} errors)",
+                    run.moved, run.errors
+                );
+                run
             }
             // Nothing in the organise pass has run yet, so every planned move
             // is untouched — but the journal still owes a closing line.
@@ -594,6 +622,13 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
         move_pb.finish_with_message("organisation complete");
     }
 
+    // Sidecars are folded in here and nowhere else. The journal's closing line
+    // counts *entries*, and a sidecar was journalled as one — a `RunCompleted`
+    // claiming forty moves for a journal holding eighty would be the one line of
+    // the record that disagrees with the rest of it.
+    let sidecars_moved = run.sidecars.moved + duplicates.sidecars.moved;
+    let sidecar_errors = run.sidecars.errors + duplicates.sidecars.errors;
+
     // Every exit path from the move phase closes the journal, including the
     // early stop and the journal's own failure. `failed` counts moves that were
     // attempted and did not happen; `skipped` counts files never attempted —
@@ -601,8 +636,8 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     // planned.
     finish_journal(
         journal.as_mut(),
-        run.moved + dup_moved,
-        run.errors + dup_errors,
+        run.moved + duplicates.moved + sidecars_moved,
+        run.errors + duplicates.errors + sidecar_errors,
         run.unprocessed + plan_errors,
     );
 
@@ -613,12 +648,19 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
         &reporter::RunSummary {
             organised: run.moved,
             unprocessed: run.unprocessed,
-            errors: plan_errors + run.errors + dup_errors,
+            errors: plan_errors + run.errors + duplicates.errors + sidecar_errors,
+            sidecars_moved,
             ..summary
         },
         journal_status(),
         fallback_warning,
     );
+
+    // After the summary rather than before it: these files did not move, so the
+    // question they raise is one for afterwards, and burying the table an
+    // operator is looking for underneath a list of paths would be the wrong way
+    // round.
+    reporter::print_sidecar_orphans(sidecars.orphans());
 
     // A run that stopped because it could not record itself is a failed run,
     // and a script driving `mmm` has to be able to tell.

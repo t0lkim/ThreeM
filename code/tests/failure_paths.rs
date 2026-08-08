@@ -90,6 +90,7 @@ fn plan(source: &Path, destination: &Path) -> PlannedMove {
         timezone_source: None,
         has_location: false,
         known_hash: None,
+        sidecars: Vec::new(),
     }
 }
 

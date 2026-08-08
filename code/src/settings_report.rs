@@ -237,6 +237,18 @@ pub const KEYS: &[SettingKey] = &[
         value: |settings| Some(Value::Boolean(settings.require_exif)),
     },
     SettingKey {
+        name: "sidecars",
+        table: None,
+        summary: "Move XMP, AAE and THM sidecars with the photograph they belong to.\n\
+                  A sidecar is bound to its parent by filename, so a run that renamed the \
+                  photograph and left the sidecar behind would silently detach every edit \
+                  recorded in it. Set to false to leave them alone entirely.",
+        unset: None,
+        placeholder: None,
+        claimed: |layer| layer.sidecars.is_some(),
+        value: |settings| Some(Value::Boolean(settings.sidecars)),
+    },
+    SettingKey {
         name: "filesystem_date_warning_percent",
         table: None,
         summary: "Warn when more than this share of dated files took their date from the \
@@ -280,6 +292,23 @@ pub const KEYS: &[SettingKey] = &[
                 .is_some_and(|table| table.video.is_some())
         },
         value: |settings| Some(list_value(&settings.extensions.video)),
+    },
+    SettingKey {
+        name: "sidecar",
+        table: Some("extensions"),
+        summary: "Which extensions name a companion file rather than a photograph — the ones \
+                  that travel with their parent when `sidecars` is on.\n\
+                  Replaces rather than extends, as above. An extension named here and in `image` \
+                  or `video` is treated as media.",
+        unset: None,
+        placeholder: None,
+        claimed: |layer| {
+            layer
+                .extensions
+                .as_ref()
+                .is_some_and(|table| table.sidecar.is_some())
+        },
+        value: |settings| Some(list_value(&settings.extensions.sidecar)),
     },
 ];
 
@@ -720,17 +749,23 @@ mod tests {
             include_location: _,
             duplicates_dir: _,
             unsorted_dir: _,
-            extensions: Extensions { image: _, video: _ },
+            extensions:
+                Extensions {
+                    image: _,
+                    video: _,
+                    sidecar: _,
+                },
             skip_patterns: _,
             default_timezone: _,
             require_exif: _,
             filesystem_date_warning_percent: _,
+            sidecars: _,
         } = Settings::default();
 
         assert_eq!(
             KEYS.len(),
-            16,
-            "the fifteen settings, with [extensions] counted as its two keys"
+            18,
+            "the sixteen settings, with [extensions] counted as its three keys"
         );
     }
 
@@ -771,11 +806,13 @@ mod tests {
             extensions: Some(PartialExtensions {
                 image: Some(vec!["jpg".to_string()]),
                 video: Some(vec!["mov".to_string()]),
+                sidecar: Some(vec!["xmp".to_string()]),
             }),
             skip_patterns: Some(Vec::new()),
             default_timezone: Some("Asia/Singapore".to_string()),
             require_exif: Some(true),
             filesystem_date_warning_percent: Some(50),
+            sidecars: Some(false),
         };
         let none = PartialSettings::default();
 
