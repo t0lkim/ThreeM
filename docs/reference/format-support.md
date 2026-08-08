@@ -54,7 +54,7 @@ version 0.1.0 the run says which files this happened to; before that it did not.
 | `.dng` | TIFF/IFD | ❌ **filesystem only** — ✅ from an `.xmp` beside it | ❌ | The date *is* in the file, in an Exif `SubIFD`. `nom-exif` does not read a bare TIFF. |
 | `.nef`, `.arw`, `.rw2`, `.raf`, `.srw`, `.pef`, `.orf`, `.raw` | TIFF/IFD (vendor variants) | ❌ **filesystem only** — ✅ from an `.xmp` beside it | ❌ | Same structure, same gap. |
 | `.cr2` | TIFF/IFD + `CR\x02\x00` signature | ❌ **filesystem only** — ✅ from an `.xmp` beside it | ❌ | Verified as unreadable with a fixture carrying the Canon signature. |
-| `.cr3` | ISO-BMFF (Canon) | ⚠️ untested | ⚠️ untested | A different container from CR2 despite the name. Canon stores EXIF in a custom `CMT1` box, which is not the HEIF `Exif` item, so it is unlikely to read. |
+| `.cr3` | ISO-BMFF (Canon), major brand `crx ` | ⚠️ untested — and the outcome is genuinely open | ⚠️ untested | A different container from CR2 despite the name. Canon puts EXIF in a custom `CMT1` box, not the HEIF `Exif` item, so *EXIF* will not be read. But `crx ` is in none of the parser's brand lists while `isom` — which a CR3 lists as a compatible brand — is, so it may be taken for an MP4 and dated from `moov/mvhd` instead. Reading the parser cannot settle which; only a fixture can. |
 | `.tiff`, `.tif` | TIFF/IFD | ❌ **filesystem only** | ❌ | Same gap as the RAW families. |
 | `.png` | PNG | ❌ **filesystem only** | ❌ | Not an EXIF container the parser knows. A PNG `eXIf` chunk is not read. |
 | `.webp` | RIFF | ❌ **filesystem only** | ❌ | Not recognised. |
@@ -152,7 +152,19 @@ full resolution order and the reasoning.
 
 Every ✅ above corresponds to a test, and every ❌ in the RAW rows corresponds to a
 test asserting the *absence* — that the file is reported as an unsupported format
-rather than silently dated from the filesystem. The fixtures are synthesised byte
+rather than silently dated from the filesystem.
+
+**The remaining ❌ rows — PNG, WebP, BMP, TIFF, AVI, MKV, WebM, WMV, FLV,
+MTS/M2TS — have no fixture of their own, and are derived rather than measured.**
+The derivation is sound and worth stating so a reader can judge it: the parser
+recognises exactly four containers, so a format that is none of them cannot be
+read, and the tool decides that by asking the parser rather than by consulting a
+list. A fixture per row would re-measure the same fact eleven times. What it
+would additionally catch is a container being *mis*-recognised — a RIFF file
+mistaken for something readable — which is the CR3 case one row up, and the
+reason that row is ⚠️ rather than ❌.
+
+The fixtures are synthesised byte
 by byte in `code/tests/common/mod.rs`; there are no checked-in binary assets, so
 the matrix can be re-verified offline on any machine, and it is re-verified under
 `TZ=Europe/London` and `TZ=Pacific/Apia` as well as locally.
