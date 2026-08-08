@@ -1,0 +1,61 @@
+[package]
+name = "mmm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The targets assert on parsed values, not merely on the absence of a crash.
+chrono = "0.4"
+serde_json = "1"
+
+[dependencies.mmm]
+path = ".."
+
+# A workspace of its own. The fuzz crate builds under a different toolchain
+# (nightly), with sanitiser flags and a `panic = "abort"` profile that the
+# library's own build must not inherit — and `cargo test` at `code/` has no
+# business trying to compile libFuzzer.
+[workspace]
+members = ["."]
+
+# Fuzzing is throughput: an unoptimised target finds in an hour what an optimised
+# one finds in a minute. `debug-assertions` and `overflow-checks` stay on because
+# they are exactly the class of defect being looked for — an arithmetic overflow
+# that release mode would wrap silently is a finding, not a nuisance.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "parse_wall_clock"
+path = "fuzz_targets/parse_wall_clock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_iso6709"
+path = "fuzz_targets/parse_iso6709.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xmp_sidecar"
+path = "fuzz_targets/xmp_sidecar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_line"
+path = "fuzz_targets/journal_line.rs"
+test = false
+doc = false
+bench = false

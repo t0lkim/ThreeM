@@ -1,0 +1,16 @@
+target
+coverage
+
+# libFuzzer writes the units it discovers into the FIRST corpus directory it is
+# given. That directory is `scratch/`, not `corpus/` — a corpus of ten thousand
+# machine-generated near-duplicates is not reviewable, and a diff full of them
+# hides the one seed that matters. `corpus/` holds only what a person put there:
+# a valid input per accepted shape, and the crash that once broke a parser.
+scratch
+
+# `artifacts/` is where libFuzzer drops the input that crashed a run. Those are
+# working notes: the ones worth keeping are promoted into `corpus/` by hand as
+# named regression seeds, which is what makes them reviewable in a diff.
+artifacts
+
+# NOTE: `corpus/` is deliberately NOT ignored — see `fuzz/README.md`.

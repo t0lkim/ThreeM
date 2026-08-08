@@ -429,7 +429,7 @@ pub fn journals_newest_first(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Parse one JSONL line into `T`.
-fn parse_line<T: DeserializeOwned>(line: &[u8]) -> Result<T> {
+pub(crate) fn parse_line<T: DeserializeOwned>(line: &[u8]) -> Result<T> {
     let text = std::str::from_utf8(line)
         .context("journal line is not valid UTF-8 (truncated mid-character?)")?;
     serde_json::from_str(text).with_context(|| format!("parsing journal line: {}", elide(text)))

@@ -746,7 +746,10 @@ pub(crate) fn parse_wall_clock(s: &str) -> Option<(NaiveDateTime, Option<FixedOf
 }
 
 /// Parse ISO 6709 location string like "+48.8577+002.295/" or "+48.8577-002.295+35.6/"
-fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
+///
+/// Visible to the crate so [`crate::fuzz`] can reach it: this reads a string a
+/// video container hands us, and the string is the camera's, not ours.
+pub(crate) fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
     let s = s.trim_end_matches('/');
     // Find the second +/- (start of longitude)
     let bytes = s.as_bytes();
@@ -777,6 +780,33 @@ fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
 
     let lat: f64 = lat_str.parse().ok()?;
     let lon: f64 = lon_str.parse().ok()?;
+
+    // `f64::from_str` is not a coordinate validator. It accepts `NaN`, `inf` and
+    // `-inf` — the strings, verbatim — and it accepts any magnitude at all, so
+    // `+302.2093` parses as happily as `+002.2093`.
+    //
+    // What that costs is not a crash. `geocoder::GeoLookup::lookup` hands the
+    // pair to a k-d tree search that does not reject them either: measured, a
+    // `NaN` latitude returns the *first record in the dataset* (El Tarter,
+    // Andorra), and so does an infinity. The photograph is then named after a
+    // country nobody in it has been to, and there is nothing in the output to
+    // say the location was invented rather than read.
+    //
+    // Refusing here puts the file back on the honest path — no location, exactly
+    // as though the container had carried no location tag, which is the truth.
+    // The bounds are ISO 6709's own: latitude ±90, longitude ±180.
+    //
+    // Found by `fuzz/fuzz_targets/parse_iso6709.rs` on `-33.8688+302.2093/`
+    // within seconds of the target first being pointed at this function.
+    if !lat.is_finite() || !lon.is_finite() {
+        debug!(lat, lon, location = s, "ignoring a non-finite coordinate");
+        return None;
+    }
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        debug!(lat, lon, location = s, "ignoring an off-planet coordinate");
+        return None;
+    }
+
     Some((lat, lon))
 }
 
@@ -951,6 +981,49 @@ mod tests {
         let (lat, lon) = parse_iso6709("-33.8688+151.2093/").unwrap();
         assert!((lat - (-33.8688)).abs() < 0.001);
         assert!((lon - 151.2093).abs() < 0.001);
+    }
+
+    /// The poles and the antimeridian are real places, and a parser that
+    /// tightened the bounds by rejecting them would file the Antarctic wrong.
+    #[test]
+    fn the_extremes_of_the_coordinate_system_are_accepted() {
+        for (text, expected) in [
+            ("+90.0+180.0/", (90.0, 180.0)),
+            ("-90.0-180.0/", (-90.0, -180.0)),
+            ("+00.0+000.0/", (0.0, 0.0)),
+        ] {
+            assert_eq!(
+                parse_iso6709(text),
+                Some(expected),
+                "{text} names a point on the earth"
+            );
+        }
+    }
+
+    /// The regression `fuzz/fuzz_targets/parse_iso6709.rs` found.
+    ///
+    /// `f64::from_str` accepts all of these, and every one of them used to reach
+    /// the reverse geocoder — which does not reject them either. A `NaN`
+    /// latitude resolves to the first record in the dataset, so a video with a
+    /// corrupt location tag came out named after Andorra with nothing to say the
+    /// place had been invented. `None` is the only honest answer: it is what a
+    /// video carrying no location at all produces.
+    #[test]
+    fn a_coordinate_that_is_not_a_coordinate_is_refused() {
+        for text in [
+            "-33.8688+302.2093/", // longitude past the antimeridian — the fuzzer's find
+            "+91.0+000.0/",       // latitude past the pole
+            "-90.0001-180.0001/", // just outside, both axes
+            "+NaN+NaN/",          // `f64::from_str` accepts the word
+            "+inf-inf/",
+            "-inf+180.0/",
+        ] {
+            assert_eq!(
+                parse_iso6709(text),
+                None,
+                "{text} is not a place, and must not be reverse geocoded into one"
+            );
+        }
     }
 
     /// `chrono` accepts these; the naming scheme cannot spell them.

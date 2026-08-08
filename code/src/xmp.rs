@@ -190,7 +190,10 @@ pub fn read_date(path: &Path) -> Option<SidecarDate> {
 /// drive it from a string without touching the filesystem.
 ///
 /// `origin` names the source in the log lines only.
-fn parse<R: std::io::BufRead>(source: R, origin: &Path) -> Option<SidecarDate> {
+///
+/// Visible to the crate for the same reason it was split out at all, one step
+/// further: [`crate::fuzz`] drives it from a byte slice.
+pub(crate) fn parse<R: std::io::BufRead>(source: R, origin: &Path) -> Option<SidecarDate> {
     let mut reader = NsReader::from_reader(source);
     reader.config_mut().trim_text(true);
 

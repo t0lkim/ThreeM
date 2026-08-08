@@ -126,6 +126,66 @@ jobs:
           check src/organiser.rs 92.0
           check src/journal.rs 96.0
 
+  fuzz:
+    name: fuzz (60s per target)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned, not floating on `nightly`. The current nightly does not compile
+      # `nom-exif` 1.5.2 — a change in what a range expression means, in a
+      # dependency, unrelated to fuzzing. `code/fuzz/README.md` records the exact
+      # error and the condition for unpinning.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-01
+
+      - uses: taiki-e/install-action@cargo-fuzz
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The fuzz crate is its own workspace, built under a different
+          # toolchain with sanitiser flags. It shares nothing with the entries
+          # above.
+          workspaces: code/fuzz
+          key: fuzz
+
+      # Sixty seconds a target is not a fuzzing campaign, and it is not meant to
+      # be — a real campaign runs for hours and belongs on somebody's machine or
+      # a nightly schedule. What this catches is the two things a pull request
+      # can break: a change that makes one of the checked-in regression seeds
+      # crash again, and a shallow new panic reachable from them. Every run
+      # starts from `fuzz/corpus/`, so the seeds are executed first and a
+      # returning crash fails in the first second rather than the sixtieth.
+      #
+      # `-timeout=10` matters more than it looks. libFuzzer's default per-unit
+      # timeout is twenty minutes, so an input that sends a parser into an
+      # infinite loop would hang the job until GitHub killed it with no useful
+      # output. Ten seconds turns that into a reported failure naming the input.
+      - name: Run each target
+        working-directory: code
+        run: |
+          set -euo pipefail
+          for target in $(cargo fuzz list); do
+            echo "::group::$target"
+            mkdir -p "fuzz/scratch/$target"
+            cargo fuzz run "$target" \
+              "fuzz/scratch/$target" "fuzz/corpus/$target" \
+              -- -max_total_time=60 -timeout=10 -print_final_stats=1
+            echo "::endgroup::"
+          done
+
+      # The input that crashed it, so the failure can be reproduced locally
+      # rather than re-fuzzed for.
+      - name: Upload any crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: code/fuzz/artifacts/
+          if-no-files-found: ignore
+
   release-build:
     name: release build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
