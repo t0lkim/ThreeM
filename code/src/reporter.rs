@@ -2,8 +2,10 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::hasher::DuplicateGroup;
+use crate::journal::{JournalEntry, RunHeader};
 use crate::metadata::DateSource;
 use crate::organiser::PlannedMove;
+use crate::undo::{RestoreOutcome, RestorePlan, RestoreRun, RunRow};
 
 /// Print the duplicate groups found during scanning
 pub fn print_duplicates(groups: &[DuplicateGroup]) {
@@ -222,6 +224,249 @@ pub fn print_summary(summary: &RunSummary, journal: JournalStatus<'_>) {
     }
     print_journal_location(journal);
     println!("═══════════════════════════\n");
+}
+
+// ---------------------------------------------------------------------------
+// Undo
+// ---------------------------------------------------------------------------
+
+/// Printed instead of a plan when a run has nothing to put back.
+pub const NOTHING_TO_UNDO: &str = "This run moved nothing, so there is nothing to put back.";
+
+/// Printed for a run whose journal has no closing line.
+pub const INTERRUPTED_RUN_NOTICE: &str =
+    "warning: this run never finished — it was interrupted, so its journal records only the \
+     moves it managed. Anything it was part-way through is not listed below.";
+
+/// Announce which run is about to be reversed, and how.
+pub fn print_restore_plan(plan: &RestorePlan) {
+    println!("\n═══ Undo — Run {} ═══", plan.header.run_id);
+    println!("  {:<LABEL_WIDTH$}{}", "Started:", plan.header.started_at);
+    println!(
+        "  {:<LABEL_WIDTH$}{}",
+        "Library:",
+        plan.header.output_dir.display()
+    );
+    println!("  {JOURNAL_LABEL:<LABEL_WIDTH$}{}", plan.journal.display());
+    println!(
+        "  {:<LABEL_WIDTH$}{}",
+        "Files to restore:",
+        plan.steps.len()
+    );
+
+    if plan.interrupted {
+        println!("\n{INTERRUPTED_RUN_NOTICE}");
+    }
+
+    if plan.steps.is_empty() {
+        println!("\n{NOTHING_TO_UNDO}");
+        return;
+    }
+
+    println!();
+    for step in &plan.steps {
+        println!("  {} → {}", step.current.display(), step.original.display());
+    }
+}
+
+/// Label for files that went back where they came from.
+pub const RESTORED_LABEL: &str = "Restored:";
+
+/// Label for files that could not be put back.
+pub const RESTORE_FAILED_LABEL: &str = "Could not restore:";
+
+/// Label for files an interrupted undo never reached.
+pub const RESTORE_UNPROCESSED_LABEL: &str = "Not attempted:";
+
+/// Label for the directories a restore emptied and removed.
+pub const PRUNED_LABEL: &str = "Directories removed:";
+
+/// Print what the undo actually did, file by file and then in total.
+///
+/// The per-file lines come first and are unconditional: a run that could not
+/// put everything back owes the operator the names, not a count they then have
+/// to go looking for.
+pub fn print_restore_summary(plan: &RestorePlan, run: &RestoreRun, journal: JournalStatus<'_>) {
+    if !run.outcomes.is_empty() {
+        println!("\n═══ Undo — Results ═══\n");
+        for (index, outcome) in &run.outcomes {
+            let Some(step) = plan.steps.get(*index) else {
+                continue;
+            };
+            match outcome {
+                RestoreOutcome::Restored { at, .. } => {
+                    if at == &step.original {
+                        println!("  restored   {}", at.display());
+                    } else {
+                        // The source path was taken, so the file went back
+                        // beside its occupant rather than through it. Saying
+                        // where matters more than saying it worked.
+                        println!(
+                            "  restored   {}  (source path was occupied; original name was {})",
+                            at.display(),
+                            step.original.display()
+                        );
+                    }
+                }
+                RestoreOutcome::RestoredUnrecorded => println!(
+                    "  restored   {}  (NOT recorded — this undo cannot itself be undone)",
+                    step.original.display()
+                ),
+                RestoreOutcome::Failed { reason } => {
+                    println!("  FAILED     {}: {reason}", step.current.display());
+                }
+            }
+        }
+    }
+
+    println!("\n═══ Undo Complete ═══");
+    println!("  {RESTORED_LABEL:<LABEL_WIDTH$}{}", run.restored);
+    if run.failed > 0 {
+        println!("  {RESTORE_FAILED_LABEL:<LABEL_WIDTH$}{}", run.failed);
+    }
+    if run.unprocessed > 0 {
+        println!(
+            "  {RESTORE_UNPROCESSED_LABEL:<LABEL_WIDTH$}{}",
+            run.unprocessed
+        );
+    }
+    if run.pruned_dirs > 0 {
+        println!("  {PRUNED_LABEL:<LABEL_WIDTH$}{}", run.pruned_dirs);
+    }
+    print_journal_location(journal);
+    println!("═════════════════════\n");
+}
+
+// ---------------------------------------------------------------------------
+// Journal inspection
+// ---------------------------------------------------------------------------
+
+/// Printed by `mmm journal list` when a library has journals but none readable,
+/// or none at all.
+pub const NO_RUNS_RECORDED: &str = "No runs recorded for this library.";
+
+/// Print one line per recorded run, newest first.
+pub fn print_run_list(rows: &[RunRow]) {
+    if rows.is_empty() {
+        println!("\n{NO_RUNS_RECORDED}");
+        return;
+    }
+
+    println!("\n═══ Recorded Runs ═══\n");
+    for row in rows {
+        match &row.detail {
+            Ok(detail) => {
+                let status = match &detail.completion {
+                    Some(c) => format!(
+                        "moved {}, failed {}, skipped {}",
+                        c.moved, c.failed, c.skipped
+                    ),
+                    None => "INTERRUPTED — never finished".to_string(),
+                };
+                println!("  {}  {}", row.run_id, detail.started_at);
+                println!("    {status}");
+                println!(
+                    "    {} file{} could be put back by `mmm undo --run {}`",
+                    detail.restorable,
+                    if detail.restorable == 1 { "" } else { "s" },
+                    row.run_id
+                );
+            }
+            // An unreadable journal is still a run that happened, and hiding it
+            // would make the listing quietly wrong at the one moment it matters.
+            Err(error) => {
+                println!("  {}  UNREADABLE", row.run_id);
+                println!("    {error}");
+            }
+        }
+        println!();
+    }
+    println!(
+        "Total: {} run{}",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
+}
+
+/// Print one run's journal in full: what it was, then every line it wrote.
+pub fn print_run_detail(path: &Path, header: &RunHeader, entries: &[JournalEntry]) {
+    println!("\n═══ Run {} ═══", header.run_id);
+    println!("  {:<LABEL_WIDTH$}{}", "Started:", header.started_at);
+    println!("  {:<LABEL_WIDTH$}{}", "mmm version:", header.mmm_version);
+    println!(
+        "  {:<LABEL_WIDTH$}{}",
+        "Library:",
+        header.output_dir.display()
+    );
+    println!(
+        "  {:<LABEL_WIDTH$}{}",
+        "Schema version:", header.schema_version
+    );
+    println!("  {:<LABEL_WIDTH$}{}", "Command:", header.argv.join(" "));
+    println!("  {JOURNAL_LABEL:<LABEL_WIDTH$}{}", path.display());
+
+    if entries.is_empty() {
+        println!("\nThis run recorded no operations.");
+        return;
+    }
+
+    println!("\n─── Entries ───\n");
+    for entry in entries {
+        println!("  {}", describe_entry(entry));
+    }
+
+    if !entries
+        .iter()
+        .any(|e| matches!(e, JournalEntry::RunCompleted { .. }))
+    {
+        println!("\n{INTERRUPTED_RUN_NOTICE}");
+    }
+}
+
+/// One journal line, as a person reads it.
+fn describe_entry(entry: &JournalEntry) -> String {
+    match entry {
+        JournalEntry::MoveIntent {
+            seq,
+            source,
+            destination,
+            source_size,
+            kind,
+            ..
+        } => format!(
+            "[{seq:>5}] intent    {:?}  {} → {}  ({source_size} bytes)",
+            kind,
+            source.display(),
+            destination.display()
+        ),
+        JournalEntry::MoveCommitted {
+            seq,
+            final_destination,
+            move_kind,
+        } => format!(
+            "[{seq:>5}] committed {}  ({move_kind})",
+            final_destination.display()
+        ),
+        JournalEntry::MoveFailed { seq, reason } => format!("[{seq:>5}] FAILED    {reason}"),
+        JournalEntry::DuplicateMoved {
+            seq,
+            group,
+            source,
+            destination,
+        } => format!(
+            "[{seq:>5}] duplicate group {group:03}  {} → {}",
+            source.display(),
+            destination.display()
+        ),
+        JournalEntry::RunCompleted {
+            moved,
+            failed,
+            skipped,
+            ended_at,
+        } => format!(
+            "        completed at {ended_at}  (moved {moved}, failed {failed}, skipped {skipped})"
+        ),
+    }
 }
 
 /// Prompt the user to continue processing the next chunk

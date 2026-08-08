@@ -1,11 +1,35 @@
-use clap::Parser;
-use std::path::PathBuf;
+use clap::{Args, Parser, Subcommand};
+use std::path::{Path, PathBuf};
 
 use crate::METADATA_DIR_NAME;
 
 /// The journal directory, below [`METADATA_DIR_NAME`] in the output tree.
 const JOURNAL_SUBDIR: &str = "journal";
 
+/// Where the journals of runs that organised into `output_dir` live.
+///
+/// One definition of the layout, shared by the side that writes journals
+/// ([`Config::resolve_journal_dir`]) and the side that reads them back
+/// ([`JournalLocation::resolve`]). Two copies of this join would be two
+/// opportunities for `undo` to look somewhere `organise` never wrote.
+pub fn journal_dir_for(output_dir: &Path) -> PathBuf {
+    output_dir.join(METADATA_DIR_NAME).join(JOURNAL_SUBDIR)
+}
+
+/// The whole command line: an optional subcommand, or the organise arguments
+/// given bare.
+///
+/// `mmm ~/Photos` has meant "organise ~/Photos" since before there were
+/// subcommands, and it has to keep meaning that — a tool that breaks every
+/// invocation in every script the day it grows an `undo` has not made anyone
+/// safer. So [`Config`] is flattened in as well as being the payload of
+/// `organise`, with `subcommand_negates_reqs` so `mmm undo` is not refused for
+/// naming no directories, and `args_conflicts_with_subcommands` so
+/// `mmm ~/Photos undo` is an error rather than a guess.
+///
+/// The one cost is a directory literally named `undo` or `journal`:
+/// `mmm undo` reads as the subcommand. `mmm organise undo` says the other
+/// thing, which is why `organise` exists explicitly at all.
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "mmm",
@@ -21,13 +45,148 @@ const JOURNAL_SUBDIR: &str = "journal";
                   EXAMPLES:\n  \
                   mmm ~/Photos                      # preview the plan, change nothing\n  \
                   mmm ~/Photos --commit             # apply the plan, moving files\n  \
-                  mmm ~/Photos -o ~/Sorted --commit # apply, writing into a separate tree\n\n\
+                  mmm ~/Photos -o ~/Sorted --commit # apply, writing into a separate tree\n  \
+                  mmm undo ~/Photos                 # preview putting the last run back\n  \
+                  mmm undo ~/Photos --commit        # put the last run back\n  \
+                  mmm journal list ~/Photos         # what has been run against this library\n\n\
                   JOURNAL:\n  \
                   Every committing run records what it is about to do in a journal under \
-                  <output>/.mmm/journal/ before it does it, so the run can be reversed. The \
-                  path is printed in the run summary.",
-    version
+                  <output>/.mmm/journal/ before it does it, so the run can be reversed with \
+                  `mmm undo`. The path is printed in the run summary.",
+    version,
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
 )]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    /// The organise arguments, when given without naming a subcommand.
+    #[command(flatten)]
+    pub organise: Config,
+
+    /// Increase verbosity (can be repeated: -v, -vv, -vvv)
+    ///
+    /// Global so it means the same thing before or after a subcommand: the
+    /// operator reaching for `-v` is debugging, and having to remember where
+    /// the flag goes is not what they need at that moment.
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    pub verbose: u8,
+}
+
+impl Cli {
+    /// What this invocation actually asked for.
+    ///
+    /// Not called `command` because [`clap::CommandFactory::command`] already
+    /// is, and a method that shadows it would turn every `Cli::command()` in
+    /// the help tests into something else entirely.
+    pub fn resolve(self) -> Command {
+        self.command
+            .unwrap_or(Command::Organise(Box::new(self.organise)))
+    }
+}
+
+/// The three things `mmm` does.
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Organise media into the output tree (the default)
+    ///
+    /// Boxed because it is by far the largest variant, and an enum sized to
+    /// its biggest member would make every `undo` carry the organiser's
+    /// command line around with it.
+    Organise(Box<Config>),
+
+    /// Put a recorded run's moves back
+    Undo(UndoArgs),
+
+    /// Inspect the journals of past runs
+    Journal {
+        #[command(subcommand)]
+        action: JournalAction,
+    },
+}
+
+/// Which library's journals a reading subcommand is about.
+///
+/// A positional defaulting to the current directory, because the shape this
+/// has to make easy is `cd ~/Photos && mmm undo` — the operator who has just
+/// looked at what a run did to a tree is standing in it.
+#[derive(Args, Debug, Clone)]
+pub struct JournalLocation {
+    /// The organised library whose journals to read
+    #[arg(value_name = "LIBRARY", default_value = ".")]
+    pub library: PathBuf,
+
+    /// Read journals from here instead of <LIBRARY>/.mmm/journal
+    ///
+    /// The counterpart of `organise --journal-dir`: a run whose journal was
+    /// written elsewhere has to be undoable from there too.
+    #[arg(long, value_name = "PATH")]
+    pub journal_dir: Option<PathBuf>,
+}
+
+impl JournalLocation {
+    /// The directory to read journals from.
+    pub fn resolve(&self) -> PathBuf {
+        self.journal_dir
+            .clone()
+            .unwrap_or_else(|| journal_dir_for(&self.library))
+    }
+}
+
+/// `mmm undo` — replay a run's journal backwards.
+#[derive(Args, Debug, Clone)]
+pub struct UndoArgs {
+    #[command(flatten)]
+    pub location: JournalLocation,
+
+    /// Undo this run rather than the most recent one
+    #[arg(long, value_name = "RUN_ID", conflicts_with = "last")]
+    pub run: Option<String>,
+
+    /// Undo the most recent recorded run (the default)
+    ///
+    /// Inert on its own — it is what happens anyway. It exists so a script can
+    /// say which run it means instead of relying on a default that a later
+    /// version might change.
+    #[arg(long, default_value_t = false)]
+    pub last: bool,
+
+    /// Actually move the files back (without this, undo only prints the plan)
+    #[arg(long, default_value_t = false)]
+    pub commit: bool,
+}
+
+impl UndoArgs {
+    /// Whether this undo is a preview. Same posture as everything else: moving
+    /// files is the opt-in.
+    pub fn is_dry_run(&self) -> bool {
+        !self.commit
+    }
+}
+
+/// `mmm journal …` — read-only, always.
+#[derive(Subcommand, Debug, Clone)]
+pub enum JournalAction {
+    /// List the runs recorded against a library, newest first
+    List(JournalLocation),
+
+    /// Show one run's journal in full
+    Show(JournalShowArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct JournalShowArgs {
+    /// The run to show, as printed by `mmm journal list`
+    #[arg(value_name = "RUN_ID")]
+    pub run_id: String,
+
+    #[command(flatten)]
+    pub location: JournalLocation,
+}
+
+/// `mmm organise` — the arguments of a run that moves media into place.
+#[derive(Args, Debug, Clone)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "this struct is the command line, and a command line is a bag of independent \
@@ -83,10 +242,6 @@ pub struct Config {
     /// Acknowledge an unsafe flag combination (currently only --no-journal --commit)
     #[arg(long, default_value_t = false)]
     pub i_know_what_im_doing: bool,
-
-    /// Increase verbosity (can be repeated: -v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    pub verbose: u8,
 }
 
 /// Emitted once on stderr when a caller passes the retired `--dry-run` flag.
@@ -131,11 +286,11 @@ impl Config {
         if self.no_journal {
             return None;
         }
-        Some(self.journal_dir.clone().unwrap_or_else(|| {
-            self.output_dir()
-                .join(METADATA_DIR_NAME)
-                .join(JOURNAL_SUBDIR)
-        }))
+        Some(
+            self.journal_dir
+                .clone()
+                .unwrap_or_else(|| journal_dir_for(self.output_dir())),
+        )
     }
 
     /// Reject flag combinations that are individually sensible and jointly
@@ -176,8 +331,18 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// Parse a full command line and insist it resolved to an organise run.
+    ///
+    /// Every assertion below is about the organise arguments, and routing them
+    /// through [`Cli`] rather than through `Config` directly is the point: the
+    /// property under test is what the *command line* means, and since the
+    /// subcommands arrived that is no longer a question `Config` alone can
+    /// answer.
     fn parse(args: &[&str]) -> Config {
-        Config::try_parse_from(args).unwrap()
+        match Cli::try_parse_from(args).unwrap().resolve() {
+            Command::Organise(config) => *config,
+            other => panic!("expected an organise run, got {other:?}"),
+        }
     }
 
     #[test]
@@ -344,9 +509,201 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Subcommand layout
+    // -----------------------------------------------------------------
+
+    /// The compatibility promise: every invocation written before subcommands
+    /// existed still means what it meant.
+    #[test]
+    fn a_bare_path_is_still_an_organise_run() {
+        let config = parse(&["mmm", "/photos", "--commit"]);
+        assert_eq!(config.directories, vec![PathBuf::from("/photos")]);
+        assert!(config.commit);
+    }
+
+    #[test]
+    fn organise_can_also_be_named_explicitly() {
+        let config = parse(&["mmm", "organise", "/photos", "-o", "/sorted"]);
+        assert_eq!(config.directories, vec![PathBuf::from("/photos")]);
+        assert_eq!(config.output_dir(), &PathBuf::from("/sorted"));
+    }
+
+    /// `mmm undo` names no directories, and must not be refused for it.
+    #[test]
+    fn undo_does_not_inherit_the_organiser_required_directories() {
+        let Command::Undo(args) = Cli::try_parse_from(["mmm", "undo"]).unwrap().resolve() else {
+            panic!("`mmm undo` must resolve to the undo subcommand");
+        };
+        assert_eq!(args.location.library, PathBuf::from("."));
+        assert!(args.is_dry_run(), "undo previews unless told otherwise");
+        assert_eq!(args.run, None);
+    }
+
+    #[test]
+    fn undo_takes_the_library_positionally_and_commits_on_request() {
+        let Command::Undo(args) = Cli::try_parse_from(["mmm", "undo", "/photos", "--commit"])
+            .unwrap()
+            .resolve()
+        else {
+            panic!("expected undo");
+        };
+        assert_eq!(args.location.library, PathBuf::from("/photos"));
+        assert!(!args.is_dry_run());
+    }
+
+    #[test]
+    fn undo_reads_journals_from_the_library_metadata_dir() {
+        let Command::Undo(args) = Cli::try_parse_from(["mmm", "undo", "/photos"])
+            .unwrap()
+            .resolve()
+        else {
+            panic!("expected undo");
+        };
+        assert_eq!(
+            args.location.resolve(),
+            PathBuf::from("/photos/.mmm/journal")
+        );
+    }
+
+    /// The read and write sides must agree on where journals live, or an undo
+    /// looks somewhere the run never wrote.
+    #[test]
+    fn undo_looks_where_organise_writes() {
+        let organised = parse(&["mmm", "/photos", "-o", "/sorted"]);
+        let Command::Undo(args) = Cli::try_parse_from(["mmm", "undo", "/sorted"])
+            .unwrap()
+            .resolve()
+        else {
+            panic!("expected undo");
+        };
+        assert_eq!(
+            organised.resolve_journal_dir(),
+            Some(args.location.resolve())
+        );
+    }
+
+    #[test]
+    fn undo_journal_dir_overrides_the_library() {
+        let Command::Undo(args) =
+            Cli::try_parse_from(["mmm", "undo", "/photos", "--journal-dir", "/var/log/mmm"])
+                .unwrap()
+                .resolve()
+        else {
+            panic!("expected undo");
+        };
+        assert_eq!(args.location.resolve(), PathBuf::from("/var/log/mmm"));
+    }
+
+    /// Naming a run and asking for the newest one are contradictory requests,
+    /// and clap is the right place to say so — before anything reads a journal.
+    #[test]
+    fn undo_refuses_both_a_named_run_and_last() {
+        assert!(
+            Cli::try_parse_from(["mmm", "undo", "--run", "20240315-103000-abc123", "--last"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn undo_takes_a_named_run() {
+        let Command::Undo(args) =
+            Cli::try_parse_from(["mmm", "undo", "--run", "20240315-103000-abc123"])
+                .unwrap()
+                .resolve()
+        else {
+            panic!("expected undo");
+        };
+        assert_eq!(args.run.as_deref(), Some("20240315-103000-abc123"));
+    }
+
+    #[test]
+    fn journal_list_and_show_reach_the_same_directory() {
+        let Command::Journal {
+            action: JournalAction::List(list),
+        } = Cli::try_parse_from(["mmm", "journal", "list", "/photos"])
+            .unwrap()
+            .resolve()
+        else {
+            panic!("expected journal list");
+        };
+        let Command::Journal {
+            action: JournalAction::Show(show),
+        } = Cli::try_parse_from([
+            "mmm",
+            "journal",
+            "show",
+            "20240315-103000-abc123",
+            "/photos",
+        ])
+        .unwrap()
+        .resolve()
+        else {
+            panic!("expected journal show");
+        };
+
+        assert_eq!(list.resolve(), PathBuf::from("/photos/.mmm/journal"));
+        assert_eq!(show.location.resolve(), list.resolve());
+        assert_eq!(show.run_id, "20240315-103000-abc123");
+    }
+
+    /// `journal show` needs to know which run; there is no sensible default.
+    #[test]
+    fn journal_show_requires_a_run_id() {
+        assert!(Cli::try_parse_from(["mmm", "journal", "show"]).is_err());
+    }
+
+    /// Only the *first* argument can name a subcommand. After a path has been
+    /// taken as a directory, everything following it is another directory —
+    /// including one called `undo`.
+    ///
+    /// This is the behaviour worth pinning rather than a refusal: a run that
+    /// silently dropped `~/Photos/undo` from its input, or that refused an
+    /// otherwise valid two-directory invocation, would both be worse than
+    /// reading the word where it sits.
+    #[test]
+    fn a_directory_named_undo_is_a_directory_when_it_is_not_the_first_argument() {
+        let config = parse(&["mmm", "/photos", "undo"]);
+        assert_eq!(
+            config.directories,
+            vec![PathBuf::from("/photos"), PathBuf::from("undo")]
+        );
+    }
+
+    /// The other half of the same rule, and the one that costs something:
+    /// a *first* argument called `undo` is the subcommand. `mmm organise undo`
+    /// is how to say the other thing.
+    #[test]
+    fn a_leading_undo_is_the_subcommand_and_organise_disambiguates_it() {
+        assert!(matches!(
+            Cli::try_parse_from(["mmm", "undo"]).unwrap().resolve(),
+            Command::Undo(_)
+        ));
+        assert_eq!(
+            parse(&["mmm", "organise", "undo"]).directories,
+            vec![PathBuf::from("undo")]
+        );
+    }
+
+    /// `-v` is global, so it means the same thing wherever the operator
+    /// reaches for it.
+    #[test]
+    fn verbosity_is_accepted_before_or_after_a_subcommand() {
+        assert_eq!(
+            Cli::try_parse_from(["mmm", "-vv", "/photos"])
+                .unwrap()
+                .verbose,
+            2
+        );
+        assert_eq!(
+            Cli::try_parse_from(["mmm", "undo", "-vv"]).unwrap().verbose,
+            2
+        );
+    }
+
     #[test]
     fn help_marks_no_journal_as_unsafe_and_names_the_default_location() {
-        let help = Config::command().render_long_help().to_string();
+        let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--journal-dir"), "{help}");
         assert!(
             help.contains("UNSAFE"),
@@ -357,7 +714,7 @@ mod tests {
 
     #[test]
     fn the_deprecated_flag_is_hidden_from_help() {
-        let help = Config::command().render_long_help().to_string();
+        let help = Cli::command().render_long_help().to_string();
         assert!(
             !help.contains("--dry-run"),
             "the retired flag must not be advertised: {help}"
@@ -367,8 +724,17 @@ mod tests {
 
     #[test]
     fn help_states_the_safety_posture() {
-        let help = Config::command().render_long_help().to_string();
+        let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("SAFE BY DEFAULT"), "{help}");
         assert!(help.contains("--commit"), "{help}");
+    }
+
+    /// A user who has just been told a run is journalled needs to be able to
+    /// find the command that replays it without leaving `--help`.
+    #[test]
+    fn help_advertises_undo_as_the_way_back() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("undo"), "{help}");
+        assert!(help.contains("journal"), "{help}");
     }
 }

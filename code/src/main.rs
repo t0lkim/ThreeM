@@ -1,16 +1,19 @@
+use std::path::Path;
+
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{error, info};
 
-use mmm::{hasher, journal, organiser, reporter, scanner};
+use mmm::{hasher, journal, organiser, reporter, scanner, undo};
 
-use mmm::config::Config;
+use mmm::config::{Cli, Command, Config, JournalAction, UndoArgs};
 use mmm::geocoder::GeoLookup;
 use mmm::journal::{Journal, JournalEntry, RunHeader};
 use mmm::organiser::{ChunkController, MoveRecorder};
 use mmm::reporter::JournalStatus;
+use mmm::undo::RestorePlan;
 
 /// Drives the chunked move phase from the terminal: the progress bar, and the
 /// operator's answer at each chunk boundary.
@@ -104,11 +107,142 @@ fn finish_journal(journal: Option<&mut Journal>, moved: usize, failed: usize, sk
     }
 }
 
+/// Open the journal that records an *undo* run.
+///
+/// Written into the same directory the run being reversed was read from, so
+/// `mmm journal list` shows an undo alongside the run it undid and
+/// `mmm undo --last` can reverse the reversal. Unlike an organise run this has
+/// no `--no-journal`: the point of the subcommand is that a move is recoverable,
+/// and an unrecorded undo would be the one operation in the tool that is not.
+///
+/// # Errors
+///
+/// Returns an error if the journal cannot be created. Nothing has moved at that
+/// point, and nothing will.
+fn open_undo_journal(dir: &Path, plan: &RestorePlan) -> Result<Journal> {
+    let header = RunHeader::new(
+        journal::generate_run_id(),
+        &plan.header.output_dir,
+        RunHeader::current_argv(),
+    );
+    let journal = Journal::create(dir, &header)
+        .context("the undo journal could not be created, so no files have been moved")?;
+
+    println!();
+    reporter::print_journal_location(JournalStatus::At(journal.path()));
+
+    Ok(journal)
+}
+
+/// `mmm undo` — replay one run's journal in reverse.
+fn run_undo(args: &UndoArgs) -> Result<()> {
+    let dir = args.location.resolve();
+
+    let journal_path = match &args.run {
+        Some(run_id) => {
+            let path = journal::journal_path(&dir, run_id);
+            if !path.is_file() {
+                anyhow::bail!(
+                    "no run {run_id} was recorded in {} — `mmm journal list` shows the runs that \
+                     were",
+                    dir.display()
+                );
+            }
+            path
+        }
+        // `--last` and giving nothing mean the same thing; the flag exists so a
+        // script can say which it meant.
+        None => journal::journals_newest_first(&dir)?
+            .into_iter()
+            .next()
+            .with_context(|| {
+                format!(
+                    "no runs are recorded in {} — there is nothing to undo",
+                    dir.display()
+                )
+            })?,
+    };
+
+    let plan = undo::plan_restore(&journal_path)?;
+
+    reporter::print_mode_banner(args.is_dry_run());
+    reporter::print_restore_plan(&plan);
+
+    if args.is_dry_run() {
+        println!("\n{}", reporter::DRY_RUN_BANNER);
+        return Ok(());
+    }
+
+    if plan.steps.is_empty() {
+        // Nothing to record and nothing to reverse. Creating a journal for a
+        // run that moves no files would leave a growing trail of empty undos.
+        return Ok(());
+    }
+
+    let mut journal = open_undo_journal(&dir, &plan)?;
+    let journal_path = journal.path().to_path_buf();
+
+    let mut recorder = MoveRecorder::new(Some(&mut journal));
+    let run = undo::execute_restore(&plan, &mut recorder);
+
+    finish_journal(
+        Some(&mut journal),
+        run.restored,
+        run.failed,
+        run.unprocessed,
+    );
+    reporter::print_restore_summary(&plan, &run, JournalStatus::At(&journal_path));
+
+    // A partial undo has to be detectable by a script, which cannot read the
+    // table above.
+    if run.journal_failed {
+        anyhow::bail!(
+            "the undo journal could not be written, so the undo stopped after {} file{} — see \
+             the errors above. Nothing further was moved.",
+            run.restored,
+            if run.restored == 1 { "" } else { "s" }
+        );
+    }
+    if run.failed > 0 {
+        anyhow::bail!(
+            "{} file{} could not be put back — see the results above. The rest of the run has \
+             been restored.",
+            run.failed,
+            if run.failed == 1 { "" } else { "s" }
+        );
+    }
+
+    Ok(())
+}
+
+/// `mmm journal list` / `mmm journal show` — read-only, always.
+fn run_journal(action: &JournalAction) -> Result<()> {
+    match action {
+        JournalAction::List(location) => {
+            let rows = undo::summarise_runs(&location.resolve())?;
+            reporter::print_run_list(&rows);
+        }
+        JournalAction::Show(args) => {
+            let path = journal::journal_path(&args.location.resolve(), &args.run_id);
+            if !path.is_file() {
+                anyhow::bail!(
+                    "no run {} was recorded in {} — `mmm journal list` shows the runs that were",
+                    args.run_id,
+                    args.location.resolve().display()
+                );
+            }
+            let (header, entries) = undo::read_run(&path)?;
+            reporter::print_run_detail(&path, &header, &entries);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
-    let config = Config::parse();
+    let cli = Cli::parse();
 
     // Initialise tracing
-    let filter = match config.verbose {
+    let filter = match cli.verbose {
         0 => "warn",
         1 => "info",
         2 => "debug",
@@ -119,6 +253,15 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    match cli.resolve() {
+        Command::Organise(config) => run_organise(&config),
+        Command::Undo(args) => run_undo(&args),
+        Command::Journal { action } => run_journal(&action),
+    }
+}
+
+/// `mmm organise` — the scan, plan, and move pipeline.
+fn run_organise(config: &Config) -> Result<()> {
     if let Some(notice) = config.deprecation_notice() {
         eprintln!("{notice}");
     }
@@ -241,7 +384,7 @@ fn main() -> Result<()> {
     }
 
     // === JOURNAL: opened before the first move, closed on every way out ===
-    let mut journal = open_journal(&config)?;
+    let mut journal = open_journal(config)?;
     let journal_path = journal.as_ref().map(|j| j.path().to_path_buf());
     let journal_status = || match journal_path.as_deref() {
         Some(path) => JournalStatus::At(path),

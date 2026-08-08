@@ -281,6 +281,13 @@ pub enum MovePurpose<'a> {
     Organise,
     /// A duplicate moving into `duplicates/<group>/`.
     Duplicate { group: usize, hash: &'a str },
+    /// `mmm undo` putting a file back where a previous run found it.
+    ///
+    /// Carries the hash the original run recorded, when it recorded one, so an
+    /// undo's own journal describes the file it moved as precisely as the run
+    /// it is reversing did — which is what makes an undo undoable on the same
+    /// terms as everything else.
+    Restore { hash: Option<&'a str> },
 }
 
 impl MovePurpose<'_> {
@@ -288,6 +295,7 @@ impl MovePurpose<'_> {
         match self {
             Self::Organise => IntentKind::Organise,
             Self::Duplicate { .. } => IntentKind::Duplicate,
+            Self::Restore { .. } => IntentKind::Restore,
         }
     }
 
@@ -295,6 +303,7 @@ impl MovePurpose<'_> {
         match self {
             Self::Organise => None,
             Self::Duplicate { hash, .. } => Some(hash.to_string()),
+            Self::Restore { hash } => hash.map(ToString::to_string),
         }
     }
 }
@@ -397,7 +406,11 @@ impl<'a> MoveRecorder<'a> {
         let Some(seq) = seq else { return Ok(()) };
 
         let entry = match purpose {
-            MovePurpose::Organise => JournalEntry::MoveCommitted {
+            // A restore is an ordinary committed move as far as the journal is
+            // concerned — its *reason* is already on the intent line, and
+            // giving it a record type of its own would mean a third thing
+            // `undo` has to recognise to reverse an undo.
+            MovePurpose::Organise | MovePurpose::Restore { .. } => JournalEntry::MoveCommitted {
                 seq,
                 final_destination: outcome.destination.clone(),
                 move_kind: outcome.kind,
@@ -454,7 +467,7 @@ pub enum RecordedMoveError {
 ///
 /// [`RecordedMoveError::Move`] if the move failed, and
 /// [`RecordedMoveError::Journal`] if any of the three journal writes did.
-fn recorded_move(
+pub(crate) fn recorded_move(
     recorder: &mut MoveRecorder<'_>,
     planned: &PlannedMove,
     purpose: MovePurpose<'_>,

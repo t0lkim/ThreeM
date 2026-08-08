@@ -359,6 +359,57 @@ impl Journal {
     }
 }
 
+/// The file extension every journal carries.
+const JOURNAL_EXTENSION: &str = "jsonl";
+
+/// Where the journal of run `run_id` lives inside `dir`.
+///
+/// The inverse of [`Journal::create`]'s naming, stated once so `undo --run`
+/// cannot look for a file under a name nothing writes.
+pub fn journal_path(dir: &Path, run_id: &str) -> PathBuf {
+    dir.join(format!("{run_id}.{JOURNAL_EXTENSION}"))
+}
+
+/// The run id a journal file is named for.
+pub fn run_id_of(path: &Path) -> Option<String> {
+    path.file_stem().map(|s| s.to_string_lossy().into_owned())
+}
+
+/// Every journal in `dir`, newest first.
+///
+/// Sorted by file name and reversed rather than by mtime: the run id *is* a
+/// timestamp, so this is chronological by construction and stays right when a
+/// library is copied to another disk and every mtime becomes the copy's.
+///
+/// A directory that does not exist is an empty list, not an error: `.mmm/journal`
+/// is created by the first committing run, so its absence means no such run has
+/// happened here. That is a fact about the library, and the caller has a better
+/// sentence for it than this function does. Anything else — a denied read, a
+/// broken mount — really is "could not look" and is reported as such.
+///
+/// # Errors
+///
+/// Returns an error if `dir` exists but cannot be read.
+pub fn journals_newest_first(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("reading the journal directory {}", dir.display())))
+        }
+    };
+
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == JOURNAL_EXTENSION))
+        .collect();
+
+    paths.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    Ok(paths)
+}
+
 /// Parse one JSONL line into `T`.
 fn parse_line<T: DeserializeOwned>(line: &[u8]) -> Result<T> {
     let text = std::str::from_utf8(line)
@@ -783,5 +834,64 @@ mod tests {
     fn run_ids_generated_together_are_distinct() {
         let ids: std::collections::HashSet<String> = (0..256).map(|_| generate_run_id()).collect();
         assert_eq!(ids.len(), 256, "run ids collided within one second");
+    }
+
+    /// `undo --run <id>` has to find the file `create` wrote. Naming it in two
+    /// places would be two chances to disagree.
+    #[test]
+    fn a_journal_is_found_under_the_name_it_was_created_with() {
+        let tmp = TempDir::new().unwrap();
+        let journal = Journal::create(tmp.path(), &header("20240315-103000-abc123")).unwrap();
+
+        assert_eq!(
+            journal_path(tmp.path(), "20240315-103000-abc123"),
+            journal.path()
+        );
+        assert_eq!(
+            run_id_of(journal.path()).as_deref(),
+            Some("20240315-103000-abc123")
+        );
+    }
+
+    #[test]
+    fn journals_are_listed_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        for run_id in [
+            "20240315-103000-aaaaaa",
+            "20240316-090000-bbbbbb",
+            "20240315-110000-cccccc",
+        ] {
+            drop(Journal::create(tmp.path(), &header(run_id)).unwrap());
+        }
+        // Something that is not a journal, which the listing must ignore.
+        fs::write(tmp.path().join("notes.txt"), b"not a journal").unwrap();
+
+        let listed: Vec<String> = journals_newest_first(tmp.path())
+            .unwrap()
+            .iter()
+            .filter_map(|p| run_id_of(p))
+            .collect();
+
+        assert_eq!(
+            listed,
+            vec![
+                "20240316-090000-bbbbbb",
+                "20240315-110000-cccccc",
+                "20240315-103000-aaaaaa",
+            ]
+        );
+    }
+
+    /// The journal directory is created by the first committing run, so its
+    /// absence is not a failure to look — it is the answer. `mmm undo` in a
+    /// library nobody has organised should say "nothing to undo", not report an
+    /// io error at the operator.
+    #[test]
+    fn a_library_that_was_never_organised_lists_no_runs() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(
+            journals_newest_first(&tmp.path().join("never-run")).unwrap(),
+            Vec::<PathBuf>::new()
+        );
     }
 }

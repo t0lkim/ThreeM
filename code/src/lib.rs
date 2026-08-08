@@ -24,3 +24,4 @@ pub mod naming;
 pub mod organiser;
 pub mod reporter;
 pub mod scanner;
+pub mod undo;
