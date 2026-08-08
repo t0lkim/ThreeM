@@ -69,6 +69,9 @@ mmm config validate [PATH]          # parse a config, run nothing
 | `--commit` | | off | **Actually move files.** Without this, `mmm` only prints the plan and exits |
 | `--chunk-size <N>` | `-c` | 100 | Number of files to process before pausing for confirmation |
 | `--no-prompt[=<BOOL>]` | | off | Skip confirmation prompts between chunks. `--no-prompt=false` keeps them, which is how to answer a `no_prompt = true` written in a config file |
+| `--timezone <TZ>` | | machine's zone | Which wall clock to read a file that recorded no offset against. A fixed offset (`+08:00`, `-05:30`) or an IANA name (`Asia/Singapore`). See [Timezones](#timezones) |
+| `--require-exif[=<BOOL>]` | | off | Refuse to file anything under a date the file did not record itself — those go to `unsorted/` instead, keeping their own names. See [Refusing dates you do not trust](#refusing-dates-you-do-not-trust) |
+| `--no-sidecars[=<BOOL>]` | | off | Leave `.xmp`, `.aae` and `.thm` sidecars where they are instead of moving them with their photograph. See [Sidecars](#sidecars) |
 | `--config <PATH>` | | discovery | Read this config file instead of searching for one. A path that does not exist is an error |
 | `--no-config` | | off | Ignore every config file. `MMM_` environment variables still apply |
 | `--journal-dir <PATH>` | | `<output>/.mmm/journal` | Write the run journal somewhere else — useful when the output tree is read-only, or when journals for several libraries are collected in one place |
@@ -89,8 +92,8 @@ mmm config validate [PATH]          # parse a config, run nothing
 1. **Announces the mode** — `DRY RUN — no files will be modified. Re-run with --commit to apply.` or `COMMIT MODE — files will be moved.`, printed before anything is scanned.
 2. **Scans** all input directories recursively for media files.
 3. **Deduplicates** using a three-phase hash cascade (see Technical Documentation).
-4. **Extracts metadata** — creation date and GPS coordinates from EXIF (images) or container atoms (video). Falls back to filesystem creation date when metadata is absent.
-5. **Plans renames** — each unique file is assigned a target path: `<output>/YYYY-MM-DD/YYYY-MM-DD-HHMMSS[-location].ext`.
+4. **Extracts metadata** — creation date and GPS coordinates from EXIF (images) or container atoms (video), then from an `.xmp` sidecar for a file that recorded nothing usable itself. Falls back to the filesystem timestamp when there is nothing else, and says which of the three reasons applied.
+5. **Plans renames** — each unique file is assigned a target path: `<output>/YYYY-MM-DD/YYYY-MM-DD-HHMMSS[-location].ext`, derived from the file's **local wall clock** (see [Timezones](#timezones)).
 6. **Reports** — without `--commit`, prints the full plan and duplicate list, then exits. Nothing is created, moved or deleted.
 7. **Opens a journal** — with `--commit`, a record of the run is created at `<output>/.mmm/journal/<run_id>.jsonl` before anything moves. Its path is printed immediately and again in the closing summary. A preview writes no journal, because it moves nothing.
 8. **Moves duplicates** — with `--commit`, duplicate files are moved to `<output>/duplicates/000/`, `001/`, etc. Each group directory includes a `manifest.txt` recording the BLAKE3 hash and original file path.
@@ -116,18 +119,48 @@ Group 1 (3 files, 4521984 bytes each, hash: 7a3b1c4d5e6f7890…):
 ```
 ═══ Dry Run — Planned Operations ═══
 
-  [EXIF] ~/Photos/IMG_0001.jpg → ~/Organised/2024-03-15/2024-03-15-143022-London-GB.jpg
-  [FS]   ~/Photos/screenshot.png → ~/Organised/2026-01-02/2026-01-02-091500.png
+  [EXIF][tz:exif] ~/Photos/IMG_0001.jpg → ~/Organised/2024-03-15/2024-03-15-143022-London-GB.jpg
+  [SIDECAR][tz:config] ~/Photos/IMG_0002.cr2 → ~/Organised/2024-03-15/2024-03-15-143530.cr2
+    [sidecar] ~/Photos/IMG_0002.cr2.xmp → ~/Organised/2024-03-15/2024-03-15-143530.cr2.xmp
+  [FS][tz:system] ~/Photos/screenshot.png → ~/Organised/2026-01-02/2026-01-02-091500.png
+  [FS: UNSUPPORTED][tz:system] ~/Photos/DSC_0009.nef → ~/Organised/2026-01-02/2026-01-02-091500.nef
   [NO DATE] ~/Photos/unknown.bmp → ~/Organised/unsorted/unknown.bmp
 ```
 
-The `[EXIF]`, `[FS]`, and `[NO DATE]` tags tell you where the date came from.
+The first tag says where the **date** came from:
+
+| Tag | Meaning |
+|---|---|
+| `[EXIF]` | The file's own embedded metadata. |
+| `[SIDECAR]` | An `.xmp` beside the file — see [Sidecars](#sidecars). |
+| `[FS]` | The filesystem timestamp: the file records no date. |
+| `[FS: UNREADABLE]` | The filesystem timestamp, because the file's metadata is there and will not parse — a truncated write, a corrupted card. |
+| `[FS: UNSUPPORTED]` | The filesystem timestamp, because the format is not one `mmm` can read a date out of. Which formats those are is in [`docs/reference/format-support.md`](reference/format-support.md). |
+| `[NO DATE]` | No usable date at all; the file goes to `unsorted/`. |
+
+The second tag says which **wall clock** the date was read against — `[tz:exif]`,
+`[tz:sidecar]`, `[tz:config]`, `[tz:system]` or `[tz:utc]`. See
+[Timezones](#timezones).
+
+An indented `[sidecar]` line is a companion file following its parent. The
+closing summary counts every one of these categories, on a committing run as well
+as a preview.
 
 ### Supported Formats
+
+Thirty-two extensions are **scanned** — 21 image, 11 video:
 
 **Images:** JPEG, PNG, HEIC/HEIF, TIFF, RAW (CR2, CR3, NEF, ARW, DNG, ORF, RW2, RAF, SRW, PEF), WebP, AVIF, BMP
 
 **Video:** MOV, MP4, M4V, AVI, MKV, WMV, FLV, WebM, 3GP, MTS, M2TS
+
+A date can be **read out of** four container families: JPEG, the HEIF family
+(HEIC/HEIF/AVIF), QuickTime and MP4. Everything else — every TIFF-based RAW
+included — falls back to the filesystem timestamp unless there is an `.xmp`
+beside it, and the run says so per file rather than passing it off as an ordinary
+date. Which formats are verified, which are not, and what happens in each case is
+the whole subject of
+[`docs/reference/format-support.md`](reference/format-support.md).
 
 ### Output Structure
 
@@ -165,6 +198,177 @@ Every name in that tree is a default, not a fixture: `date_directory_format`, `f
 - **A file that cannot be read is never moved.** If its contents could not be established, it stays exactly where you put it.
 - **You can stop at any chunk.** Between chunks, the tool asks whether to continue. Answering `n` stops before the next chunk; files already moved stay moved, nothing else is touched. The run then finishes properly — it prints the same closing summary a completed run does, with a `Not processed:` line counting the files it never got to, so you always know what a stopped run managed.
 - **Every committing run is recorded before it acts.** Each move is written to the journal and flushed to disk *before* the file is touched, so a run killed by `Ctrl-C`, a power cut or a full disk still leaves a record of exactly what it moved and where — and one entry naming the single file it was part-way through. See [Undoing a run](#undoing-a-run).
+
+---
+
+## Timezones
+
+**A photograph is filed under the time its camera displayed.** A frame taken at
+23:30 in Singapore lands in `2024-03-15/` and is named `2024-03-15-233000.jpg` —
+on any machine, in any zone, whatever you pass on the command line. That is the
+whole of what most people need to know, and it is a change: builds before this
+one read an EXIF timestamp as UTC, so the same frame landed in `2024-03-16/`
+under a filename stamped `153000` for anyone east of Greenwich.
+
+An EXIF `DateTimeOriginal` is a wall clock with no zone in it. `mmm` still works
+out the real instant behind it, because comparing two photographs taken in
+different places needs one, but the *instant* is not what names the directory.
+
+### When the file did not say
+
+Most files record no offset. `--timezone` decides what to assume for those:
+
+```bash
+# A library shot in Singapore, being organised on a laptop in Portugal
+mmm ~/Photos --timezone Asia/Singapore
+
+# A fixed offset works too — note that west-of-Greenwich offsets start with a hyphen
+mmm ~/Photos --timezone -05:00
+```
+
+Set it once instead, in a config file:
+
+```toml
+default_timezone = "Asia/Singapore"
+```
+
+Resolution order, first answer wins:
+
+1. **The file's own offset** — an EXIF `OffsetTimeOriginal` tag, an offset in an
+   `.xmp` sidecar, or the offset an iPhone writes into a `.mov`. Always believed,
+   over everything below it.
+2. **`--timezone` / `default_timezone`.**
+3. **The machine's own timezone.**
+4. **UTC**, only where the machine's zone has no answer — a local time inside a
+   daylight-saving gap, which never occurred.
+
+### What `--timezone` does not do
+
+**It does not move a photograph to a different day.** A wall clock is filed under
+its own digits whatever the zone; the setting decides the instant recorded
+alongside, which is what the `[tz:…]` tag reports. It *does* move files whose
+timestamp is a genuine instant rather than a wall clock — a filesystem-dated
+file, or a video with only a container clock — because those have to be converted
+to somebody's local time before they can name a directory, and converting them to
+UTC's would be the original bug again.
+
+Every line of a preview carries its `[tz:…]` tag, and the preview summary breaks
+the run down by how each zone was decided, so a run that fell back to the
+machine's timezone for three thousand files tells you once rather than leaving it
+to be inferred.
+
+The reasoning, the alternatives and the known gaps are in
+[`docs/decisions/adr-006-timezone-handling.md`](decisions/adr-006-timezone-handling.md).
+
+---
+
+## Sidecars
+
+An `.xmp` is bound to its photograph by **filename and nothing else** — there is
+no identifier inside it naming the RAW it describes. So a run that renamed
+`IMG_1234.CR2` and left `IMG_1234.xmp` behind would silently detach every edit
+its owner had made. `mmm` moves them together.
+
+```
+~/Photos/IMG_1234.CR2      →  ~/Organised/2024-03-15/2024-03-15-143022.cr2
+~/Photos/IMG_1234.cr2.xmp  →  ~/Organised/2024-03-15/2024-03-15-143022.cr2.xmp
+```
+
+- **Both naming conventions are recognised, case-insensitively** — `IMG_1234.xmp`
+  (Adobe's, matched on the stem) and `IMG_1234.CR2.xmp` (darktable's, matched on
+  the whole filename).
+- **The convention is preserved, not normalised.** A sidecar written the
+  darktable way lands as `<new stem>.cr2.xmp`, because the tool that wrote it is
+  the tool that will next go looking for it.
+- **`.aae` and `.thm` count too** — Apple's edit records and camera video
+  thumbnails. The list is `extensions.sidecar`, default `["xmp", "aae", "thm"]`.
+- A sidecar follows its parent wherever it **actually** landed, collision suffix
+  included, and follows a duplicate into `duplicates/NNN/`.
+- It is never treated as a media file: not counted in the scan totals, not
+  deduplicated, not dated on its own.
+- Each move is journalled separately, so `mmm undo` puts both back.
+
+### Sidecars left in place
+
+Two cases are reported rather than guessed at, under a `Sidecars left in place`
+heading and counted as `Sidecars orphaned:` in the summary:
+
+| Reason | Example |
+|---|---|
+| **No parent** | `IMG_9999.xmp` with no media file of that name beside it — including one whose parent was excluded by `skip_patterns` or a narrowed extension list. |
+| **More than one parent** | `IMG_1234.xmp` beside both `IMG_1234.jpg` and `IMG_1234.cr2` — an ordinary RAW+JPEG shoot. Nothing in the file breaks the tie, and attaching somebody's edits to the wrong photograph is worse than refusing. |
+
+Neither is swept into `unsorted/`, which means "no usable date" and would say the
+wrong thing.
+
+### A sidecar can supply the date
+
+If a photograph records no usable date of its own, `mmm` reads one out of its
+`.xmp` — `exif:DateTimeOriginal`, then `photoshop:DateCreated`, then
+`xmp:CreateDate` — and tags the file `[SIDECAR]`.
+
+**This is the only way a TIFF-based RAW gets filed under the date it was taken.**
+No RAW container is one `mmm` can read, so a `.cr2` library is otherwise
+organised entirely by modification time while the answer sits in the text file
+beside every frame. A sidecar never overrides a date the photograph itself
+recorded, and a malformed one is a warning and a skip, never a failed run.
+
+### Switching it off
+
+```bash
+mmm ~/Photos --no-sidecars      # sidecars are not collected, moved, dated or counted
+```
+
+`sidecars = false` in a config file does the same standing; `--no-sidecars=false`
+answers it for one run.
+
+---
+
+## Refusing dates you do not trust
+
+A filesystem timestamp is when a file was last written. On a library that has
+been copied between disks, restored from a backup or synced through a cloud
+service, that is the date of the **copy** — so filing by it produces a tree that
+looks organised and is not.
+
+`--require-exif` refuses to do it:
+
+```bash
+mmm ~/Photos --require-exif --commit
+```
+
+Any file whose date did not come from the file itself or its sidecar goes to
+`unsorted/` instead of being filed under a date nobody recorded. **It keeps its
+own filename there**, unlike the undated files in `unsorted/`, which are all
+`unknown.<ext>` — a refused file has a perfectly good name and a date you merely
+declined to trust, and the name is the last handle on it.
+
+It can be set in a config file (`require_exif = true`), unlike `--commit`,
+because it can only ever make a run more careful. `--require-exif=false` answers a
+configured `true` for one run.
+
+### The warning that points at it
+
+Every run's summary counts each way a date was established:
+
+```
+  Date from EXIF: 812
+  Date from XMP sidecar: 0
+  Date from filesystem: 4
+  Date from filesystem — metadata unreadable: 1
+  Date from filesystem — format not supported: 296
+  No date (unsorted): 0
+
+  WARNING: 27% of dated files (301 of 1113) took their date from the filesystem
+  rather than from the file's own metadata.
+  A filesystem timestamp is when the file was last written, which on a library
+  that has been copied between disks is the date of the copy — not of the
+  photograph. Pass --require-exif to send those to unsorted/ instead of filing
+  them under a date nobody recorded.
+```
+
+The threshold is `filesystem_date_warning_percent`, 20% of dated files by
+default. `0` warns about every one; `100` never warns.
 
 ---
 

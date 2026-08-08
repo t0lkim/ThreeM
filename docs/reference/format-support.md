@@ -9,6 +9,7 @@ tags:
   - video
   - heic
 related:
+  - '[[adr-006-timezone-handling]]'
   - '[[configuration]]'
   - '[[USER-GUIDE]]'
   - '[[CHANGELOG]]'
@@ -50,20 +51,28 @@ version 0.1.0 the run says which files this happened to; before that it did not.
 | `.heic` | ISO-BMFF, brand `heic` | ✅ EXIF item via `meta`/`iinf`/`iloc` | ✅ | Every iPhone photograph since 2017. |
 | `.heif` | ISO-BMFF, brand `mif1` | ✅ | ✅ (same path) | Accepted on the major brand or on a compatible brand. |
 | `.avif` | ISO-BMFF, brand `avif` | ✅ | ✅ (same path) | Works because real AVIF files list `mif1` as a compatible brand. An AVIF that lists neither would be filesystem-only. |
-| `.dng` | TIFF/IFD | ❌ **filesystem only** | ❌ | The date *is* in the file, in an Exif `SubIFD`. `nom-exif` does not read a bare TIFF. |
-| `.nef`, `.arw`, `.rw2`, `.raf`, `.srw`, `.pef`, `.orf`, `.raw` | TIFF/IFD (vendor variants) | ❌ **filesystem only** | ❌ | Same structure, same gap. |
-| `.cr2` | TIFF/IFD + `CR\x02\x00` signature | ❌ **filesystem only** | ❌ | Verified as unreadable with a fixture carrying the Canon signature. |
+| `.dng` | TIFF/IFD | ❌ **filesystem only** — ✅ from an `.xmp` beside it | ❌ | The date *is* in the file, in an Exif `SubIFD`. `nom-exif` does not read a bare TIFF. |
+| `.nef`, `.arw`, `.rw2`, `.raf`, `.srw`, `.pef`, `.orf`, `.raw` | TIFF/IFD (vendor variants) | ❌ **filesystem only** — ✅ from an `.xmp` beside it | ❌ | Same structure, same gap. |
+| `.cr2` | TIFF/IFD + `CR\x02\x00` signature | ❌ **filesystem only** — ✅ from an `.xmp` beside it | ❌ | Verified as unreadable with a fixture carrying the Canon signature. |
 | `.cr3` | ISO-BMFF (Canon) | ⚠️ untested | ⚠️ untested | A different container from CR2 despite the name. Canon stores EXIF in a custom `CMT1` box, which is not the HEIF `Exif` item, so it is unlikely to read. |
 | `.tiff`, `.tif` | TIFF/IFD | ❌ **filesystem only** | ❌ | Same gap as the RAW families. |
 | `.png` | PNG | ❌ **filesystem only** | ❌ | Not an EXIF container the parser knows. A PNG `eXIf` chunk is not read. |
 | `.webp` | RIFF | ❌ **filesystem only** | ❌ | Not recognised. |
 | `.bmp` | BMP | ❌ **filesystem only** | ❌ | Carries no date to read in any case. |
 
+**The RAW rows have a second answer, and for a darktable or Lightroom library it
+is the one that applies.** The date column above is about what is *inside* the
+file. A file with no readable date of its own takes one from the `.xmp` sidecar
+beside it — which is where the RAW families' dates actually live, because a RAW
+must never be written into and so every edited frame has one. Such a file is
+tagged `[SIDECAR]`, not `[FS: UNSUPPORTED]`, and `--require-exif` admits it. See
+[Sidecar dates](#sidecar-dates) below.
+
 ## Videos
 
 | Extension | Container | Date source verified | GPS verified | Notes |
 |---|---|---|---|---|
-| `.mp4`, `.m4v` | ISO-BMFF, brands `mp42`/`isom`/… | ✅ `moov/mvhd` creation time | ✅ via `moov/udta/©xyz` (Android) — untested | `mvhd` is a UTC instant; see [Timezones](#timezones) below. |
+| `.mp4`, `.m4v` | ISO-BMFF, brands `mp42`/`isom`/… | ✅ `moov/mvhd` creation time | ⚠️ untested — the Android `moov/udta/©xyz` path has no fixture | `mvhd` is a UTC instant; see [Timezones](#timezones) below. |
 | `.mov` | QuickTime, brand `qt  ` | ✅ `moov/mvhd`, and `com.apple.quicktime.creationdate` when present | ✅ `com.apple.quicktime.location.ISO6709` | The Apple key wins over `mvhd`, because only it knows where the camera stood. |
 | `.3gp` | ISO-BMFF, brand `3gp4` | ✅ `moov/mvhd` creation time | ⚠️ untested | Same parser path as MP4. |
 | `.avi` | RIFF | ❌ **filesystem only** | ❌ | Not recognised. |
@@ -88,11 +97,35 @@ whose EXIF block is there and will not parse reports `Unreadable`. Three
 outcomes, one directory: they are told apart in the report because they are not
 told apart by the output tree.
 
+## Sidecar dates
+
+The date column is about what a container holds. When it holds nothing usable,
+`mmm` reads the `.xmp` sidecar beside the file — `exif:DateTimeOriginal`, then
+`photoshop:DateCreated`, then `xmp:CreateDate` — and tags the file `[SIDECAR]`.
+Both RDF serialisations are read, and a property is matched on its namespace URI
+under whatever prefix a writer chose.
+
+This is the whole of the RAW answer for anyone using an editor: no TIFF-based RAW
+is a container this tool reads, and every one of them that has been edited has an
+`.xmp` beside it, because a RAW must never be written into. `--require-exif`
+admits a sidecar date for that reason — it refuses *filesystem* timestamps, and a
+date somebody's editor wrote down is not one.
+
+What it will not do: override a date the file itself recorded, read anything but
+a `.xmp` (an `.aae` is a binary property list, a `.thm` is a thumbnail with
+metadata of its own), read coordinates, or accept a value coarser than a whole
+day. A malformed sidecar is a warning and a skip.
+
+For a RAW library with no sidecars, `--require-exif` is the conservative posture:
+every row marked *filesystem only* above goes to `unsorted/` under its own
+filename rather than being filed under a modification time.
+
 ## Timezones
 
 Three different things a file can say about when it was made, and each is
-treated differently. See `adr-006-timezone-handling.md` for the full resolution
-order.
+treated differently. See
+[`adr-006-timezone-handling`](../decisions/adr-006-timezone-handling.md) for the
+full resolution order and the reasoning.
 
 | The file says | Example | How it is read |
 |---|---|---|
@@ -112,24 +145,34 @@ order.
   coordinates into a zone needs a boundary database; a place-name lookup is not
   one.
 - **RAW dates are not read out of the RAW itself**, per the table above. A second
-  parser would be needed. What *is* read is the `.xmp` sidecar beside it: a file
-  with no usable embedded date takes `exif:DateTimeOriginal`,
-  `photoshop:DateCreated` or `xmp:CreateDate` from its sidecar and is tagged
-  `[SIDECAR]` — which for a darktable or Lightroom library covers the whole of
-  the gap, since a RAW file must never be written into and so always has one.
-  `--require-exif` admits a sidecar date for that reason, and remains the
-  conservative posture for a RAW library without sidecars: every row marked
-  *filesystem only* goes to `unsorted/` under its own filename rather than being
-  filed under a modification time.
+  parser would be needed. The `.xmp` beside it is read instead — see
+  [Sidecar dates](#sidecar-dates).
 
 ## Verifying this page
 
-Every ✅ above corresponds to a test in `code/tests/metadata_formats.rs`, and
-every ❌ in the RAW rows corresponds to a test asserting the *absence* — that the
-file is reported as an unreadable format rather than silently dated from the
-filesystem. The fixtures are synthesised byte by byte in
-`code/tests/common/mod.rs`; there are no checked-in binary assets, so the matrix
-can be re-verified offline on any machine.
+Every ✅ above corresponds to a test, and every ❌ in the RAW rows corresponds to a
+test asserting the *absence* — that the file is reported as an unsupported format
+rather than silently dated from the filesystem. The fixtures are synthesised byte
+by byte in `code/tests/common/mod.rs`; there are no checked-in binary assets, so
+the matrix can be re-verified offline on any machine, and it is re-verified under
+`TZ=Europe/London` and `TZ=Pacific/Apia` as well as locally.
+
+| Claim | Test |
+|---|---|
+| JPEG date, offset tag, GPS | `fixture_selftest::*`, `metadata_formats::an_offset_tag_files_an_evening_photograph_under_its_own_wall_clock` |
+| HEIC date + GPS through the HEIF item indirection | `metadata_formats::a_heic_yields_its_exif_datetime_and_coordinates` |
+| `heic` / `mif1` / `avif` brands | `metadata_formats::the_heif_family_is_read_under_each_brand_the_scanner_claims` |
+| MP4, MOV and 3GP `mvhd` clocks | `metadata_formats::an_mp4_or_mov_container_clock_is_read_as_the_utc_instant_it_is` |
+| Apple `creationdate` + ISO 6709 location | `metadata_formats::an_apple_creationdate_is_believed_over_the_runs_own_timezone` |
+| `mvhd`-only video takes the run's zone | `metadata_formats::a_video_without_a_recording_offset_still_takes_the_runs_zone` |
+| TIFF RAW (DNG, NEF, ARW, CR2) reported unsupported | `metadata_formats::a_tiff_based_raw_is_reported_as_unsupported_rather_than_silently_degrading` |
+| …and the RAW fixtures are not merely malformed | `metadata_formats::the_raw_fixtures_carry_a_date_the_tool_would_read_in_any_other_container` |
+| The three filesystem fallbacks are told apart | `metadata_formats::the_three_ways_of_falling_back_to_the_filesystem_are_told_apart` |
+| A RAW dated from its sidecar | `sidecars::a_raw_takes_its_date_from_the_xmp_beside_it` |
+
+The anti-vacuity control in the second RAW row matters: it asserts that the
+identical EXIF block parses when it is put in a JPEG, so "the container is the
+blocker" is a measurement rather than a story about a possibly-broken fixture.
 
 The ⚠️ cells are honest gaps in this page, not necessarily in the tool: `.cr3`,
 the Android `©xyz` GPS path and GPS in a `.3gp` have no fixture, so nothing above
