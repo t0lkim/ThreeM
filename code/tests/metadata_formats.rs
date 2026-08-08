@@ -1243,3 +1243,81 @@ fn the_two_byte_boundary_is_answered_consistently() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A location outlives a date it cannot read
+// ---------------------------------------------------------------------------
+
+/// A photograph that recorded *where* but not *when* keeps its location.
+///
+/// The coordinates were read and then thrown away: the undated answer carried
+/// them, the caller discarded the whole struct in favour of the filesystem
+/// timestamp, and the file was filed under a date nobody recorded with no
+/// location in its name — while the GPS block sat in the file the whole time.
+/// The two facts are independent, and losing one because the other is missing
+/// is the defect.
+#[test]
+fn a_photograph_with_a_location_and_no_readable_date_keeps_its_location() {
+    let tz = TimezonePolicy::new(Some(Timezone::from_str("+00:00").unwrap()));
+
+    // Greenwich, so the place name is stable and recognisable in a filename.
+    let tree = MediaTree::new().jpeg_with_exif_but_no_date("nowhen.jpg", Some((51.4779, -0.0015)));
+
+    let meta = extract_metadata(&tree.join("nowhen.jpg"), false, &tz).unwrap();
+
+    assert!(
+        !meta.date_source.is_recorded(),
+        "the fixture must have no readable date, or this proves nothing"
+    );
+    assert!(
+        meta.date.is_some(),
+        "it still gets a filesystem date, as before"
+    );
+    assert!(
+        meta.latitude.is_some() && meta.longitude.is_some(),
+        "the coordinates the file recorded were dropped along with the date"
+    );
+
+    let (lat, lon) = (meta.latitude.unwrap(), meta.longitude.unwrap());
+    assert!(
+        (lat - 51.4779).abs() < 0.001 && (lon - -0.0015).abs() < 0.001,
+        "the coordinates came back changed: {lat}, {lon}"
+    );
+}
+
+/// And the consequence a user sees: the location reaches the filename.
+///
+/// Asserted through the real binary because the library keeping the
+/// coordinates and the *name* carrying them are two different wirings, and only
+/// a run crosses both.
+#[test]
+fn a_location_without_a_date_reaches_the_filename() {
+    let tree = MediaTree::new().jpeg_with_exif_but_no_date("nowhen.jpg", Some((51.4779, -0.0015)));
+
+    let listing = preview_listing(tree.path(), &[]);
+    let line = listing
+        .lines()
+        .find(|l| l.contains("nowhen.jpg"))
+        .unwrap_or_else(|| panic!("the fixture was not planned:\n{listing}"));
+
+    // The destination is the half after the arrow. A dated filename is
+    // `YYYY-MM-DD-HHMMSS.jpg`; a located one carries a place between the stamp
+    // and the extension. Asserting on the shape rather than on a place name
+    // keeps this independent of what the bundled GeoNames dataset calls the
+    // spot, which is not this test's claim.
+    let destination = line.rsplit('\u{2192}').next().unwrap_or_default().trim();
+    let stem = Path::new(destination)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+
+    assert!(
+        stem.len() > "YYYY-MM-DD-HHMMSS".len(),
+        "the planned name is a bare timestamp, so the coordinates did not reach \
+         it: {destination}"
+    );
+    assert!(
+        stem.chars().any(char::is_alphabetic),
+        "a location suffix is letters, and this name has none: {destination}"
+    );
+}

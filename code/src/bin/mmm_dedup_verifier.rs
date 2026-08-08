@@ -232,12 +232,34 @@ fn main() -> Result<()> {
         process::exit(1);
     }
 
-    if missing > 0 && args.check_originals {
-        println!("\nWARNING: {missing} originals not found at recorded paths!");
+    // A group whose original cannot be found was not verified against anything.
+    // This used to be an error only under `--check-originals`, which meant the
+    // default run — the one somebody makes before deleting a `duplicates/`
+    // directory — printed an all-clear having confirmed nothing at all. The
+    // flag is kept so existing invocations still parse; it no longer changes
+    // the outcome.
+    if missing > 0 {
+        println!(
+            "\nWARNING: {missing} originals were not found at their recorded paths, so those \
+             groups were NOT verified. Nothing here should be deleted on the strength of this \
+             run."
+        );
         process::exit(1);
     }
 
-    println!("\nAll verified groups are confirmed duplicates.");
+    // Every remaining group is confirmed, so this is the only path on which the
+    // all-clear is true. Reaching it with `confirmed == 0` would mean claiming
+    // to have verified something while having verified nothing, which is the
+    // defect this guard exists to make unreachable.
+    if confirmed == 0 {
+        println!(
+            "\nNothing was verified: no group in {} could be checked. This is not an all-clear.",
+            args.duplicates_dir.display()
+        );
+        process::exit(1);
+    }
+
+    println!("\nAll {confirmed} verified groups are confirmed duplicates.");
     Ok(())
 }
 
@@ -247,6 +269,7 @@ fn parse_manifest(path: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
     let reader = BufReader::new(file);
 
     let mut original_path = PathBuf::new();
+    let mut moved_destination: Option<PathBuf> = None;
     let mut duplicate_paths = Vec::new();
 
     for line in reader.lines() {
@@ -257,14 +280,24 @@ fn parse_manifest(path: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
             continue;
         }
 
-        if let Some(orig) = trimmed.strip_prefix("# Original kept at: ") {
+        if let Some(moved_to) = trimmed.strip_prefix("# Original moved to: ") {
+            // Written by the organise pass, which runs *after* the dedup pass
+            // and therefore after `# Original kept at:` was recorded. It is the
+            // path the file is actually at, so it wins — unconditionally, and
+            // regardless of the order the two lines appear in.
+            //
+            // Without this the verifier resolved an input path the organise
+            // pass had already emptied, found nothing, confirmed zero groups
+            // and still reported an all-clear.
+            moved_destination = Some(PathBuf::from(moved_to));
+        } else if let Some(orig) = trimmed.strip_prefix("# Original kept at: ") {
             original_path = PathBuf::from(orig);
         } else if !trimmed.starts_with('#') {
             duplicate_paths.push(PathBuf::from(trimmed));
         }
     }
 
-    Ok((original_path, duplicate_paths))
+    Ok((moved_destination.unwrap_or(original_path), duplicate_paths))
 }
 
 /// Compute independent verification hash using BLAKE3 keyed mode

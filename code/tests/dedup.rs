@@ -158,8 +158,12 @@ fn scanned_files(input: &Path) -> Vec<PathBuf> {
 struct Manifest {
     hash: String,
     size: u64,
-    /// Path recorded for the file that was *not* moved aside.
+    /// Path recorded for the file that was *not* moved aside, as the dedup pass
+    /// saw it — before the organise pass moved it.
     original: String,
+    /// Where the organise pass reported the original finally landed, if it got
+    /// that far. This is the path `mmm-dedup-verifier` actually resolves.
+    original_moved_to: Option<String>,
     /// Paths recorded for the files that were moved into this group.
     duplicates: Vec<String>,
 }
@@ -176,6 +180,7 @@ fn read_manifest(path: &Path) -> Manifest {
     let mut hash = None;
     let mut size = None;
     let mut original = None;
+    let mut original_moved_to = None;
     let mut duplicates = Vec::new();
 
     for line in text.lines() {
@@ -187,6 +192,8 @@ fn read_manifest(path: &Path) -> Manifest {
             hash = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("# File size: ") {
             size = v.strip_suffix(" bytes").and_then(|n| n.parse::<u64>().ok());
+        } else if let Some(v) = line.strip_prefix("# Original moved to: ") {
+            original_moved_to = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("# Original kept at: ") {
             original = Some(v.to_string());
         } else if !line.starts_with('#') {
@@ -198,6 +205,7 @@ fn read_manifest(path: &Path) -> Manifest {
         hash: hash.unwrap_or_else(|| panic!("no hash line in {}", path.display())),
         size: size.unwrap_or_else(|| panic!("no size line in {}", path.display())),
         original: original.unwrap_or_else(|| panic!("no original line in {}", path.display())),
+        original_moved_to,
         duplicates,
     }
 }
@@ -349,27 +357,20 @@ fn the_manifest_names_both_the_retained_original_and_the_moved_duplicate() {
 }
 
 #[test]
-fn the_manifest_records_input_paths_which_go_stale_when_the_run_moves_them() {
-    // NOTE — this pins real behaviour that is arguably wrong, in the same
-    // spirit as the `unsorted/` test in `organise.rs`.
+fn the_manifest_records_where_the_original_actually_ended_up() {
+    // The dedup pass runs *before* the organise pass, so the header line
+    // `# Original kept at:` names the original's location in the *input* tree —
+    // a path the organise pass then empties. That was the whole of the record
+    // until 0.2.2, and it made `mmm-dedup-verifier` vacuous: it resolved that
+    // path, found nothing, recorded `OriginalMissing`, confirmed zero groups
+    // and still exited 0 printing "All verified groups are confirmed
+    // duplicates" — the independent second opinion somebody runs *before*
+    // deleting a `duplicates/` directory.
     //
-    // `move_duplicates` runs *before* the organise pass, and writes the paths
-    // it sees at that moment: the original's location in the input tree, and
-    // the duplicates' locations in the input tree. The organise pass then
-    // moves the original into the date tree, and the duplicates are already
-    // gone. So every path in a finished manifest points at a file that no
-    // longer exists.
-    //
-    // The consequence is not cosmetic. `mmm-dedup-verifier` resolves
-    // `# Original kept at:` to hash the original and compare it against the
-    // set-aside copies. Given a tree `mmm` itself just produced, it finds
-    // nothing there, records `OriginalMissing`, confirms zero groups — and
-    // still exits 0 while printing "All verified groups are confirmed
-    // duplicates". The independent second opinion in this safety net is
-    // therefore vacuous by default; only `--check-originals` turns it into a
-    // failure. Fixing that means rewriting the manifest with final
-    // destinations after the organise pass, which is a product change beyond
-    // this suite's remit.
+    // The organise pass now appends `# Original moved to:` once it knows. The
+    // header is left alone deliberately: appending keeps the crash-safety the
+    // manifest was designed around, where nothing already flushed is ever
+    // rewritten.
     let tree = MediaTree::new()
         .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
         .duplicate_of("b.jpg", "a.jpg");
@@ -379,25 +380,126 @@ fn the_manifest_records_input_paths_which_go_stale_when_the_run_moves_them() {
 
     let manifest = read_manifest(&out_dir.join("duplicates/000/manifest.txt"));
 
+    // The header still records where the file was when the group was formed.
+    // That is history, not a lie, and it is why the second line exists.
     assert!(
         !Path::new(&manifest.original).exists(),
-        "the recorded original path now resolves — the manifest may have been \
-         fixed to record final destinations, which is a real improvement but \
-         needs this test and the verifier's expectations updated with it"
+        "the input path in the header should no longer resolve — the organise \
+         pass moved the file"
     );
+
+    let moved_to = manifest.original_moved_to.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the manifest records no `# Original moved to:` line, so the \
+             verifier has nothing resolvable to hash and will report this \
+             group as missing"
+        )
+    });
+    assert!(
+        Path::new(moved_to).exists(),
+        "the recorded destination {moved_to} does not resolve"
+    );
+    assert!(
+        Path::new(moved_to).starts_with(&out_dir),
+        "the original should have landed inside the output tree, not at {moved_to}"
+    );
+
+    // The duplicates' own recorded source paths are still input paths, and
+    // still dangle. They are the record of where each file *came from*, which
+    // is what an interrupted run needs; `# moved:` outcome lines say where they
+    // went.
     for dup in &manifest.duplicates {
         assert!(
             !Path::new(dup).exists(),
-            "recorded duplicate path {dup} still resolves"
+            "recorded duplicate source {dup} still resolves"
         );
     }
 
-    // The bytes themselves are safe and accounted for; it is only the
-    // bookkeeping that dangles.
     assert_eq!(
         content_hash_counts(&out_dir).values().sum::<usize>(),
         2,
         "both copies must still exist somewhere in the output tree"
+    );
+}
+
+/// The point of the manifest fix, stated as the tool's own verdict: the
+/// verifier confirms the group and exits 0 against a tree `mmm` produced.
+///
+/// Driven through the real binary because the defect was never in the hashing —
+/// it was in whether the path the verifier resolves is the path the file is at,
+/// which only a whole run establishes.
+#[test]
+fn the_verifier_confirms_a_tree_mmm_produced() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("b.jpg", "a.jpg");
+
+    let (_scratch, out_dir) = scratch_output();
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    let out = Command::cargo_bin("mmm-dedup-verifier")
+        .unwrap()
+        .arg(out_dir.join("duplicates"))
+        .output()
+        .expect("running mmm-dedup-verifier");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    assert!(
+        out.status.success(),
+        "the verifier failed against a tree mmm itself produced:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Confirmed duplicates: 1"),
+        "the group was not confirmed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Original missing: 0"),
+        "the original was not found where the manifest said:\n{stdout}"
+    );
+}
+
+/// A verifier that confirmed nothing must not exit 0.
+///
+/// This is the other half of the defect, and it survives independently of the
+/// manifest: an all-clear printed over zero confirmed groups is a false
+/// all-clear whatever caused the groups to go unconfirmed. Reproduced by
+/// deleting the original after the run, which is the state the stale manifest
+/// used to produce on every run.
+#[test]
+fn the_verifier_refuses_to_report_an_all_clear_having_confirmed_nothing() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("b.jpg", "a.jpg");
+
+    let (_scratch, out_dir) = scratch_output();
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    let manifest = read_manifest(&out_dir.join("duplicates/000/manifest.txt"));
+    let moved_to = manifest
+        .original_moved_to
+        .expect("the manifest must name where the original landed");
+    fs::remove_file(&moved_to).expect("removing the original");
+
+    let out = Command::cargo_bin("mmm-dedup-verifier")
+        .unwrap()
+        .arg(out_dir.join("duplicates"))
+        .output()
+        .expect("running mmm-dedup-verifier");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    assert!(
+        !out.status.success(),
+        "the verifier exited 0 having confirmed nothing:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("All 0 verified"),
+        "an all-clear was printed over zero confirmed groups:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("NOT verified"),
+        "the verifier did not say the group went unverified:\n{stdout}"
     );
 }
 

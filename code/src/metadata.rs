@@ -161,7 +161,31 @@ enum NoDate {
 /// same word.
 enum Extracted {
     Dated(FileMetadata),
-    Undated(NoDate),
+    /// No usable date — and whatever the file *did* say about where it was
+    /// taken.
+    ///
+    /// The coordinates travel with the reason because a photograph can record
+    /// a location and no readable date, and those two facts are independent.
+    /// They used to be read and then dropped on this arm, so such a file was
+    /// filed under its filesystem timestamp *without* its location suffix — the
+    /// GPS block was right there in the file and the name said nothing about it.
+    Undated {
+        reason: NoDate,
+        latitude: Option<f64>,
+        longitude: Option<f64>,
+    },
+}
+
+impl Extracted {
+    /// The undated answer for a file that recorded no position, or whose
+    /// position was never read.
+    fn undated(reason: NoDate) -> Self {
+        Self::Undated {
+            reason,
+            latitude: None,
+            longitude: None,
+        }
+    }
 }
 
 /// What a file said about when it was made, before a policy is applied.
@@ -230,19 +254,39 @@ pub fn extract_metadata(path: &Path, is_video: bool, tz: &TimezonePolicy) -> Res
 
     // `None` here means the parser refused the file outright, which is the one
     // outcome that does not say whether the container was ours to read.
-    let reason = match attempt {
+    let (reason, position) = match attempt {
         Ok(Extracted::Dated(meta)) => return Ok(meta),
-        Ok(Extracted::Undated(reason)) => {
+        Ok(Extracted::Undated {
+            reason,
+            latitude,
+            longitude,
+        }) => {
             debug!(path = %path.display(), ?reason, "no usable date in the file's metadata");
-            Some(reason)
+            (Some(reason), (latitude, longitude))
         }
         Err(e) => {
             debug!(path = %path.display(), error = %e, "metadata extraction failed");
-            None
+            (None, (None, None))
         }
     };
 
-    extract_filesystem_metadata(path, tz, fallback_source(path, reason))
+    let mut meta = extract_filesystem_metadata(path, tz, fallback_source(path, reason))?;
+
+    // The date fell back; the *location* did not have to. A photograph carrying
+    // a GPS block and an unreadable date knows perfectly well where it was
+    // taken, and dropping that here is what left it filed under a filesystem
+    // timestamp with no location in its name.
+    let (latitude, longitude) = position;
+    if latitude.is_some() && longitude.is_some() {
+        debug!(
+            path = %path.display(),
+            "keeping the coordinates the file recorded, though its date did not survive"
+        );
+        meta.latitude = latitude;
+        meta.longitude = longitude;
+    }
+
+    Ok(meta)
 }
 
 /// Take the date from an XMP sidecar, when the file itself had none worth
@@ -468,7 +512,7 @@ fn extract_image_metadata(path: &Path, tz: &TimezonePolicy) -> Result<Extracted>
         parse_exif(reader, None).with_context(|| format!("parsing EXIF for {}", path.display()))?;
 
     let Some(iter) = iter else {
-        return Ok(Extracted::Undated(NoDate::Absent));
+        return Ok(Extracted::undated(NoDate::Absent));
     };
 
     // Asked before the fold, because the fold is what destroys the answer.
@@ -515,18 +559,27 @@ fn extract_image_metadata(path: &Path, tz: &TimezonePolicy) -> Result<Extracted>
         .or_else(|| exif.get(ExifTag::CreateDate))
         .and_then(entry_to_wall_clock)
     else {
-        return Ok(Extracted::Undated(if unreadable_date {
-            NoDate::Unreadable
-        } else {
-            NoDate::Absent
-        }));
+        // The coordinates survive the missing date: see [`Extracted::Undated`].
+        return Ok(Extracted::Undated {
+            reason: if unreadable_date {
+                NoDate::Unreadable
+            } else {
+                NoDate::Absent
+            },
+            latitude,
+            longitude,
+        });
     };
 
     // A date we read and cannot use is a date we could not read. The alternative
     // reading — that a year-44 photograph "has no date" — would send somebody
     // looking at their camera instead of at this line.
     if !spellable(naive.year()) {
-        return Ok(Extracted::Undated(NoDate::Unreadable));
+        return Ok(Extracted::Undated {
+            reason: NoDate::Unreadable,
+            latitude,
+            longitude,
+        });
     }
 
     let reading = match offset_tag {
@@ -595,7 +648,7 @@ fn extract_video_metadata(path: &Path, tz: &TimezonePolicy) -> Result<Extracted>
 
     // As on the image path, coordinates go with this arm; see the note there.
     let Some(reading) = recorded.or(container) else {
-        return Ok(Extracted::Undated(if saw_a_date_key {
+        return Ok(Extracted::undated(if saw_a_date_key {
             NoDate::Unreadable
         } else {
             NoDate::Absent
@@ -603,7 +656,7 @@ fn extract_video_metadata(path: &Path, tz: &TimezonePolicy) -> Result<Extracted>
     };
 
     if !spellable(reading_year(reading)) {
-        return Ok(Extracted::Undated(NoDate::Unreadable));
+        return Ok(Extracted::undated(NoDate::Unreadable));
     }
 
     Ok(dated(path, reading, tz, latitude, longitude))

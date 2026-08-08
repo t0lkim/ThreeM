@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`mmm-dedup-verifier` no longer reports an all-clear having verified nothing.** It is the independent second opinion somebody runs *before* deleting a `duplicates/` directory, and against a tree `mmm` itself produced it confirmed **zero** groups, printed "All verified groups are confirmed duplicates" and exited 0. The dedup pass runs before the organise pass, so `# Original kept at:` named the original's *input* path — which the organise pass then emptied. The verifier resolved that path, found nothing, and recorded `OriginalMissing` for every group.
+
+  The organise pass now appends `# Original moved to:` to each manifest once it knows where the retained original landed, and the verifier prefers that line. Appending rather than rewriting the header keeps the crash-safety the manifest was designed around: nothing already flushed is ever rewritten, so an interrupted run still holds every line it managed to write.
+
+  **BREAKING (exit codes) — two runs that used to exit 0 now exit 1**, because both mean nothing was verified: a group whose original cannot be found (previously an error only under `--check-originals`, which left the *default* invocation vacuous), and a `duplicates/` directory whose groups carry no manifest. `--check-originals` is still accepted so existing invocations parse; it no longer changes the outcome. An empty `duplicates/` directory is still exit 0 — a library with no duplicates is not a failure. Scripts treating a non-zero exit as "unsafe to delete" behave as intended; scripts that ignored the exit code and grepped for the all-clear line will now see it withheld.
+
+- **A photograph with GPS and no readable date keeps its location.** The coordinates were read out of the EXIF block and then discarded along with the unusable date, so the file was filed under its filesystem timestamp *without* a location suffix in its name — while the GPS block sat in the file untouched. Where a photograph was taken and when it was taken are independent facts, and losing one because the other is missing was never intended. **Filenames change** for such files: `2024-03-15-143000.jpg` becomes `2024-03-15-143000-<place>.jpg`. Nothing already organised is renamed; this affects files organised from now on.
+
 ## [0.2.1] — 2026-08-09
 
 A single fix, and the reason it is its own release rather than part of 0.2.0: the defect below was named in the 0.2.0 readiness report as the first thing 0.2.1 should fix, and it was fixed after that release was cut. Folding it back into 0.2.0 would have made the report wrong about the release it describes.

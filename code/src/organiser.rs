@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -450,6 +451,48 @@ impl GroupManifest {
         ))
     }
 
+    /// Reopen an existing manifest for appending.
+    ///
+    /// The dedup pass closes its manifests before the organise pass begins, and
+    /// the organise pass owes each of them one more line. Opening in append
+    /// mode rather than holding every handle open across both passes keeps the
+    /// file-descriptor count independent of how many duplicate groups a library
+    /// turns out to have.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be opened for appending.
+    fn reopen(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| format!("reopening manifest {}", path.display()))?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Record where the retained original finally came to rest.
+    ///
+    /// Appended rather than written into the header, and appended *after* the
+    /// organise pass rather than before it, because at manifest-creation time
+    /// the original has not moved yet — the dedup pass runs first. The header's
+    /// `# Original kept at:` is therefore an input path that the organise pass
+    /// is about to empty, which is exactly what made `mmm-dedup-verifier`
+    /// resolve nothing and report an all-clear over zero confirmed groups.
+    ///
+    /// Appending keeps the crash-safety the header was written for: nothing is
+    /// rewritten, so an interrupted run still has every line it managed to
+    /// flush.
+    ///
+    /// # Errors
+    ///
+    /// As [`GroupManifest::append`].
+    fn record_original_destination(&mut self, dst: &Path) -> Result<()> {
+        self.append(&format!("# Original moved to: {}\n", dst.display()))
+    }
+
     /// Record a move that did not happen, and why.
     ///
     /// # Errors
@@ -881,6 +924,7 @@ pub fn move_duplicates(
     let mut moved = 0;
     let mut errors = 0;
     let mut sidecar_run = SidecarRun::default();
+    let mut original_manifests = HashMap::new();
 
     for (i, group) in groups.iter().enumerate() {
         let group_dir = dup_base.join(format!("{i:03}"));
@@ -888,7 +932,14 @@ pub fn move_duplicates(
             .with_context(|| format!("creating duplicate dir {}", group_dir.display()))?;
 
         // Before a single file moves.
-        let mut manifest = GroupManifest::create(&group_dir.join("manifest.txt"), i, group)?;
+        let manifest_path = group_dir.join("manifest.txt");
+        let mut manifest = GroupManifest::create(&manifest_path, i, group)?;
+
+        // The retained original is still at its input path; the organise pass
+        // will move it and owes this manifest the destination.
+        if let Some(original) = group.files.first() {
+            original_manifests.insert(original.clone(), manifest_path.clone());
+        }
 
         // Skip the first file (kept as original), move the rest
         for (done, dup_path) in group.files.iter().skip(1).enumerate() {
@@ -1005,6 +1056,7 @@ pub fn move_duplicates(
         moved,
         errors,
         sidecars: sidecar_run,
+        original_manifests,
     })
 }
 
@@ -1016,7 +1068,11 @@ pub fn move_duplicates(
 /// ones for the reason on [`SidecarRun`]: a sidecar was never a duplicate, and
 /// adding it to a duplicate count would misreport how much of somebody's library
 /// this run considered redundant.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: `original_manifests` owns its paths. The counts were copyable and
+// the backlink map is not, which is the right trade — the alternative is
+// handing the organise pass a reference to something the dedup pass has to keep
+// alive for it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DuplicateRun {
     /// Duplicates relocated into `duplicates/NNN/`.
     pub moved: usize,
@@ -1025,6 +1081,20 @@ pub struct DuplicateRun {
     pub errors: usize,
     /// What became of the sidecars travelling with them.
     pub sidecars: SidecarRun,
+    /// Where each group's retained original was, and which manifest is waiting
+    /// to be told where it ended up.
+    ///
+    /// The dedup pass runs before the organise pass, so a manifest is written
+    /// naming an original that has not moved yet — and the organise pass then
+    /// moves it, leaving the recorded path empty. This is how the organise pass
+    /// finds the manifests it owes a line to. See
+    /// [`GroupManifest::record_original_destination`].
+    ///
+    /// Keyed by the original's *source* path because that is what the organise
+    /// pass has in hand for each planned move. One entry per group, not per
+    /// file, so it costs nothing on a library with few duplicates and does not
+    /// grow with the library.
+    pub original_manifests: HashMap<PathBuf, PathBuf>,
 }
 
 /// What a completed move actually did.
@@ -1399,6 +1469,7 @@ pub fn process_moves(
     chunk_size: usize,
     controller: &mut impl ChunkController,
     recorder: &mut MoveRecorder<'_>,
+    original_manifests: &HashMap<PathBuf, PathBuf, impl std::hash::BuildHasher>,
 ) -> MoveRun {
     let total = planned.len();
     // `slice::chunks` panics on a zero size, and `--chunk-size 0` is one
@@ -1438,6 +1509,29 @@ pub fn process_moves(
                     ));
                     if run.sidecars.journal_failed {
                         run.journal_failed = true;
+                    }
+
+                    // If this file was a duplicate group's retained original,
+                    // its manifest still names the input path this move has
+                    // just emptied. Tell it where the file actually went.
+                    //
+                    // A failure here is logged and stepped over rather than
+                    // stopping the run: the photograph has already moved and is
+                    // recorded in the journal, which is what `undo` reads. The
+                    // manifest is the verifier's record, and a run that halted
+                    // over it would be trading a real library for a report.
+                    if let Some(manifest_path) = original_manifests.get(&planned.source) {
+                        if let Err(e) = GroupManifest::reopen(manifest_path)
+                            .and_then(|mut m| m.record_original_destination(&outcome.destination))
+                        {
+                            error!(
+                                manifest = %manifest_path.display(),
+                                dst = %outcome.destination.display(),
+                                error = %format!("{e:#}"),
+                                "could not record where the retained original landed; \
+                                 mmm-dedup-verifier will report this group as missing"
+                            );
+                        }
                     }
                 }
                 Err(RecordedMoveError::Move(e)) => {
@@ -2737,6 +2831,15 @@ mod tests {
     }
 
     /// Four sources in `input/`, planned into `output/`, in a stable order.
+    /// No duplicate group's original is among these moves.
+    ///
+    /// Most move-path tests are about chunking and failure handling, not about
+    /// duplicates, so they hand `process_moves` an empty backlink map — the
+    /// same thing a run over a library with no duplicates gives it.
+    fn no_backlinks() -> HashMap<PathBuf, PathBuf> {
+        HashMap::new()
+    }
+
     fn four_planned_moves(tmp: &Path) -> Vec<PlannedMove> {
         let input = tmp.join("input");
         let output = tmp.join("output");
@@ -2760,7 +2863,13 @@ mod tests {
         let planned = four_planned_moves(tmp.path());
         let mut controller = ScriptedController::new(&[false]);
 
-        let run = process_moves(&planned, 2, &mut controller, &mut MoveRecorder::disabled());
+        let run = process_moves(
+            &planned,
+            2,
+            &mut controller,
+            &mut MoveRecorder::disabled(),
+            &no_backlinks(),
+        );
 
         assert_eq!(
             (run.moved, run.errors, run.unprocessed, run.stopped_early),
@@ -2796,7 +2905,13 @@ mod tests {
         let planned = four_planned_moves(tmp.path());
         let mut controller = ScriptedController::new(&[true, true, true]);
 
-        let run = process_moves(&planned, 2, &mut controller, &mut MoveRecorder::disabled());
+        let run = process_moves(
+            &planned,
+            2,
+            &mut controller,
+            &mut MoveRecorder::disabled(),
+            &no_backlinks(),
+        );
 
         assert_eq!(
             (run.moved, run.errors, run.unprocessed, run.stopped_early),
@@ -2820,7 +2935,13 @@ mod tests {
         fs::remove_file(&planned[1].source).unwrap();
         let mut controller = ScriptedController::new(&[true, true, true]);
 
-        let run = process_moves(&planned, 2, &mut controller, &mut MoveRecorder::disabled());
+        let run = process_moves(
+            &planned,
+            2,
+            &mut controller,
+            &mut MoveRecorder::disabled(),
+            &no_backlinks(),
+        );
 
         assert_eq!(
             (run.moved, run.errors, run.unprocessed, run.stopped_early),
@@ -2841,7 +2962,13 @@ mod tests {
         let planned = four_planned_moves(tmp.path());
         let mut controller = ScriptedController::new(&[]);
 
-        let run = process_moves(&planned, 0, &mut controller, &mut MoveRecorder::disabled());
+        let run = process_moves(
+            &planned,
+            0,
+            &mut controller,
+            &mut MoveRecorder::disabled(),
+            &no_backlinks(),
+        );
 
         assert_eq!((run.moved, run.errors, run.unprocessed), (4, 0, 0));
         assert!(controller.asked.is_empty(), "one chunk asks nothing");
@@ -2879,6 +3006,7 @@ mod tests {
             0,
             &mut controller,
             &mut MoveRecorder::new(Some(&mut journal)),
+            &no_backlinks(),
         );
         assert_eq!((run.moved, run.errors), (4, 0));
 
@@ -2949,6 +3077,7 @@ mod tests {
             0,
             &mut controller,
             &mut MoveRecorder::new(Some(&mut journal)),
+            &no_backlinks(),
         );
 
         let expected = collision_candidate(&planned[0].destination, 1);
@@ -2980,6 +3109,7 @@ mod tests {
             0,
             &mut controller,
             &mut MoveRecorder::new(Some(&mut journal)),
+            &no_backlinks(),
         );
         assert_eq!((run.moved, run.errors), (0, 1));
 
@@ -3011,7 +3141,13 @@ mod tests {
         let planned = four_planned_moves(tmp.path());
         let mut controller = ScriptedController::new(&[]);
 
-        let run = process_moves(&planned, 2, &mut controller, &mut MoveRecorder::failing());
+        let run = process_moves(
+            &planned,
+            2,
+            &mut controller,
+            &mut MoveRecorder::failing(),
+            &no_backlinks(),
+        );
 
         assert!(run.journal_failed, "the run must report why it stopped");
         assert!(
@@ -3121,6 +3257,7 @@ mod tests {
             0,
             &mut controller,
             &mut MoveRecorder::new(Some(&mut journal)),
+            &no_backlinks(),
         );
 
         let seqs: Vec<u64> = entries_of(&journal)
@@ -3145,7 +3282,13 @@ mod tests {
         let planned = four_planned_moves(tmp.path());
         let mut controller = ScriptedController::new(&[]);
 
-        let run = process_moves(&planned, 0, &mut controller, &mut MoveRecorder::disabled());
+        let run = process_moves(
+            &planned,
+            0,
+            &mut controller,
+            &mut MoveRecorder::disabled(),
+            &no_backlinks(),
+        );
 
         assert_eq!((run.moved, run.errors, run.journal_failed), (4, 0, false));
         assert!(
@@ -3244,6 +3387,7 @@ mod tests {
                 0,
                 &mut ScriptedController::new(&[]),
                 &mut MoveRecorder::disabled(),
+                &no_backlinks(),
             )
         });
 
@@ -3281,6 +3425,7 @@ mod tests {
                 0,
                 &mut ScriptedController::new(&[]),
                 &mut MoveRecorder::failing_after(2),
+                &no_backlinks(),
             )
         });
 
@@ -3314,6 +3459,7 @@ mod tests {
                 0,
                 &mut ScriptedController::new(&[]),
                 &mut MoveRecorder::failing_after(1),
+                &no_backlinks(),
             )
         });
 
@@ -3876,6 +4022,7 @@ mod tests {
                 0,
                 &mut ScriptedController::new(&[]),
                 &mut MoveRecorder::disabled(),
+                &no_backlinks(),
             )
         });
 
@@ -3899,6 +4046,7 @@ mod tests {
                 0,
                 &mut ScriptedController::new(&[]),
                 &mut MoveRecorder::disabled(),
+                &no_backlinks(),
             )
         });
 
@@ -3929,6 +4077,7 @@ mod tests {
                 0,
                 &mut ScriptedController::new(&[]),
                 &mut MoveRecorder::failing_after(3),
+                &no_backlinks(),
             )
         });
 
@@ -4063,7 +4212,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let planned = four_planned_moves(tmp.path());
 
-        let run = process_moves(&planned, 1, &mut Silent, &mut MoveRecorder::disabled());
+        let run = process_moves(
+            &planned,
+            1,
+            &mut Silent,
+            &mut MoveRecorder::disabled(),
+            &no_backlinks(),
+        );
 
         assert_eq!(
             (run.moved, run.errors, run.unprocessed),

@@ -195,10 +195,18 @@ fn an_altered_copy_is_a_mismatch_and_exits_non_zero() {
 }
 
 /// Property 2, the third verdict: an original that is no longer where the
-/// manifest says is reported either way, and fails the run only when the
-/// operator asked for that with `--check-originals`.
+/// manifest says fails the run, with or without `--check-originals`.
+///
+/// **This changed in 0.2.2.** It used to fail only under `--check-originals`,
+/// which meant the default invocation — the one somebody makes before deleting
+/// a `duplicates/` directory — printed "All verified groups are confirmed
+/// duplicates" and exited 0 having confirmed nothing at all. A group whose
+/// original cannot be found was not checked against anything, and a tool whose
+/// entire purpose is confirming-before-deleting must not call that an
+/// all-clear. The flag is kept so existing invocations still parse; it no
+/// longer changes the outcome.
 #[test]
-fn a_missing_original_fails_only_under_check_originals() {
+fn a_missing_original_fails_the_run() {
     let tmp = TempDir::new().unwrap();
     let original = tmp.path().join("deleted-since.jpg");
 
@@ -213,17 +221,19 @@ fn a_missing_original_fails_only_under_check_originals() {
 
     let (ok, stdout) = verify(&duplicates, &[]);
     assert!(
-        ok,
-        "a missing original is reported but does not fail by default:\n{stdout}"
+        !ok,
+        "a missing original means nothing was verified, so the run must fail:\n{stdout}"
     );
     assert!(stdout.contains("[MISSING] Group 000"), "{stdout}");
     assert!(stdout.contains("Original missing: 1"), "{stdout}");
-
-    let (ok, stdout) = verify(&duplicates, &["--check-originals"]);
     assert!(
-        !ok,
-        "--check-originals must make a missing original fail the run:\n{stdout}"
+        stdout.contains("NOT verified"),
+        "the run must say plainly that the group went unverified:\n{stdout}"
     );
+
+    // The flag is accepted and the verdict is the same.
+    let (ok, _stdout) = verify(&duplicates, &["--check-originals"]);
+    assert!(!ok, "--check-originals must not soften the verdict");
 }
 
 /// A group directory with no manifest is skipped with a warning rather than
@@ -238,10 +248,17 @@ fn a_group_without_a_manifest_is_skipped_not_confirmed() {
 
     let (ok, stdout) = verify(&duplicates, &[]);
 
-    assert!(ok, "{stdout}");
     assert!(
         stdout.contains("Groups verified: 0"),
         "a group with no manifest must not be counted as verified:\n{stdout}"
+    );
+    // **Changed in 0.2.2.** This used to exit 0. A `duplicates/` directory
+    // holding files that were never checked is exactly the state in which an
+    // all-clear is most dangerous — the operator is about to delete them.
+    assert!(
+        !ok,
+        "files sit in duplicates/ that nothing verified, so this is not a \
+         success:\n{stdout}"
     );
 }
 

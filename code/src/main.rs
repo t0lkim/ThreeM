@@ -616,6 +616,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
         settings.chunk_size,
         &mut controller,
         &mut recorder,
+        &duplicates.original_manifests,
     );
 
     // A run that stopped did not complete, and the bar must not claim it did.
