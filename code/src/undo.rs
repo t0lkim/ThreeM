@@ -529,6 +529,9 @@ pub fn execute_restore(plan: &RestorePlan, recorder: &mut MoveRecorder<'_>) -> R
             source: step.current.clone(),
             destination: step.original.clone(),
             date_source: DateSource::None,
+            // A restore puts a file back where it came from; no date was read
+            // and no wall clock chosen.
+            timezone_source: None,
             has_location: false,
             // A restore carries its digest on the purpose, below.
             known_hash: None,

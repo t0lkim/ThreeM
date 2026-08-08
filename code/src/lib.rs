@@ -26,4 +26,5 @@ pub mod reporter;
 pub mod scanner;
 pub mod settings;
 pub mod settings_report;
+pub mod timezone;
 pub mod undo;

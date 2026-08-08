@@ -37,6 +37,7 @@ mod common;
 
 use common::{naive, MediaTree};
 use mmm::metadata::{extract_metadata, DateSource, FileMetadata};
+use mmm::timezone::{TimezonePolicy, TimezoneSource};
 
 /// The tolerance the task specifies for a GPS round-trip, in decimal degrees.
 /// The harness encodes seconds with a denominator of 10000, so the real error
@@ -45,7 +46,11 @@ const GPS_TOLERANCE: f64 = 0.0001;
 
 /// Extract metadata from a fixture file, as an image (never as video).
 fn read_image(tree: &MediaTree, rel: &str) -> FileMetadata {
-    extract_metadata(&tree.join(rel), false)
+    // The default policy — nothing configured — on purpose. The harness writes
+    // an `OffsetTimeOriginal` tag, so a correct extractor never consults the
+    // policy at all for these fixtures, and passing the *machine's* fallback is
+    // what makes that a real assertion rather than a tautology.
+    extract_metadata(&tree.join(rel), false, &TimezonePolicy::default())
         .unwrap_or_else(|e| panic!("extracting metadata from fixture {rel}: {e}"))
 }
 
@@ -64,9 +69,16 @@ fn synthetic_exif_datetime_round_trips_exactly() {
     );
     assert_eq!(
         meta.date,
-        Some(naive(2024, 1, 15, 14, 30, 0).and_utc()),
+        Some(naive(2024, 1, 15, 14, 30, 0).and_utc().fixed_offset()),
         "EXIF datetime did not round-trip; if this is off by a whole-hour offset \
          the OffsetTimeOriginal tag has regressed and the machine's timezone is leaking in"
+    );
+    assert_eq!(
+        meta.timezone_source,
+        Some(TimezoneSource::ExifOffsetTag),
+        "the harness writes an OffsetTimeOriginal tag, so the run must report having read \
+         it rather than having assumed a zone — the assertion above is only \
+         machine-independent because of that"
     );
 }
 
@@ -93,7 +105,11 @@ fn synthetic_exif_datetime_round_trips_across_a_range_of_dates() {
             DateSource::Exif,
             "{rel}: not read as EXIF"
         );
-        assert_eq!(meta.date, Some(dt.and_utc()), "{rel}: datetime mismatch");
+        assert_eq!(
+            meta.date,
+            Some(dt.and_utc().fixed_offset()),
+            "{rel}: datetime mismatch"
+        );
     }
 }
 
@@ -125,7 +141,7 @@ fn synthetic_exif_gps_round_trips_within_tolerance() {
         );
         assert_eq!(
             meta.date,
-            Some(naive(2024, 6, 1, 9, 15, 30).and_utc()),
+            Some(naive(2024, 6, 1, 9, 15, 30).and_utc().fixed_offset()),
             "{rel}: adding a GPS IFD disturbed the datetime"
         );
 
@@ -178,6 +194,12 @@ fn a_file_that_is_not_valid_exif_falls_back_to_the_filesystem() {
         meta.date_source,
         DateSource::Filesystem,
         "expected the fallback path for a file with no parseable EXIF"
+    );
+    assert_eq!(
+        meta.timezone_source,
+        Some(TimezoneSource::SystemLocal),
+        "a filesystem timestamp is a real instant, but it still has to be read against \
+         some wall clock, and with nothing configured that is the machine's"
     );
     assert_eq!(meta.latitude, None);
     assert_eq!(meta.longitude, None);

@@ -54,6 +54,7 @@ use mmm::naming::{
 use mmm::organiser::{build_target_path, collision_candidate, execute_move, PlannedMove};
 use mmm::scanner::ScanFilter;
 use mmm::settings::Settings;
+use mmm::timezone::{TimezonePolicy, TimezoneSource};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
@@ -85,7 +86,12 @@ const STEM: &str = "IMG_0001";
 
 fn dated(date: Option<DateTime<Utc>>, gps: Option<(f64, f64)>) -> FileMetadata {
     FileMetadata {
-        date,
+        // Generated as UTC and read as a local wall clock, which for these
+        // properties is the same digits either way: every claim below is about
+        // what the *renderer* does with a datetime, not about which datetime it
+        // was handed. Timezone resolution has its own tests.
+        date: date.map(|dt| dt.fixed_offset()),
+        timezone_source: date.map(|_| TimezoneSource::ExifOffsetTag),
         latitude: gps.map(|(lat, _)| lat),
         longitude: gps.map(|(_, lon)| lon),
         date_source: DateSource::Exif,
@@ -404,7 +410,14 @@ proptest! {
             source.display()
         );
 
-        let planned = mmm::organiser::plan_move(&scan.files[0], &output, geo(), scheme(), None)
+        let planned = mmm::organiser::plan_move(
+            &scan.files[0],
+            &output,
+            geo(),
+            scheme(),
+            &TimezonePolicy::default(),
+            None,
+        )
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
 
         prop_assert!(
@@ -498,6 +511,7 @@ proptest! {
                 source: source.clone(),
                 destination: destination.clone(),
                 date_source: DateSource::None,
+                timezone_source: None,
                 has_location: false,
                 known_hash: None,
             })

@@ -36,6 +36,7 @@ use crate::naming::{
     DateDirectoryFormat, FilenameFormat, FormatError, Layout, OutputSubdir, Scheme,
 };
 use crate::scanner::{PatternError, ScanFilter, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS};
+use crate::timezone::{Timezone, TimezoneError, TimezonePolicy};
 
 /// Files processed between prompts, when nothing says otherwise.
 pub const DEFAULT_CHUNK_SIZE: usize = 100;
@@ -158,6 +159,16 @@ pub struct Settings {
     /// somebody expected to be organised is a surprise, so every skip has to be
     /// asked for.
     pub skip_patterns: Vec<String>,
+
+    /// Which wall clock an undated EXIF timestamp is read against.
+    ///
+    /// `None` — like `output_dir`, and unlike every other field here — because
+    /// its fallback is not a value this module could name: it is the machine's
+    /// own timezone, which is not knowable until the run happens and is not
+    /// something a default should pretend to have decided. `None` means "nobody
+    /// configured one", and [`crate::timezone::TimezonePolicy`] takes it from
+    /// there.
+    pub default_timezone: Option<String>,
 }
 
 impl Default for Settings {
@@ -175,6 +186,7 @@ impl Default for Settings {
             unsorted_dir: PathBuf::from(DEFAULT_UNSORTED_DIR),
             extensions: Extensions::default(),
             skip_patterns: Vec::new(),
+            default_timezone: None,
         }
     }
 }
@@ -238,6 +250,8 @@ pub struct PartialSettings {
     pub extensions: Option<PartialExtensions>,
     #[serde(default, deserialize_with = "de_skip_patterns")]
     pub skip_patterns: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "de_default_timezone")]
+    pub default_timezone: Option<String>,
 }
 
 impl PartialSettings {
@@ -266,6 +280,7 @@ impl PartialSettings {
                 (lower, higher) => higher.or(lower),
             },
             skip_patterns: higher_priority.skip_patterns.or(self.skip_patterns),
+            default_timezone: higher_priority.default_timezone.or(self.default_timezone),
         }
     }
 
@@ -349,6 +364,25 @@ where
     Ok(name.map(PathBuf::from))
 }
 
+/// Read `default_timezone`, refusing a value that is not a timezone.
+///
+/// See [`de_date_directory_format`] for why this is a deserialiser. The
+/// consequence of not refusing it here is particular: a `default_timezone` that
+/// silently failed to apply would leave the run falling back to the machine's
+/// zone, which on the machine the config was written on is very often the same
+/// answer — so the setting would look like it worked, and would quietly stop
+/// working the moment the library was organised from anywhere else.
+fn de_default_timezone<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let name = Option::<String>::deserialize(deserializer)?;
+    if let Some(name) = &name {
+        name.parse::<Timezone>().map_err(serde::de::Error::custom)?;
+    }
+    Ok(name)
+}
+
 /// Read `skip_patterns`, refusing an entry that is not a glob.
 ///
 /// See [`de_date_directory_format`] for why this is a deserialiser. A pattern
@@ -396,6 +430,24 @@ impl Settings {
             OutputSubdir::new("unsorted_dir", &self.unsorted_dir.to_string_lossy())?,
             OutputSubdir::new("duplicates_dir", &self.duplicates_dir.to_string_lossy())?,
         ))
+    }
+
+    /// Which wall clock this run reads undated timestamps against.
+    ///
+    /// Fallible for the same reason as [`Self::layout`]: every layer validated
+    /// its own value as it was read, so this is the last line of defence rather
+    /// than the first.
+    ///
+    /// # Errors
+    ///
+    /// [`TimezoneError`] naming the value, if a hand-built [`Settings`] carries
+    /// one that is not a timezone.
+    pub fn timezone_policy(&self) -> Result<TimezonePolicy, TimezoneError> {
+        self.default_timezone
+            .as_deref()
+            .map(str::parse::<Timezone>)
+            .transpose()
+            .map(TimezonePolicy::new)
     }
 
     /// What the scan admits and what it passes over.
@@ -474,6 +526,7 @@ impl Settings {
             unsorted_dir: partial.unsorted_dir.unwrap_or(defaults.unsorted_dir),
             extensions,
             skip_patterns: partial.skip_patterns.unwrap_or(defaults.skip_patterns),
+            default_timezone: partial.default_timezone,
         }
     }
 }
@@ -880,6 +933,14 @@ where
                 ScanFilter::new(&[], &[], &patterns)
                     .map_err(|error| env_refusal(&variable, &error))?;
                 layer.skip_patterns = Some(patterns);
+            }
+            // Validated where it is read, like the formats above, and for a
+            // sharper reason: see [`de_default_timezone`].
+            "default_timezone" => {
+                value
+                    .parse::<Timezone>()
+                    .map_err(|error| env_refusal(&variable, &error))?;
+                layer.default_timezone = Some(value);
             }
             "extensions_image" => {
                 extensions.image = Some(parse_list(&value));

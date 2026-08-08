@@ -87,6 +87,7 @@ fn plan(source: &Path, destination: &Path) -> PlannedMove {
         source: source.to_path_buf(),
         destination: destination.to_path_buf(),
         date_source: DateSource::None,
+        timezone_source: None,
         has_location: false,
         known_hash: None,
     }

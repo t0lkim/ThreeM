@@ -26,6 +26,13 @@ directories = "6.0.0"
 # character classes, `**` and escaping — three places to be subtly wrong about
 # which of somebody's photographs get passed over.
 globset = "0.4"
+# IANA zone names for `default_timezone`. A fixed `+08:00` could be parsed with
+# `chrono` alone, but a fixed offset is wrong for half the year anywhere that
+# observes daylight saving — `Europe/Lisbon` is not `+00:00` in July — and a
+# setting that silently mis-files six months of somebody's library is worse than
+# no setting. Default features off: the tz database is all that is wanted, not
+# the build-time regeneration machinery.
+chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 assert_cmd = "2"

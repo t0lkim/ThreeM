@@ -5,6 +5,7 @@ use crate::hasher::DuplicateGroup;
 use crate::journal::{JournalEntry, RunHeader};
 use crate::metadata::DateSource;
 use crate::organiser::PlannedMove;
+use crate::timezone::TimezoneSource;
 use crate::undo::{
     RestoreOutcome, RestorePlan, RestoreRun, RunRow, UnresolvedIntent, Verification,
 };
@@ -66,6 +67,7 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
     let mut fs_count = 0;
     let mut no_date_count = 0;
     let mut with_location = 0;
+    let mut timezones = TimezoneTally::default();
 
     for planned in moves {
         let source_tag = match planned.date_source {
@@ -87,9 +89,12 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
             with_location += 1;
         }
 
+        timezones.count(planned.timezone_source);
+
         println!(
-            "  {} {} → {}",
+            "  {}{} {} → {}",
             source_tag,
+            timezone_tag(planned.timezone_source),
             planned.source.display(),
             planned.destination.display()
         );
@@ -101,6 +106,63 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
     println!("  Date from filesystem: {fs_count}");
     println!("  No date (unsorted): {no_date_count}");
     println!("  With GPS location: {with_location}");
+    timezones.print();
+}
+
+/// The timezone marker beside a planned move's date-source tag.
+///
+/// Empty for a file with no date, where there was no wall clock to choose. The
+/// marker is short because it sits on every line of a listing that may run to
+/// thousands; [`TimezoneTally::print`] spells the same information out once.
+fn timezone_tag(source: Option<TimezoneSource>) -> String {
+    source.map_or_else(String::new, |source| format!("[tz:{}]", source.tag()))
+}
+
+/// How many files had their wall clock decided each way.
+///
+/// Worth its own line in the summary rather than being left to the per-file
+/// markers: a run where every date came from the machine's timezone is a run
+/// whose output would land differently on a different machine, and that is the
+/// kind of thing a person wants told to them once rather than inferred from
+/// three thousand tags.
+#[derive(Debug, Default, Clone, Copy)]
+struct TimezoneTally {
+    from_the_file: usize,
+    configured: usize,
+    system: usize,
+    assumed: usize,
+}
+
+impl TimezoneTally {
+    fn count(&mut self, source: Option<TimezoneSource>) {
+        match source {
+            Some(TimezoneSource::ExifOffsetTag | TimezoneSource::GpsDerived) => {
+                self.from_the_file += 1;
+            }
+            Some(TimezoneSource::ConfiguredDefault) => self.configured += 1,
+            Some(TimezoneSource::SystemLocal) => self.system += 1,
+            Some(TimezoneSource::AssumedUtc) => self.assumed += 1,
+            None => {}
+        }
+    }
+
+    fn print(self) {
+        let dated = self.from_the_file + self.configured + self.system + self.assumed;
+        if dated == 0 {
+            return;
+        }
+
+        println!("  Timezone recorded by the file: {}", self.from_the_file);
+        if self.configured > 0 {
+            println!("  Timezone from default_timezone: {}", self.configured);
+        }
+        if self.system > 0 {
+            println!("  Timezone from this machine: {}", self.system);
+        }
+        if self.assumed > 0 {
+            println!("  Timezone assumed as UTC: {}", self.assumed);
+        }
+    }
 }
 
 /// Everything the closing summary reports.

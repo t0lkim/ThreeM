@@ -512,6 +512,20 @@ pub struct Config {
     #[arg(long, value_name = "PATH")]
     pub journal_dir: Option<PathBuf>,
 
+    /// Which timezone to assume for photos whose EXIF records no offset
+    ///
+    /// A fixed offset (`+08:00`, `-05:30`) or an IANA zone name
+    /// (`Asia/Singapore`). Without this the run falls back to the machine's own
+    /// timezone. Files that *do* carry an offset tag are unaffected — the file's
+    /// own record always wins.
+    ///
+    /// This does not change which day a photo is filed under: an EXIF wall clock
+    /// is filed under exactly the digits the camera wrote, whatever the zone. It
+    /// decides the instant the run records, and it does move filesystem-dated
+    /// and UTC-stamped video files.
+    #[arg(long, value_name = "TZ")]
+    pub timezone: Option<String>,
+
     /// UNSAFE: do not journal this run — it cannot be undone
     ///
     /// Without a journal there is no record of where a file came from, so `mmm
@@ -555,6 +569,7 @@ impl Config {
             chunk_size: self.chunk_size,
             no_prompt: self.no_prompt,
             journal_dir: self.journal_dir.clone(),
+            default_timezone: self.timezone.clone(),
             ..PartialSettings::default()
         }
     }

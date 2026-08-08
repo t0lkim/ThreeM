@@ -366,6 +366,7 @@ fn the_unsorted_path_is_used_when_a_file_genuinely_has_no_date() {
     // see the CLI-level test below for why it cannot be reached end to end.
     let meta = FileMetadata {
         date: None,
+        timezone_source: None,
         latitude: None,
         longitude: None,
         date_source: DateSource::None,
@@ -1340,6 +1341,7 @@ fn a_config_supplied_unsorted_directory_is_where_an_undateable_file_lands() {
 
     let meta = FileMetadata {
         date: None,
+        timezone_source: None,
         latitude: None,
         longitude: None,
         date_source: DateSource::None,

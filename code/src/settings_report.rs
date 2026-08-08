@@ -215,6 +215,17 @@ pub const KEYS: &[SettingKey] = &[
         value: |settings| Some(list_value(&settings.skip_patterns)),
     },
     SettingKey {
+        name: "default_timezone",
+        table: None,
+        summary: "Which wall clock a photo with no recorded offset is read against.\n\
+                  A fixed offset (\"+08:00\") or an IANA name (\"Asia/Singapore\"). A file that \
+                  carries its own offset tag is unaffected — the file always wins.",
+        unset: Some("the machine's own timezone is used, and the run says so"),
+        placeholder: Some("Asia/Singapore"),
+        claimed: |layer| layer.default_timezone.is_some(),
+        value: |settings| settings.default_timezone.clone().map(Value::String),
+    },
+    SettingKey {
         name: "image",
         table: Some("extensions"),
         summary: "Which extensions count as photographs — lowercase, no leading dot.\n\
@@ -685,12 +696,13 @@ mod tests {
             unsorted_dir: _,
             extensions: Extensions { image: _, video: _ },
             skip_patterns: _,
+            default_timezone: _,
         } = Settings::default();
 
         assert_eq!(
             KEYS.len(),
-            13,
-            "the twelve settings, with [extensions] counted as its two keys"
+            14,
+            "the thirteen settings, with [extensions] counted as its two keys"
         );
     }
 
@@ -733,6 +745,7 @@ mod tests {
                 video: Some(vec!["mov".to_string()]),
             }),
             skip_patterns: Some(Vec::new()),
+            default_timezone: Some("Asia/Singapore".to_string()),
         };
         let none = PartialSettings::default();
 
@@ -1043,10 +1056,14 @@ mod tests {
 
         assert_eq!(
             Settings {
-                // The only two keys shown as examples rather than defaults,
-                // because their fallback is computed from the run.
+                // The only three keys shown as examples rather than defaults,
+                // because each has a fallback computed from the run rather than
+                // a value this module could write down: the first input
+                // directory, a path inside the output tree, and the timezone of
+                // whichever machine the run happens on.
                 output_dir: None,
                 journal_dir: None,
+                default_timezone: None,
                 ..settings.clone()
             },
             Settings::default(),
@@ -1055,6 +1072,7 @@ mod tests {
         assert_eq!(settings.chunk_size, DEFAULT_CHUNK_SIZE);
         assert!(settings.output_dir.is_some(), "shown as an example value");
         assert!(settings.journal_dir.is_some());
+        assert!(settings.default_timezone.is_some());
     }
 
     /// The reader of this file is the person who will next ask why a run did

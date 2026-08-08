@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, Timelike};
 use tracing::{debug, error, info};
 
 use crate::geocoder::GeoLookup;
@@ -13,6 +13,7 @@ use crate::journal::{IntentKind, Journal, JournalEntry};
 use crate::metadata::{self, DateSource, FileMetadata};
 use crate::naming::{sanitise_for_filename, year_is_representable, FilenameParts, Layout};
 use crate::scanner::ScannedFile;
+use crate::timezone::{TimezonePolicy, TimezoneSource};
 
 /// A planned file operation (computed during scan, executed during process)
 #[derive(Debug, Clone)]
@@ -20,6 +21,14 @@ pub struct PlannedMove {
     pub source: PathBuf,
     pub destination: PathBuf,
     pub date_source: DateSource,
+    /// How the offset behind the destination's dated directory was decided, or
+    /// `None` for a file with no usable date at all.
+    ///
+    /// Carried alongside `date_source` rather than folded into it because they
+    /// answer different questions — *what* said when the file was made, and
+    /// *which wall clock* that saying was read against — and a run can be
+    /// confident about one while guessing at the other.
+    pub timezone_source: Option<TimezoneSource>,
     pub has_location: bool,
     /// The source's full BLAKE3 digest, when the dedup cascade already
     /// established one (see [`crate::hasher::UniqueFile`]).
@@ -40,9 +49,10 @@ pub fn plan_move(
     output_dir: &Path,
     geo: &GeoLookup,
     layout: &Layout,
+    tz: &TimezonePolicy,
     known_hash: Option<String>,
 ) -> Result<PlannedMove> {
-    let meta = metadata::extract_metadata(&file.path, file.is_video)?;
+    let meta = metadata::extract_metadata(&file.path, file.is_video, tz)?;
 
     // The stem is only read by the `{original_stem}` token, but it is derived
     // here for every file rather than inside the format: a file whose name is
@@ -62,6 +72,7 @@ pub fn plan_move(
         source: file.path.clone(),
         destination,
         date_source: meta.date_source,
+        timezone_source: meta.timezone_source,
         has_location: meta.latitude.is_some() && meta.longitude.is_some(),
         known_hash,
     })
@@ -83,6 +94,12 @@ pub fn plan_move(
 /// scanner, which admits none but its own known-media extensions, so this was
 /// not reachable from the CLI; it is fixed because the invariant belongs to the
 /// function rather than to the discipline of one caller.
+///
+/// **The date is read as a wall clock, not as an instant.** `meta.date` carries
+/// the local offset resolved by [`crate::timezone`], so `dt.year()`,
+/// `dt.day()` and `dt.hour()` here are the reading a person would have seen on
+/// the camera. This is the fix for evening photographs landing on the following
+/// day: nothing in this function converts to UTC, and nothing may start.
 ///
 /// **A year outside four digits goes to the unsorted directory.** See
 /// [`crate::naming::year_is_representable`] — printing it produced directories
@@ -129,7 +146,7 @@ pub fn build_target_path(
 /// all — `include_location = false` is a run that does not pay for the lookups
 /// it would then discard — and only when the file has coordinates.
 fn date_filename(
-    dt: &DateTime<Utc>,
+    dt: &DateTime<FixedOffset>,
     meta: &FileMetadata,
     extension: &str,
     original_stem: &str,
@@ -585,6 +602,9 @@ pub fn move_duplicates(
                 source: dup_path.clone(),
                 destination: dest,
                 date_source: DateSource::None,
+                // A duplicate is filed by its group, not by its date, so no
+                // wall clock was ever chosen for it.
+                timezone_source: None,
                 has_location: false,
                 // The duplicate pass carries its digest on the purpose, which
                 // is where the journal reads it from for this kind of move.
@@ -1405,8 +1425,10 @@ mod tests {
                     .unwrap()
                     .and_hms_opt(10, 30, 0)
                     .unwrap()
-                    .and_utc(),
+                    .and_utc()
+                    .fixed_offset(),
             ),
+            timezone_source: Some(TimezoneSource::ExifOffsetTag),
             latitude: None,
             longitude: None,
             date_source: DateSource::Exif,
@@ -1460,6 +1482,7 @@ mod tests {
             source: src.to_path_buf(),
             destination: dst.to_path_buf(),
             date_source: DateSource::None,
+            timezone_source: None,
             has_location: false,
             known_hash: None,
         }
@@ -2701,6 +2724,7 @@ mod tests {
     fn test_build_target_path_no_date() {
         let meta = FileMetadata {
             date: None,
+            timezone_source: None,
             latitude: None,
             longitude: None,
             date_source: DateSource::None,

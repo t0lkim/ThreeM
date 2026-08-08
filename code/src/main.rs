@@ -388,6 +388,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     // is about to move them.
     let layout = settings.layout()?;
     let filter = settings.scan_filter()?;
+    let timezone = settings.timezone_policy()?;
 
     // Say which posture we are in before doing any work, not after — a user
     // who expected a preview must not learn otherwise from the aftermath.
@@ -482,6 +483,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
             output_dir,
             &geo,
             &layout,
+            &timezone,
             unique.known_hash.clone(),
         ) {
             Ok(planned) => planned_moves.push(planned),

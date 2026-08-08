@@ -21,7 +21,7 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use chrono::format::{Item, StrftimeItems};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use thiserror::Error;
 
 /// The years `YYYY-MM-DD` can spell.
@@ -291,7 +291,14 @@ impl DateDirectoryFormat {
     /// ([`crate::organiser::build_target_path`]) routes those files to
     /// `unsorted/`, which is the bucket that already means "no filing we can
     /// trust", instead of inventing a directory nobody asked for.
-    pub fn render(&self, dt: &DateTime<Utc>) -> Option<PathBuf> {
+    /// Generic over the timezone rather than pinned to UTC, because the
+    /// datetime that reaches here is a *local* one — see [`crate::timezone`].
+    /// `dt.format_with_items` reads the wall clock of whatever offset it
+    /// carries, which is precisely what the dated directory has to spell.
+    pub fn render<Tz: TimeZone>(&self, dt: &DateTime<Tz>) -> Option<PathBuf>
+    where
+        Tz::Offset: std::fmt::Display,
+    {
         let mut rendered = String::new();
         // `write!` rather than `to_string`: `DelayedFormat`'s `Display` returns
         // an error for a pattern it cannot render, and `to_string` turns that
@@ -626,7 +633,10 @@ impl Scheme {
     }
 
     /// The dated directory for `dt`, or `None` if there is none to give.
-    pub fn date_directory(&self, dt: &DateTime<Utc>) -> Option<PathBuf> {
+    pub fn date_directory<Tz: TimeZone>(&self, dt: &DateTime<Tz>) -> Option<PathBuf>
+    where
+        Tz::Offset: std::fmt::Display,
+    {
         self.date_directory.render(dt)
     }
 
@@ -690,7 +700,10 @@ impl Layout {
     }
 
     /// The dated directory for `dt`, or `None` if there is none to give.
-    pub fn date_directory(&self, dt: &DateTime<Utc>) -> Option<PathBuf> {
+    pub fn date_directory<Tz: TimeZone>(&self, dt: &DateTime<Tz>) -> Option<PathBuf>
+    where
+        Tz::Offset: std::fmt::Display,
+    {
         self.scheme.date_directory(dt)
     }
 
