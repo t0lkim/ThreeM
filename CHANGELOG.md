@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-08-09
+
+A single fix, and the reason it is its own release rather than part of 0.2.0: the defect below was named in the 0.2.0 readiness report as the first thing 0.2.1 should fix, and it was fixed after that release was cut. Folding it back into 0.2.0 would have made the report wrong about the release it describes.
+
 ### Fixed
 
 - **A file under two bytes no longer panics the run.** `nom-exif` 1.5.2 opens its format probe with `assert!(input.len() >= 2)` (`jpeg.rs:110`), and every entry point reaches it — image and video alike — so a one-byte file with a media extension aborted the process during *planning*, exit 101, no summary, and no indication which file did it. `--commit` was irrelevant: the mode that promises to touch nothing crashed instead. A truncated download or an interrupted copy is enough to produce one. `metadata::extract_metadata` now answers a file too short to hold any container signature before a parser sees it, filing it under its filesystem timestamp and reporting `format not supported` — which is what a zero-byte file already did, by luck rather than design. Zero and one byte are now answered identically, pinned by a test that says so.
@@ -259,5 +263,6 @@ Six further defects on the destructive path — every one of them able to lose a
 - No TIFF-based RAW is dated from the RAW itself — `nom-exif` reads four container families and none of them is a bare TIFF. An `.xmp` beside the file covers this for an edited library; a RAW library with no sidecars is dated from the filesystem unless `--require-exif` is passed.
 - A file with GPS coordinates and no readable date loses its coordinates. The undated `FileMetadata` carrying them is discarded in favour of the filesystem timestamp, so the location never reaches the filename. Pre-existing rather than introduced; restoring it would change output filenames, so it is its own change.
 
-[Unreleased]: https://github.com/t0lkim/ThreeM/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/t0lkim/ThreeM/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/t0lkim/ThreeM/releases/tag/v0.2.1
 [0.2.0]: https://github.com/t0lkim/ThreeM/releases/tag/v0.2.0
