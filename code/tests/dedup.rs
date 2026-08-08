@@ -79,6 +79,30 @@ fn run_preview(input: &Path) -> std::process::Output {
         .expect("running mmm in preview mode")
 }
 
+/// Everything a run printed except the line naming its thread count.
+///
+/// That line is the one place two runs at different thread counts may legitimately
+/// differ, so it is removed here and asserted separately by the caller — dropping
+/// it without also checking it would leave a comparison that passed just as
+/// happily if `--threads` were being ignored altogether.
+fn plan_without_thread_count(stdout: &str) -> String {
+    stdout
+        .lines()
+        .filter(|line| !line.starts_with("Analysing for duplicates"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Run `mmm` against `input` in preview mode, with extra arguments appended.
+fn run_preview_with(input: &Path, extra: &[&str]) -> std::process::Output {
+    Command::cargo_bin("mmm")
+        .unwrap()
+        .arg(input)
+        .args(extra)
+        .output()
+        .expect("running mmm in preview mode")
+}
+
 /// Run `mmm --commit` against `input`, organising into `output`.
 fn run_commit(input: &Path, output: &Path) -> std::process::Output {
     Command::cargo_bin("mmm")
@@ -697,5 +721,67 @@ fn a_preview_run_reports_duplicates_without_creating_or_moving_anything() {
     assert!(
         stdout.contains("Duplicate files:    1"),
         "the preview did not count the duplicate it found:\n{stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The concurrency bound changes the pace and nothing else
+// ---------------------------------------------------------------------------
+
+/// The plan a run prints must not depend on how many threads hashed it.
+///
+/// `--threads 1` is the setting somebody on a spinning disk or a network share
+/// reaches for, and the trade they are making is speed for kindness to their
+/// storage. They must not also be trading *which copy of their photograph gets
+/// kept* — so the whole plan is compared, not merely the number of duplicate
+/// groups: the group numbering, the retained original of each, the destination
+/// name of every unique file and every count in the summary.
+///
+/// Compared in preview rather than after two committed runs, because two commits
+/// need two input trees and the manifests would then differ by their temp-dir
+/// prefix alone — a difference that would have to be normalised away, and
+/// normalisation is where a real difference hides. One tree, twice, moving
+/// nothing.
+///
+/// The one line that legitimately differs is the phase's own thread count, and
+/// it is asserted rather than merely skipped: a test that filtered it out
+/// without checking it would still pass if `--threads` were silently ignored,
+/// which is the failure it most needs to catch.
+#[test]
+fn one_thread_plans_exactly_what_the_parallel_default_plans() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .duplicate_of("nested/b.jpg", "a.jpg")
+        .duplicate_of("nested/deeper/c.jpg", "a.jpg")
+        .jpeg_with_exif("x/p.jpg", naive(2023, 7, 4, 8, 9, 10), Some((51.5, -0.12)))
+        .duplicate_of("y/p.jpg", "x/p.jpg")
+        .jpeg_with_exif("solo.jpg", naive(2022, 3, 1, 6, 0, 0), None)
+        .non_media("notes.txt", b"leave me alone");
+
+    let before = snapshot_tree_hashed(tree.path());
+
+    let serial = run_preview_with(tree.path(), &["--threads", "1"]);
+    assert_ok(&serial, "preview with --threads 1");
+    let parallel = run_preview_with(tree.path(), &[]);
+    assert_ok(&parallel, "preview with the default thread count");
+
+    let serial = stdout_of(&serial);
+    let parallel = stdout_of(&parallel);
+
+    assert!(
+        serial.contains("Analysing for duplicates (1 thread)..."),
+        "--threads 1 did not reach the hashing pool:\n{serial}"
+    );
+
+    assert_eq!(
+        plan_without_thread_count(&serial),
+        plan_without_thread_count(&parallel),
+        "the thread count bounds the concurrency and must not reach the plan"
+    );
+
+    assert_eq!(
+        snapshot_tree_hashed(tree.path()),
+        before,
+        "neither preview may move anything"
     );
 }

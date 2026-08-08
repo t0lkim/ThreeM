@@ -57,7 +57,7 @@ use criterion::{
     criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
 };
 use indicatif::ProgressBar;
-use mmm::hasher::{self, find_duplicates};
+use mmm::hasher::{self, find_duplicates, HashPool};
 use mmm::scanner::ScannedFile;
 use tempfile::TempDir;
 
@@ -303,20 +303,37 @@ fn pseudo_random(seed: u64, size: u64) -> Vec<u8> {
 
 /// Total wall-clock of the whole cascade, per tier and over the mixed corpus.
 fn bench_cascade(c: &mut Criterion, corpus: &Corpus) {
+    // The machine's default bound — the same one a plain `mmm` run gets, so
+    // these numbers describe the shipped configuration rather than a
+    // benchmark-only one.
+    let pool = HashPool::automatic().expect("a default hashing pool must build");
+
     let mut group = c.benchmark_group("find_duplicates");
     configure(&mut group);
 
     for ((name, files), bytes) in corpus.per_tier.iter().zip(&corpus.bytes_per_tier) {
         group.throughput(Throughput::Bytes(*bytes));
         group.bench_with_input(BenchmarkId::from_parameter(*name), files, |b, files| {
-            b.iter(|| black_box(find_duplicates(black_box(files), &ProgressBar::hidden())));
+            b.iter(|| {
+                black_box(find_duplicates(
+                    black_box(files),
+                    &ProgressBar::hidden(),
+                    &pool,
+                ))
+            });
         });
     }
 
     let mixed = corpus.all();
     group.throughput(Throughput::Bytes(corpus.total_bytes()));
     group.bench_with_input(BenchmarkId::from_parameter("mixed"), &mixed, |b, files| {
-        b.iter(|| black_box(find_duplicates(black_box(files), &ProgressBar::hidden())));
+        b.iter(|| {
+            black_box(find_duplicates(
+                black_box(files),
+                &ProgressBar::hidden(),
+                &pool,
+            ))
+        });
     });
 
     group.finish();
@@ -330,6 +347,7 @@ fn bench_cascade(c: &mut Criterion, corpus: &Corpus) {
 /// phase 2 gets the files whose size is shared, phase 3 gets those whose
 /// partial hash is shared.
 fn bench_phases(c: &mut Criterion, corpus: &Corpus) {
+    let pool = HashPool::automatic().expect("a default hashing pool must build");
     let mixed = corpus.all();
 
     let size_groups = hasher::group_by_size(&mixed);
@@ -339,7 +357,7 @@ fn bench_phases(c: &mut Criterion, corpus: &Corpus) {
         .flatten()
         .collect();
 
-    let partial = hasher::group_by_partial_hash(&phase2_candidates);
+    let partial = hasher::group_by_partial_hash(&phase2_candidates, &pool);
     let phase3_candidates: Vec<&ScannedFile> = partial
         .groups
         .values()
@@ -376,12 +394,22 @@ fn bench_phases(c: &mut Criterion, corpus: &Corpus) {
 
     group.throughput(Throughput::Elements(phase2_candidates.len() as u64));
     group.bench_function("2_partial_hash", |b| {
-        b.iter(|| black_box(hasher::group_by_partial_hash(black_box(&phase2_candidates))));
+        b.iter(|| {
+            black_box(hasher::group_by_partial_hash(
+                black_box(&phase2_candidates),
+                &pool,
+            ))
+        });
     });
 
     group.throughput(Throughput::Elements(phase3_candidates.len() as u64));
     group.bench_function("3_full_hash", |b| {
-        b.iter(|| black_box(hasher::group_by_full_hash(black_box(&phase3_candidates))));
+        b.iter(|| {
+            black_box(hasher::group_by_full_hash(
+                black_box(&phase3_candidates),
+                &pool,
+            ))
+        });
     });
 
     group.finish();

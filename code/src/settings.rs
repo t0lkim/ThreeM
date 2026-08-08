@@ -27,11 +27,13 @@
 use std::fmt;
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
+use crate::hasher::{default_hash_threads, MAX_HASH_THREADS};
 use crate::naming::{
     DateDirectoryFormat, FilenameFormat, FormatError, Layout, OutputSubdir, Scheme,
 };
@@ -223,6 +225,21 @@ pub struct Settings {
     /// of somebody who manages sidecars by other means; see
     /// [`crate::sidecar`].
     pub sidecars: bool,
+
+    /// How many files the dedup cascade may hash at once.
+    ///
+    /// `None` — like `output_dir` and `default_timezone`, and unlike every other
+    /// field here — because its fallback is not a value this module could name:
+    /// it is derived from the machine's own core count, which is not knowable
+    /// until the run happens. `None` means "nobody configured one", and
+    /// [`Self::hash_thread_count`] takes it from there.
+    ///
+    /// Settable from a config file for the same reason `require_exif` is: it
+    /// cannot make a run destructive. The worst a wrong value does is make the
+    /// hashing slower, which is recoverable by editing one line — and the right
+    /// value is a property of the *machine*, which is precisely what a per-user
+    /// config file is for.
+    pub hash_threads: Option<usize>,
 }
 
 impl Default for Settings {
@@ -244,6 +261,7 @@ impl Default for Settings {
             require_exif: false,
             filesystem_date_warning_percent: DEFAULT_FILESYSTEM_DATE_WARNING_PERCENT,
             sidecars: true,
+            hash_threads: None,
         }
     }
 }
@@ -315,6 +333,8 @@ pub struct PartialSettings {
     #[serde(default, deserialize_with = "de_percentage")]
     pub filesystem_date_warning_percent: Option<u8>,
     pub sidecars: Option<bool>,
+    #[serde(default, deserialize_with = "de_hash_threads")]
+    pub hash_threads: Option<usize>,
 }
 
 impl PartialSettings {
@@ -349,6 +369,7 @@ impl PartialSettings {
                 .filesystem_date_warning_percent
                 .or(self.filesystem_date_warning_percent),
             sidecars: higher_priority.sidecars.or(self.sidecars),
+            hash_threads: higher_priority.hash_threads.or(self.hash_threads),
         }
     }
 
@@ -477,6 +498,58 @@ where
     Ok(value)
 }
 
+/// Refuse a `hash_threads` value that no pool could be built from.
+///
+/// One function rather than three, because all four layers that can supply this
+/// key — the two file layers, the environment and `--threads` — have to refuse
+/// the same values with the same words. The two refusals are not cosmetic:
+///
+/// * **Zero** is the dangerous one. `rayon` reads a thread count of zero as "use
+///   your default", so a `hash_threads = 0` that was merely passed through would
+///   not be a bound of nothing — it would be *no bound at all*, silently, on the
+///   one setting whose whole job is to be a bound. Refused where it is written
+///   rather than clamped, because somebody who typed `0` meant something, and
+///   quietly substituting eight for it is how a setting comes to look broken.
+/// * **Above [`MAX_HASH_THREADS`]** is refused so the failure is a message
+///   naming the value rather than a thread spawn failing partway through
+///   building the pool.
+///
+/// # Errors
+///
+/// A sentence naming the value and the range, ready to be wrapped by whichever
+/// layer read it.
+pub fn validate_hash_threads(value: usize) -> Result<usize, String> {
+    if value == 0 {
+        return Err(
+            "`hash_threads` is how many files may be hashed at once, and 0 is not a number of \
+             files — use 1 to hash them one at a time"
+                .to_string(),
+        );
+    }
+    if value > MAX_HASH_THREADS {
+        return Err(format!(
+            "`hash_threads` is capped at {MAX_HASH_THREADS}, and {value} is past it — a thread \
+             count above a storage device's useful queue depth costs seeks, not speed"
+        ));
+    }
+    Ok(value)
+}
+
+/// Read `hash_threads`, refusing a count nothing could hash with.
+///
+/// See [`de_date_directory_format`] for why this is a deserialiser, and
+/// [`validate_hash_threads`] for what is refused and why.
+fn de_hash_threads<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<usize>::deserialize(deserializer)?;
+    value
+        .map(validate_hash_threads)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
 /// Read `skip_patterns`, refusing an entry that is not a glob.
 ///
 /// See [`de_date_directory_format`] for why this is a deserialiser. A pattern
@@ -548,6 +621,20 @@ impl Settings {
     #[must_use]
     pub fn date_policy(&self) -> DatePolicy {
         DatePolicy::from_require_exif(self.require_exif)
+    }
+
+    /// How many files this run may hash at once, on this machine.
+    ///
+    /// The one place `hash_threads`' `None` is turned into a number, so there is
+    /// no second reading of what "unset" means. Infallible: every layer that can
+    /// supply the key refused zero on the way in (see
+    /// [`validate_hash_threads`]), and a hand-built [`Settings`] carrying one is
+    /// answered here rather than by `rayon` quietly reading it as "no bound".
+    #[must_use]
+    pub fn hash_thread_count(&self) -> NonZeroUsize {
+        self.hash_threads
+            .and_then(NonZeroUsize::new)
+            .unwrap_or_else(default_hash_threads)
     }
 
     /// The share of filesystem dates above which the run says so.
@@ -655,6 +742,7 @@ impl Settings {
                 .filesystem_date_warning_percent
                 .unwrap_or(defaults.filesystem_date_warning_percent),
             sidecars: partial.sidecars.unwrap_or(defaults.sidecars),
+            hash_threads: partial.hash_threads,
         }
     }
 }
@@ -1053,6 +1141,20 @@ where
                 layer.filename_format = Some(value);
             }
             "chunk_size" => layer.chunk_size = Some(parse_number(&variable, &value)?),
+            // Range-checked here for the same reason the file layer checks it,
+            // and with a sharper consequence: `MMM_HASH_THREADS=0` passed
+            // through would leave `rayon` reading zero as "use your default",
+            // so the one setting whose job is to bound the concurrency would
+            // silently not bound it. See `validate_hash_threads`.
+            "hash_threads" => {
+                let threads: usize = parse_number(&variable, &value)?;
+                layer.hash_threads = Some(validate_hash_threads(threads).map_err(|message| {
+                    ConfigError::Environment {
+                        variable: variable.clone(),
+                        message,
+                    }
+                })?);
+            }
             "verbose" => layer.verbose = Some(parse_number(&variable, &value)?),
             "no_prompt" => layer.no_prompt = Some(parse_bool(&variable, &value)?),
             "require_exif" => layer.require_exif = Some(parse_bool(&variable, &value)?),
@@ -1902,6 +2004,67 @@ mod tests {
         assert!(!message.is_empty(), "{message}");
     }
 
+    /// A thread count nothing could hash with is refused where it is written,
+    /// at the position of the value — not clamped, and not passed on.
+    ///
+    /// Zero is the one that matters. `rayon` reads a thread count of zero as
+    /// "use your default", so a `hash_threads = 0` that merely got through would
+    /// not be a very small bound — it would be *no bound*, on the single setting
+    /// whose whole purpose is to be one.
+    #[test]
+    fn a_thread_count_nothing_could_hash_with_is_refused_in_a_file() {
+        let ConfigError::Parse { message, line, .. } = parse_err("hash_threads = 0\n") else {
+            panic!("zero threads would leave rayon reading the setting as `no bound`");
+        };
+        assert_eq!(line, 1);
+        assert!(message.contains("one at a time"), "{message}");
+
+        let ConfigError::Parse { message, .. } = parse_err("hash_threads = 5000\n") else {
+            panic!("a count past the cap must be named rather than spawned");
+        };
+        assert!(message.contains(&MAX_HASH_THREADS.to_string()), "{message}");
+
+        assert_eq!(
+            parse_layer("hash_threads = 4\n", Path::new("/tmp/mmm.toml"))
+                .unwrap()
+                .hash_threads,
+            Some(4),
+            "an ordinary count is an ordinary setting"
+        );
+    }
+
+    /// Unset means "ask the machine", and set means exactly what was set.
+    ///
+    /// The fallback is checked against [`default_hash_threads`] rather than
+    /// against a literal, because a literal here would be this module deciding
+    /// the default a second time — and the two would eventually disagree.
+    #[test]
+    fn an_unset_thread_count_falls_back_to_this_machines_bound() {
+        let settings = Settings::default();
+        assert_eq!(settings.hash_threads, None);
+        assert_eq!(settings.hash_thread_count(), default_hash_threads());
+
+        let settings = Settings {
+            hash_threads: Some(1),
+            ..Settings::default()
+        };
+        assert_eq!(settings.hash_thread_count().get(), 1);
+    }
+
+    /// Every layer refuses the same values, so a reader who moves a count from
+    /// a file to a flag is not told two different stories about it.
+    #[test]
+    fn the_thread_count_refusals_are_the_same_at_every_door() {
+        assert!(validate_hash_threads(0).is_err());
+        assert!(validate_hash_threads(MAX_HASH_THREADS + 1).is_err());
+        assert_eq!(validate_hash_threads(1), Ok(1));
+        assert_eq!(
+            validate_hash_threads(MAX_HASH_THREADS),
+            Ok(MAX_HASH_THREADS),
+            "the cap is a limit, not a fence one short of it"
+        );
+    }
+
     #[test]
     fn a_missing_file_is_missing_when_it_was_asked_for_and_absent_when_it_was_discovered() {
         let (_dir, root) = temp_tree();
@@ -2119,6 +2282,27 @@ mod tests {
         let err = env_layer(env(&[("MMM_NO_PROMPT", "maybe")])).unwrap_err();
         assert!(err.to_string().contains("MMM_NO_PROMPT"), "{err}");
         assert!(err.to_string().contains("true or false"), "{err}");
+    }
+
+    /// The environment door onto the same refusal — with the sharper stake:
+    /// `rayon` reads a thread count of zero as "no bound", so a zero passed
+    /// through here would switch the setting off rather than set it low.
+    #[test]
+    fn a_thread_count_of_zero_is_refused_from_the_environment() {
+        let err = env_layer(env(&[("MMM_HASH_THREADS", "0")]))
+            .expect_err("zero threads would silently mean `no bound at all`");
+        assert!(err.to_string().contains("MMM_HASH_THREADS"), "{err}");
+        assert!(err.to_string().contains("hash them one at a time"), "{err}");
+
+        let err = env_layer(env(&[("MMM_HASH_THREADS", "5000")]))
+            .expect_err("a count past the cap must be named, not spawned");
+        assert!(
+            err.to_string().contains(&MAX_HASH_THREADS.to_string()),
+            "{err}"
+        );
+
+        let layer = env_layer(env(&[("MMM_HASH_THREADS", "3")])).unwrap();
+        assert_eq!(layer.hash_threads, Some(3));
     }
 
     #[test]

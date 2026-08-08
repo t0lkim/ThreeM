@@ -467,9 +467,20 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     }
 
     // Dedup
-    println!("\nAnalysing for duplicates...");
+    //
+    // The pool is built here rather than inside `find_duplicates` so that a
+    // thread count nothing can be spawned for stops the run at the point it was
+    // asked for, before a single file has been read — and so the count is
+    // printed alongside the phase it bounds, which is the one place a user
+    // reaching for `--threads` will look to see whether it took.
+    let hash_pool = hasher::HashPool::with_threads(settings.hash_thread_count())?;
+    let threads = hash_pool.threads().get();
+    println!(
+        "\nAnalysing for duplicates ({threads} thread{})...",
+        if threads == 1 { "" } else { "s" }
+    );
     let dedup_pb = hasher::hashing_progress_bar(files.len() as u64);
-    let dedup_result = hasher::find_duplicates(&files, &dedup_pb);
+    let dedup_result = hasher::find_duplicates(&files, &dedup_pb, &hash_pool);
     dedup_pb.finish_with_message("deduplication complete");
 
     // Report duplicates

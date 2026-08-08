@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::hash::Hash;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::thread::available_parallelism;
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -21,6 +23,102 @@ const PARTIAL_HASH_BYTES: u64 = 64 * 1024; // 64KB
 /// One constant rather than one per function, so a copy and the hash that
 /// verifies it can never disagree about how they walk a file.
 const STREAM_BUFFER_BYTES: usize = 128 * 1024;
+
+// =====================================================================
+// How many files may be read at once
+// =====================================================================
+
+/// The most threads the *default* will choose, however many cores it finds.
+///
+/// The bound is about the storage device, not the CPU. Hashing is fast enough
+/// that the cascade spends most of its time waiting on reads, so the thread
+/// count is really a queue depth — and queue depth stops helping long before
+/// core count does. A solid-state device saturates in the single digits; a spinning
+/// disk has one head, so every concurrent reader past the first turns a
+/// sequential read into a seek storm and makes the run *slower*; a network share
+/// is worse again, because each thread is a separate round trip.
+///
+/// Eight, then, rather than `available_parallelism()` unbounded: a 64-core
+/// workstation firing 64 concurrent reads at somebody's photo library is not
+/// eight times better than eight, and on half the storage it could plausibly be
+/// pointed at, it is worse. Anyone who knows their device wants more says so
+/// with `--threads`.
+pub const DEFAULT_HASH_THREAD_CEILING: usize = 8;
+
+/// The most threads a *setting* may ask for.
+///
+/// Far above any real device's useful queue depth, and far below the point at
+/// which building the pool becomes the run's biggest problem. It exists so that
+/// `--threads 100000` is refused by name rather than discovered as a failure to
+/// spawn the ten-thousandth thread, halfway into a library.
+pub const MAX_HASH_THREADS: usize = 1024;
+
+/// How many threads the cascade uses when nothing said otherwise.
+///
+/// [`DEFAULT_HASH_THREAD_CEILING`] applied to whatever this machine reports.
+/// A machine that will not report its parallelism gets one thread — the
+/// conservative answer, and the one that cannot thrash anything.
+pub fn default_hash_threads() -> NonZeroUsize {
+    let ceiling = NonZeroUsize::new(DEFAULT_HASH_THREAD_CEILING).unwrap_or(NonZeroUsize::MIN);
+    available_parallelism().map_or(NonZeroUsize::MIN, |cores| cores.min(ceiling))
+}
+
+/// The bounded worker pool the hashing phases run on.
+///
+/// **A pool of its own, never the global one.** `rayon`'s global pool is
+/// process-wide and built once, on first use, from whatever asked for it first —
+/// so configuring the hashing bound through it would mean a setting that could
+/// only be applied before anything else touched `rayon`, could not be changed
+/// afterwards, and could not be tested twice in one process with two different
+/// values. Two tests in this module do exactly that. A dedicated pool makes the
+/// bound a value the caller holds rather than a global it hopes nobody else set.
+///
+/// It also scopes the bound to the thing it is a bound *on*: `hash_threads`
+/// describes how hard to push the storage device during dedup, and nothing else
+/// in the process inherits it.
+#[derive(Debug)]
+pub struct HashPool {
+    pool: rayon::ThreadPool,
+    threads: NonZeroUsize,
+}
+
+impl HashPool {
+    /// Build a pool of exactly `threads` workers.
+    ///
+    /// [`NonZeroUsize`] rather than `usize` because `rayon` reads
+    /// `num_threads(0)` as "use the default" — so a zero arriving from a config
+    /// file would not be an error, it would be the bound silently not applying.
+    /// The type makes that unrepresentable; [`crate::settings`] refuses the zero
+    /// at the layer that read it, with a message naming the file.
+    ///
+    /// # Errors
+    ///
+    /// If the pool cannot be built — in practice, only if the threads cannot be
+    /// spawned. A run that cannot build its pool has not read anything yet, and
+    /// stopping there is the point.
+    pub fn with_threads(threads: NonZeroUsize) -> Result<Self> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.get())
+            .thread_name(|index| format!("mmm-hash-{index}"))
+            .build()
+            .with_context(|| format!("building a hashing pool of {threads} threads"))?;
+        Ok(Self { pool, threads })
+    }
+
+    /// A pool at this machine's default bound — see [`default_hash_threads`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::with_threads`].
+    pub fn automatic() -> Result<Self> {
+        Self::with_threads(default_hash_threads())
+    }
+
+    /// How many threads this pool hashes on.
+    pub fn threads(&self) -> NonZeroUsize {
+        self.threads
+    }
+}
 
 /// A file the cascade is passing through to be organised, and the digest it
 /// happens to already know for it.
@@ -128,7 +226,18 @@ fn by_depth_then_path(a: &Path, b: &Path) -> Ordering {
 /// `photo-1.jpg`. Both are now settled by [`by_depth_then_path`] and by the
 /// content hash, applied *after* the hashing is finished — which is also what
 /// keeps the answer stable once the hashing runs on several threads.
-pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupResult {
+///
+/// **`pool` bounds the concurrency and nothing else.** The answer does not
+/// depend on how wide it is: a one-thread pool and an eight-thread pool return
+/// byte-identical results over the same tree, which is what
+/// `test_one_thread_gives_the_same_answer_as_the_parallel_default` pins. What it
+/// changes is how many files are open at once, which is a question about the
+/// storage device rather than about duplicate detection — see [`HashPool`].
+pub fn find_duplicates(
+    files: &[ScannedFile],
+    progress: &ProgressBar,
+    pool: &HashPool,
+) -> DedupResult {
     progress.set_message("Phase 1: grouping by file size");
     let size_groups = group_by_size(files);
 
@@ -167,6 +276,7 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
         &phase2_candidates,
         |file| partial_hash(&file.path),
         |file, digest| (file.size, digest),
+        pool,
     );
     progress.inc(phase2_candidates.len() as u64);
 
@@ -196,7 +306,7 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
     progress.set_message("Phase 3: full hashing confirmed candidates");
     let mut duplicate_groups: Vec<DuplicateGroup> = Vec::new();
 
-    let full = group_by_full_hash(&phase3_candidates);
+    let full = group_by_full_hash(&phase3_candidates, pool);
     skipped += full.skipped;
     progress.inc(phase3_candidates.len() as u64);
 
@@ -271,9 +381,13 @@ pub fn group_by_size(files: &[ScannedFile]) -> HashMap<u64, Vec<ScannedFile>> {
 /// A file that cannot be opened, seeked or read is left out of the returned
 /// groups and counted in [`HashGroups::skipped`], with a warning naming it.
 // exposed for integration tests
-pub fn group_by_partial_hash<'a>(files: &[&'a ScannedFile]) -> HashGroups<'a> {
-    let (groups, skipped) =
-        group_by_key(files, |file| partial_hash(&file.path), |_, digest| digest);
+pub fn group_by_partial_hash<'a>(files: &[&'a ScannedFile], pool: &HashPool) -> HashGroups<'a> {
+    let (groups, skipped) = group_by_key(
+        files,
+        |file| partial_hash(&file.path),
+        |_, digest| digest,
+        pool,
+    );
     HashGroups { groups, skipped }
 }
 
@@ -283,8 +397,13 @@ pub fn group_by_partial_hash<'a>(files: &[&'a ScannedFile]) -> HashGroups<'a> {
 /// returned groups and counted in [`HashGroups::skipped`], with a warning
 /// naming it.
 // exposed for integration tests
-pub fn group_by_full_hash<'a>(files: &[&'a ScannedFile]) -> HashGroups<'a> {
-    let (groups, skipped) = group_by_key(files, |file| full_hash(&file.path), |_, digest| digest);
+pub fn group_by_full_hash<'a>(files: &[&'a ScannedFile], pool: &HashPool) -> HashGroups<'a> {
+    let (groups, skipped) = group_by_key(
+        files,
+        |file| full_hash(&file.path),
+        |_, digest| digest,
+        pool,
+    );
     HashGroups { groups, skipped }
 }
 
@@ -312,17 +431,24 @@ pub fn group_by_full_hash<'a>(files: &[&'a ScannedFile]) -> HashGroups<'a> {
 /// The per-file [`Result`] is the resilience contract from Phase 02 carried
 /// intact across the thread boundary: an unreadable file becomes an `Err` in
 /// the vector, not a `?` that would abandon every other file's completed work.
+///
+/// The parallel half runs inside `pool` rather than on `rayon`'s global pool, so
+/// how many files this opens at once is the caller's decision — see
+/// [`HashPool`].
 fn group_by_key<'a, K, H, F>(
     files: &[&'a ScannedFile],
     hash: H,
     key: F,
+    pool: &HashPool,
 ) -> (HashMap<K, Vec<&'a ScannedFile>>, usize)
 where
     K: Eq + Hash,
     H: Fn(&ScannedFile) -> Result<String> + Sync,
     F: Fn(&ScannedFile, String) -> K,
 {
-    let digests: Vec<Result<String>> = files.par_iter().map(|file| hash(file)).collect();
+    let digests: Vec<Result<String>> = pool
+        .pool
+        .install(|| files.par_iter().map(|file| hash(file)).collect());
 
     let mut groups: HashMap<K, Vec<&'a ScannedFile>> = HashMap::new();
     let mut skipped = 0;
@@ -521,6 +647,21 @@ mod tests {
         }
     }
 
+    /// A pool at this machine's default bound — what a real run gets.
+    fn pool() -> HashPool {
+        HashPool::automatic().expect("a default hashing pool must build")
+    }
+
+    /// The cascade as a run performs it: default bound, no visible bar.
+    ///
+    /// Each call builds its own pool rather than sharing one, which costs a
+    /// handful of thread spawns and buys the repeated-run tests a fresh
+    /// scheduler each time — the answer has to be the same across pools, not
+    /// merely stable within one.
+    fn dedup(files: &[ScannedFile]) -> DedupResult {
+        find_duplicates(files, &ProgressBar::hidden(), &pool())
+    }
+
     #[test]
     fn test_unique_files_by_size() {
         let tmp = TempDir::new().unwrap();
@@ -531,7 +672,7 @@ mod tests {
 
         let files = vec![make_scanned(f1, 5), make_scanned(f2, 24)];
 
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
         assert_eq!(result.unique.len(), 2);
         assert!(result.duplicate_groups.is_empty());
     }
@@ -548,7 +689,7 @@ mod tests {
         let size = content.len() as u64;
         let files = vec![make_scanned(f1, size), make_scanned(f2, size)];
 
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
         assert_eq!(result.duplicate_groups.len(), 1);
         assert_eq!(result.duplicate_groups[0].files.len(), 2);
     }
@@ -694,7 +835,7 @@ mod tests {
             make_scanned(readable.clone(), 16),
             make_scanned(locked.clone(), 16),
         ];
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
 
         // Restore before asserting, or `TempDir` cannot clean up after a panic.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
@@ -741,7 +882,7 @@ mod tests {
         let denied = File::open(&locked).is_err();
         let a = make_scanned(readable, 16);
         let b = make_scanned(locked.clone(), 16);
-        let grouped = group_by_full_hash(&[&a, &b]);
+        let grouped = group_by_full_hash(&[&a, &b], &pool());
 
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -772,7 +913,7 @@ mod tests {
         let size = content.len() as u64;
         let files = vec![make_scanned(f1, size), make_scanned(f2, size)];
 
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
         assert_eq!(result.skipped, 0);
         assert_eq!(result.duplicate_groups.len(), 1);
     }
@@ -788,7 +929,7 @@ mod tests {
 
         let files = vec![make_scanned(f1, 8), make_scanned(f2, 8)];
 
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
         assert_eq!(result.unique.len(), 2);
         assert!(result.duplicate_groups.is_empty());
     }
@@ -868,10 +1009,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let files = deterministic_fixture(&tmp);
 
-        let first = render(&find_duplicates(&files, &ProgressBar::hidden()));
+        let first = render(&dedup(&files));
         for run in 1..20 {
             assert_eq!(
-                render(&find_duplicates(&files, &ProgressBar::hidden())),
+                render(&dedup(&files)),
                 first,
                 "run {run} disagreed with run 0"
             );
@@ -885,9 +1026,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut files = deterministic_fixture(&tmp);
 
-        let forwards = render(&find_duplicates(&files, &ProgressBar::hidden()));
+        let forwards = render(&dedup(&files));
         files.reverse();
-        let backwards = render(&find_duplicates(&files, &ProgressBar::hidden()));
+        let backwards = render(&dedup(&files));
 
         assert_eq!(forwards, backwards);
     }
@@ -898,7 +1039,7 @@ mod tests {
     fn test_the_retained_original_is_the_shallowest_path() {
         let tmp = TempDir::new().unwrap();
         let files = deterministic_fixture(&tmp);
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
 
         let group = result
             .duplicate_groups
@@ -923,7 +1064,7 @@ mod tests {
     fn test_the_retained_original_breaks_a_depth_tie_lexicographically() {
         let tmp = TempDir::new().unwrap();
         let files = deterministic_fixture(&tmp);
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
 
         let group = result
             .duplicate_groups
@@ -947,7 +1088,7 @@ mod tests {
     fn test_the_retained_original_is_the_file_offered_to_the_organiser() {
         let tmp = TempDir::new().unwrap();
         let files = deterministic_fixture(&tmp);
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
 
         for group in &result.duplicate_groups {
             let original = &group.files[0];
@@ -974,7 +1115,7 @@ mod tests {
     fn test_duplicate_groups_are_ordered_by_hash() {
         let tmp = TempDir::new().unwrap();
         let files = deterministic_fixture(&tmp);
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
 
         assert_eq!(result.duplicate_groups.len(), 2);
         let hashes: Vec<&str> = result
@@ -1018,16 +1159,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let files = wide_fixture(&tmp, 32);
 
-        let first = render(&find_duplicates(&files, &ProgressBar::hidden()));
+        let first = render(&dedup(&files));
         for run in 1..8 {
             assert_eq!(
-                render(&find_duplicates(&files, &ProgressBar::hidden())),
+                render(&dedup(&files)),
                 first,
                 "run {run} disagreed with run 0 — thread completion order is leaking"
             );
         }
 
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
         assert_eq!(result.duplicate_groups.len(), 32);
         assert!(result.duplicate_groups.iter().all(|g| g.files.len() == 3));
         assert_eq!(result.skipped, 0);
@@ -1059,7 +1200,7 @@ mod tests {
         }
 
         let denied = File::open(&locked[0]).is_err();
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
 
         for path in &locked {
             fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -1151,7 +1292,7 @@ mod tests {
             "the fixture is pointless unless the two sizes really do share a partial digest"
         );
 
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
 
         assert!(result.duplicate_groups.is_empty());
         assert_eq!(result.unique.len(), 4);
@@ -1162,13 +1303,115 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // The bound on how many files are open at once
+    // -----------------------------------------------------------------
+
+    /// `--threads 1` must return the same answer as the parallel default.
+    ///
+    /// This is the property that makes the bound safe to turn down: somebody on
+    /// a spinning disk or a network share who drops to one thread is trading
+    /// speed for kindness to their storage, and must not also be trading which
+    /// copy of their photograph gets kept. Byte-identical over the *whole*
+    /// result — groups, their order, the retained originals, the unique list and
+    /// the skip count — not merely "the same number of duplicates".
+    ///
+    /// Run on the wide fixture rather than the five-file one so the parallel
+    /// side really is parallel: 96 files across 32 groups spans the pool.
+    #[test]
+    fn test_one_thread_gives_the_same_answer_as_the_parallel_default() {
+        let tmp = TempDir::new().unwrap();
+        let files = wide_fixture(&tmp, 32);
+
+        let serial = HashPool::with_threads(NonZeroUsize::MIN).unwrap();
+        let parallel = pool();
+
+        assert_eq!(
+            render(&find_duplicates(&files, &ProgressBar::hidden(), &serial)),
+            render(&find_duplicates(&files, &ProgressBar::hidden(), &parallel)),
+            "the thread count bounds the concurrency and must not reach the answer"
+        );
+    }
+
+    /// The default is bounded by the ceiling rather than by the core count
+    /// alone — the whole point of the setting existing.
+    #[test]
+    fn test_the_default_thread_count_respects_the_ceiling() {
+        let threads = default_hash_threads().get();
+        assert!(
+            threads <= DEFAULT_HASH_THREAD_CEILING,
+            "{threads} threads is past the {DEFAULT_HASH_THREAD_CEILING}-thread ceiling — an \
+             unbounded default is what this setting exists to prevent"
+        );
+    }
+
+    /// The bound is real: a pool of N never runs work on more than N workers.
+    ///
+    /// Asserted by watching which worker indices actually pick tasks up, over
+    /// enough deliberately slow tasks that a wider pool would certainly spread
+    /// them. `<= n` is the contract — a run that thrashes the disk is one that
+    /// opened *more* files at once than it was told to.
+    ///
+    /// The second half is the negative control. `<= 2` alone would also pass on
+    /// an implementation that silently ran everything on one thread, so on a
+    /// machine with cores to spare the default pool is checked to use more than
+    /// one — which is what proves the first assertion is measuring a bound and
+    /// not an accident.
+    #[test]
+    fn test_a_pool_runs_on_no_more_workers_than_it_was_built_with() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        /// The worker indices that picked up any of `TASKS` slow tasks.
+        fn workers_used(pool: &HashPool) -> HashSet<usize> {
+            const TASKS: u32 = 512;
+            let seen = Mutex::new(HashSet::new());
+            pool.pool.install(|| {
+                (0..TASKS).into_par_iter().for_each(|_| {
+                    if let Some(index) = rayon::current_thread_index() {
+                        seen.lock()
+                            .expect("the index set is never poisoned")
+                            .insert(index);
+                    }
+                    std::thread::sleep(Duration::from_micros(100));
+                });
+            });
+            seen.into_inner().expect("the index set is never poisoned")
+        }
+
+        let two = HashPool::with_threads(NonZeroUsize::new(2).unwrap()).unwrap();
+        assert_eq!(two.threads().get(), 2);
+        let used = workers_used(&two);
+        assert!(
+            used.len() <= 2,
+            "a two-thread pool ran work on {} workers",
+            used.len()
+        );
+
+        let one = HashPool::with_threads(NonZeroUsize::MIN).unwrap();
+        assert_eq!(
+            workers_used(&one).len(),
+            1,
+            "a one-thread pool must open one file at a time"
+        );
+
+        if default_hash_threads().get() > 1 {
+            assert!(
+                workers_used(&pool()).len() > 1,
+                "this machine has cores to spare, so the default pool spreading over one worker \
+                 would mean the bound is not what is being measured above"
+            );
+        }
+    }
+
     /// `unique` is the order the organiser plans moves in, so it is sorted by
     /// the same rule rather than by whatever the last `HashMap` said.
     #[test]
     fn test_unique_files_come_back_in_path_order() {
         let tmp = TempDir::new().unwrap();
         let files = deterministic_fixture(&tmp);
-        let result = find_duplicates(&files, &ProgressBar::hidden());
+        let result = dedup(&files);
 
         let paths: Vec<PathBuf> = result.unique.iter().map(|u| u.file.path.clone()).collect();
         let mut sorted = paths.clone();

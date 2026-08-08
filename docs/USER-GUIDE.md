@@ -68,6 +68,7 @@ mmm config validate [PATH]          # parse a config, run nothing
 | `--output <DIR>` | `-o` | First input directory | Where organised files and the `duplicates/` directory are written |
 | `--commit` | | off | **Actually move files.** Without this, `mmm` only prints the plan and exits |
 | `--chunk-size <N>` | `-c` | 100 | Number of files to process before pausing for confirmation |
+| `--threads <N>` | | cores, capped at 8 | How many files the duplicate scan may hash at once. Higher helps on NVMe; lower is kinder to a spinning disk or a network share. The plan is the same either way — only the speed changes. See [How many threads](#how-many-threads) |
 | `--no-prompt[=<BOOL>]` | | off | Skip confirmation prompts between chunks. `--no-prompt=false` keeps them, which is how to answer a `no_prompt = true` written in a config file |
 | `--timezone <TZ>` | | machine's zone | Which wall clock to read a file that recorded no offset against. A fixed offset (`+08:00`, `-05:30`) or an IANA name (`Asia/Singapore`). See [Timezones](#timezones) |
 | `--require-exif[=<BOOL>]` | | off | Refuse to file anything under a date the file did not record itself — those go to `unsorted/` instead, keeping their own names. See [Refusing dates you do not trust](#refusing-dates-you-do-not-trust) |
@@ -198,6 +199,69 @@ Every name in that tree is a default, not a fixture: `date_directory_format`, `f
 - **A file that cannot be read is never moved.** If its contents could not be established, it stays exactly where you put it.
 - **You can stop at any chunk.** Between chunks, the tool asks whether to continue. Answering `n` stops before the next chunk; files already moved stay moved, nothing else is touched. The run then finishes properly — it prints the same closing summary a completed run does, with a `Not processed:` line counting the files it never got to, so you always know what a stopped run managed.
 - **Every committing run is recorded before it acts.** Each move is written to the journal and flushed to disk *before* the file is touched, so a run killed by `Ctrl-C`, a power cut or a full disk still leaves a record of exactly what it moved and where — and one entry naming the single file it was part-way through. See [Undoing a run](#undoing-a-run).
+
+---
+
+## How many threads
+
+Finding duplicates means reading files, and `mmm` reads several at once. How
+many is `--threads`, or `hash_threads` in a config file. **It changes the speed
+and nothing else** — a run at `--threads 1` produces exactly the same duplicate
+groups, keeps exactly the same original in each, and plans exactly the same
+moves as a run at the default.
+
+The run says what it chose:
+
+```
+Analysing for duplicates (8 threads)...
+```
+
+### What to set it to
+
+The number is really a *queue depth* for your storage device, not a use of your
+CPU — the hashing itself is fast, and most of the time is spent waiting on
+reads. So the right answer follows the disk, not the processor:
+
+| Where the library lives | Suggested | Why |
+|---|---|---|
+| **Internal SSD / NVMe** | leave it alone | The default already saturates a modern SSD. Raising it past 8 buys little and is unlikely to be measurable. |
+| **External SSD over USB** | leave it alone, or `--threads 4` | Usually fine at the default; drop it if the enclosure is the bottleneck. |
+| **Spinning hard disk** | `--threads 1` or `2` | A platter drive has **one head**. Every extra concurrent reader turns one sequential read into a seek storm, and the run gets *slower*, not faster — often dramatically so on a library of large videos. |
+| **Network share (SMB, NFS)** | `--threads 1` to `4` | Each thread is a separate round trip. A few can hide the latency; many will simply queue, and some servers throttle a client that opens too many files at once. |
+| **A machine you are still using** | `--threads 2` | Leaves cores and IO bandwidth for whatever else you are doing. The run takes longer and stays out of the way. |
+
+```bash
+# An archive on a USB hard drive — one file at a time
+mmm --threads 1 /Volumes/Archive --commit
+
+# Pin it for a machine whose library is always on the NAS
+echo 'hash_threads = 2' >> ~/.config/mmm/config.toml
+```
+
+### The default, and its limits
+
+Without a setting, `mmm` uses **as many threads as the machine has cores, up to
+a maximum of 8**. The cap exists because more concurrent readers stop helping
+long before core count does: a 64-core workstation firing 64 simultaneous reads
+at a photo library is not eight times better than eight, and on half the storage
+it might be pointed at, it is worse.
+
+Two limits worth knowing:
+
+- **This bounds the duplicate scan only.** Scanning for files, reading metadata
+  and the move phase itself are unchanged and still work through one file at a
+  time, so `--threads` will not make those faster.
+- **There is no published figure for what a given count buys on a given
+  device.** The project's benchmarks run against a page-cache-warm corpus, which
+  measures hashing rather than disk — see
+  [`docs/research/hashing-baseline.md`](research/hashing-baseline.md). If your
+  library is on unusual storage, the honest way to pick a number is to time a
+  preview run (`mmm --threads N ~/Photos`, which moves nothing) at two or three
+  values.
+
+`--threads 0` is refused rather than treated as "decide for me": zero means "no
+bound at all" to the underlying thread pool, which is the opposite of what the
+setting is for. Omit the flag to get the default.
 
 ---
 

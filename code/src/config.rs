@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use crate::settings::{LoadOptions, PartialSettings, Settings};
+use crate::settings::{self, LoadOptions, PartialSettings, Settings};
 use crate::settings_report::InitTarget;
 use crate::METADATA_DIR_NAME;
 
@@ -494,6 +494,20 @@ pub struct Config {
     #[arg(short, long, value_name = "N")]
     pub chunk_size: Option<usize>,
 
+    /// How many files the duplicate scan may hash at once [default: cores, capped at 8]
+    ///
+    /// The bound is about the storage device rather than the CPU. High counts
+    /// help on a fast SSD; on a spinning disk or a network share they turn one
+    /// sequential read into a seek storm and make the run slower. `--threads 1`
+    /// hashes one file at a time and returns exactly the same duplicate groups.
+    ///
+    /// Optional rather than defaulted, for the same reason as `--chunk-size`
+    /// above: a default baked in here would arrive as the highest-priority
+    /// layer's opinion and silently outrank every `hash_threads` a config file
+    /// could set.
+    #[arg(long, value_name = "N", value_parser = parse_threads)]
+    pub threads: Option<usize>,
+
     /// Skip user confirmation prompts between chunks [--no-prompt=false to keep them]
     ///
     /// `--no-prompt` on its own means yes. The `=false` form exists because
@@ -605,6 +619,21 @@ pub struct Config {
     pub i_know_what_im_doing: bool,
 }
 
+/// Parse and range-check `--threads`, in the words every other layer uses.
+///
+/// Routed through [`settings::validate_hash_threads`] rather than through
+/// clap's own range parser so that `--threads 0`, `hash_threads = 0` and
+/// `MMM_HASH_THREADS=0` are refused with the same sentence. A flag that gave a
+/// different reason from the config file for rejecting the same value would
+/// send the reader looking for a difference that is not there.
+fn parse_threads(value: &str) -> Result<usize, String> {
+    let count: usize = value
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a whole number, got `{value}`"))?;
+    settings::validate_hash_threads(count)
+}
+
 /// Emitted once on stderr when a caller passes the retired `--dry-run` flag.
 pub const DRY_RUN_DEPRECATION_NOTICE: &str =
     "warning: --dry-run is deprecated and does nothing — previewing is now the default. \
@@ -644,6 +673,7 @@ impl Config {
             // switched them off, and that round trip is why the flag is a
             // tri-state rather than a bare switch.
             sidecars: self.no_sidecars.map(|no| !no),
+            hash_threads: self.threads,
             ..PartialSettings::default()
         }
     }
@@ -1185,6 +1215,7 @@ mod tests {
         assert_eq!(layer.output_dir, None);
         assert_eq!(layer.journal_dir, None);
         assert_eq!(layer.verbose, None);
+        assert_eq!(layer.hash_threads, None);
         assert!(
             layer.is_empty(),
             "a bare `mmm ~/Photos` states no settings at all: {layer:?}"
@@ -1203,6 +1234,8 @@ mod tests {
             "--no-prompt",
             "--journal-dir",
             "/var/log/mmm",
+            "--threads",
+            "3",
             "-vv",
         ]);
         assert_eq!(layer.output_dir, Some(PathBuf::from("/sorted")));
@@ -1210,6 +1243,28 @@ mod tests {
         assert_eq!(layer.no_prompt, Some(true));
         assert_eq!(layer.journal_dir, Some(PathBuf::from("/var/log/mmm")));
         assert_eq!(layer.verbose, Some(2));
+        assert_eq!(layer.hash_threads, Some(3));
+    }
+
+    /// `--threads` is refused at the same values and in the same words a config
+    /// file refuses them, because it is routed through the same validator.
+    ///
+    /// Zero is the one worth a test of its own: `rayon` reads it as "use your
+    /// default", so a `--threads 0` that parsed would switch the bound off
+    /// rather than set it low — and the user who typed it would be told nothing.
+    #[test]
+    fn a_thread_count_nothing_could_hash_with_is_refused_on_the_command_line() {
+        let err = Cli::try_parse_from(["mmm", "/photos", "--threads", "0"])
+            .expect_err("zero threads means `no bound at all` to rayon")
+            .to_string();
+        assert!(err.contains("one at a time"), "{err}");
+
+        let err = Cli::try_parse_from(["mmm", "/photos", "--threads", "5000"])
+            .expect_err("a count past the cap must be named, not spawned")
+            .to_string();
+        assert!(err.contains("capped at"), "{err}");
+
+        assert!(Cli::try_parse_from(["mmm", "/photos", "--threads", "1"]).is_ok());
     }
 
     /// The switches that exist to make a destructive run deliberate are not

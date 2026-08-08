@@ -52,9 +52,16 @@ pub struct SettingKey {
     /// computed from the run rather than stored as a default.
     pub unset: Option<&'static str>,
 
-    /// An illustrative value for those same two keys, so the starter config can
+    /// An illustrative value for those same keys, so the starter config can
     /// still list every key as something the reader can uncomment.
-    pub placeholder: Option<&'static str>,
+    ///
+    /// A constructor rather than a `&str`, matching `value` below. The string
+    /// form worked only for as long as every key without a default happened to
+    /// be string-typed: an integer placeholder rendered as `"4"` is a quoted
+    /// string, which `config init` would write and the deserialiser would then
+    /// refuse — a starter config that does not parse. `every_key_is_accepted_by_the_deserialiser`
+    /// is what catches it.
+    pub placeholder: Option<fn() -> Value>,
 
     /// Whether a layer had an opinion about this key.
     claimed: fn(&PartialSettings) -> bool,
@@ -110,7 +117,7 @@ pub const KEYS: &[SettingKey] = &[
         table: None,
         summary: "Where organised files are written.",
         unset: Some("the run writes into its first input directory"),
-        placeholder: Some("/path/to/organised/library"),
+        placeholder: Some(|| Value::String("/path/to/organised/library".to_string())),
         claimed: |layer| layer.output_dir.is_some(),
         value: |settings| settings.output_dir.as_deref().map(path_value),
     },
@@ -125,6 +132,25 @@ pub const KEYS: &[SettingKey] = &[
             Some(Value::Integer(
                 i64::try_from(settings.chunk_size).unwrap_or(i64::MAX),
             ))
+        },
+    },
+    SettingKey {
+        name: "hash_threads",
+        table: None,
+        summary: "How many files the duplicate scan may hash at once.\n\
+                  The bound is about the storage device, not the CPU: high counts help on NVMe, \
+                  and on a spinning disk or a network share they turn one sequential read into a \
+                  seek storm. The answer is the same either way — only the speed changes.",
+        unset: Some(
+            "as many threads as this machine has cores, capped at 8 — set it yourself if you know \
+             what your storage wants",
+        ),
+        placeholder: Some(|| Value::Integer(4)),
+        claimed: |layer| layer.hash_threads.is_some(),
+        value: |settings| {
+            settings
+                .hash_threads
+                .map(|threads| Value::Integer(i64::try_from(threads).unwrap_or(i64::MAX)))
         },
     },
     SettingKey {
@@ -152,7 +178,7 @@ pub const KEYS: &[SettingKey] = &[
         summary: "Where run journals are written, and where `mmm undo` reads them from.\n\
                   Both sides read this one key, so moving it moves them together.",
         unset: Some("journals go under <output>/.mmm/journal"),
-        placeholder: Some("/var/log/mmm"),
+        placeholder: Some(|| Value::String("/var/log/mmm".to_string())),
         claimed: |layer| layer.journal_dir.is_some(),
         value: |settings| settings.journal_dir.as_deref().map(path_value),
     },
@@ -221,7 +247,7 @@ pub const KEYS: &[SettingKey] = &[
                   A fixed offset (\"+08:00\") or an IANA name (\"Asia/Singapore\"). A file that \
                   carries its own offset tag is unaffected — the file always wins.",
         unset: Some("the machine's own timezone is used, and the run says so"),
-        placeholder: Some("Asia/Singapore"),
+        placeholder: Some(|| Value::String("Asia/Singapore".to_string())),
         claimed: |layer| layer.default_timezone.is_some(),
         value: |settings| settings.default_timezone.clone().map(Value::String),
     },
@@ -661,7 +687,7 @@ pub fn starter_config() -> String {
 
         let value = match (key.value_in(&defaults), key.placeholder) {
             (Some(value), _) => value,
-            (None, Some(placeholder)) => Value::String(placeholder.to_string()),
+            (None, Some(placeholder)) => placeholder(),
             // Unreachable for the catalogue above, and asserted by
             // `every_key_has_something_to_show`. Rendered rather than panicked
             // so a future key that forgets a placeholder produces a visibly
@@ -760,12 +786,13 @@ mod tests {
             require_exif: _,
             filesystem_date_warning_percent: _,
             sidecars: _,
+            hash_threads: _,
         } = Settings::default();
 
         assert_eq!(
             KEYS.len(),
-            18,
-            "the sixteen settings, with [extensions] counted as its three keys"
+            19,
+            "the seventeen settings, with [extensions] counted as its three keys"
         );
     }
 
@@ -777,7 +804,7 @@ mod tests {
         for key in KEYS {
             let value = key
                 .value_in(&defaults)
-                .or_else(|| key.placeholder.map(|p| Value::String(p.to_string())))
+                .or_else(|| key.placeholder.map(|p| p()))
                 .expect("every key renders something");
             let text = match key.table {
                 Some(table) => format!("[{table}]\n{} = {value}\n", key.name),
@@ -813,6 +840,7 @@ mod tests {
             require_exif: Some(true),
             filesystem_date_warning_percent: Some(50),
             sidecars: Some(false),
+            hash_threads: Some(4),
         };
         let none = PartialSettings::default();
 
@@ -1123,14 +1151,16 @@ mod tests {
 
         assert_eq!(
             Settings {
-                // The only three keys shown as examples rather than defaults,
+                // The only four keys shown as examples rather than defaults,
                 // because each has a fallback computed from the run rather than
                 // a value this module could write down: the first input
-                // directory, a path inside the output tree, and the timezone of
-                // whichever machine the run happens on.
+                // directory, a path inside the output tree, the timezone of
+                // whichever machine the run happens on, and that machine's core
+                // count.
                 output_dir: None,
                 journal_dir: None,
                 default_timezone: None,
+                hash_threads: None,
                 ..settings.clone()
             },
             Settings::default(),
@@ -1140,6 +1170,7 @@ mod tests {
         assert!(settings.output_dir.is_some(), "shown as an example value");
         assert!(settings.journal_dir.is_some());
         assert!(settings.default_timezone.is_some());
+        assert!(settings.hash_threads.is_some());
     }
 
     /// The reader of this file is the person who will next ask why a run did
