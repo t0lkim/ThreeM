@@ -11,7 +11,7 @@ use crate::geocoder::GeoLookup;
 use crate::hasher::DuplicateGroup;
 use crate::journal::{IntentKind, Journal, JournalEntry};
 use crate::metadata::{self, DateSource, FileMetadata};
-use crate::naming::{sanitise_for_filename, year_is_representable};
+use crate::naming::{sanitise_for_filename, year_is_representable, FilenameParts, Scheme};
 use crate::scanner::ScannedFile;
 
 /// A planned file operation (computed during scan, executed during process)
@@ -39,11 +39,23 @@ pub fn plan_move(
     file: &ScannedFile,
     output_dir: &Path,
     geo: &GeoLookup,
+    scheme: &Scheme,
     known_hash: Option<String>,
 ) -> Result<PlannedMove> {
     let meta = metadata::extract_metadata(&file.path, file.is_video)?;
 
-    let (date_dir, filename) = build_target_path(&meta, &file.extension, geo);
+    // The stem is only read by the `{original_stem}` token, but it is derived
+    // here for every file rather than inside the format: a file whose name is
+    // not valid UTF-8 has no stem this scheme can spell, and the empty string it
+    // becomes is answered by the same guard as an empty `{ext}`.
+    let original_stem = file
+        .path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+
+    let (date_dir, filename) =
+        build_target_path(&meta, &file.extension, original_stem, geo, scheme);
     let destination = output_dir.join(date_dir).join(filename);
 
     Ok(PlannedMove {
@@ -55,12 +67,14 @@ pub fn plan_move(
     })
 }
 
-/// Build the directory path (YYYY-MM-DD) and filename (YYYY-MM-DD-HHMMSS[-location].ext)
+/// Build the dated directory and the filename `scheme` asks for.
 ///
-/// Total by construction: the directory it returns is either `YYYY-MM-DD` in
-/// four-two-two ASCII digits or exactly `unsorted`, and the filename is always
-/// a single ordinary path component. `tests/path_properties.rs` asserts both
-/// over generated input, which is what closed the three holes described below.
+/// Total by construction: the directory it returns is either the rendering of
+/// [`Scheme::date_directory`] — a relative path of ordinary components, whatever
+/// the pattern — or exactly `unsorted`, and the filename is always a single
+/// ordinary path component. `tests/path_properties.rs` asserts both over
+/// generated input *and over generated formats*, which is what closed the four
+/// holes described below.
 ///
 /// **The extension is sanitised.** It arrives here as arbitrary text — this
 /// function is `pub`, and nothing in its signature stops a caller passing
@@ -74,72 +88,73 @@ pub fn plan_move(
 /// [`crate::naming::year_is_representable`] — printing it produced directories
 /// like `44-03-15` and, for the negative years `chrono` will parse out of an
 /// EXIF string, `-44-03-15` plus a filename beginning with `-`.
+///
+/// **A format that renders to nothing goes to `unsorted` too.** A pattern is
+/// trial-rendered when it is validated, so this is not reachable from a config
+/// file; it is here because `Scheme` renders against a date and a date is not
+/// something validation can enumerate. `unsorted/` is the bucket that already
+/// means "no filing we can trust", which is better than a directory named after
+/// whatever the default happened to be.
 // exposed for integration tests
 pub fn build_target_path(
     meta: &FileMetadata,
     extension: &str,
+    original_stem: &str,
     geo: &GeoLookup,
+    scheme: &Scheme,
 ) -> (PathBuf, String) {
     let extension = sanitise_for_filename(extension);
 
-    match meta.date {
-        Some(dt) if year_is_representable(dt.year()) => {
-            let dir = date_directory(&dt);
-            let filename = date_filename(&dt, meta, &extension, geo);
-            (dir, filename)
-        }
-        _ => {
-            let dir = PathBuf::from("unsorted");
-            let filename = format!("unknown.{extension}");
-            (dir, filename)
-        }
-    }
+    let dated = match meta.date {
+        Some(dt) if year_is_representable(dt.year()) => scheme.date_directory(&dt).map(|dir| {
+            (
+                dir,
+                date_filename(&dt, meta, &extension, original_stem, geo, scheme),
+            )
+        }),
+        _ => None,
+    };
+
+    dated.unwrap_or_else(|| {
+        (
+            PathBuf::from("unsorted"),
+            format!("{}.{extension}", crate::naming::UNNAMED),
+        )
+    })
 }
 
-/// `YYYY-MM-DD`, zero-padded — one directory per day, not a nested tree.
+/// The name `scheme` gives a file whose date is usable.
 ///
-/// The year is `{:04}` and not `{}` because a photograph dated 44 AD — which is
-/// what a camera with a flat battery writes, and what `chrono` parses without
-/// complaint out of `0044:03:15 10:00:00` — was filed under a directory called
-/// `44-03-15`, sorting above every four-digit year in the output tree and
-/// matching none of the conventions the tool promises. Callers guarantee the
-/// year is representable; [`build_target_path`] is the only one, and it checks.
-fn date_directory(dt: &DateTime<Utc>) -> PathBuf {
-    PathBuf::from(format!(
-        "{:04}-{:02}-{:02}",
-        dt.year(),
-        dt.month(),
-        dt.day()
-    ))
-}
-
+/// The geocoder is consulted only when the scheme says locations are spelled at
+/// all — `include_location = false` is a run that does not pay for the lookups
+/// it would then discard — and only when the file has coordinates.
 fn date_filename(
     dt: &DateTime<Utc>,
     meta: &FileMetadata,
     extension: &str,
+    original_stem: &str,
     geo: &GeoLookup,
+    scheme: &Scheme,
 ) -> String {
-    let base = format!(
-        "{:04}-{:02}-{:02}-{:02}{:02}{:02}",
-        dt.year(),
-        dt.month(),
-        dt.day(),
-        dt.hour(),
-        dt.minute(),
-        dt.second()
-    );
+    let date = format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day());
+    let time = format!("{:02}{:02}{:02}", dt.hour(), dt.minute(), dt.second());
 
-    let location_part = match (meta.latitude, meta.longitude) {
-        (Some(lat), Some(lon)) => geo
+    let location = match (scheme.include_location(), meta.latitude, meta.longitude) {
+        (true, Some(lat), Some(lon)) => geo
             .lookup(lat, lon)
-            .map(|info| format!("-{}", info.filename_part)),
-        _ => None,
+            // The separator belongs to the token, not to the pattern: a file
+            // with no coordinates must not leave a dangling `-` behind.
+            .map_or_else(String::new, |info| format!("-{}", info.filename_part)),
+        _ => String::new(),
     };
 
-    match location_part {
-        Some(loc) => format!("{base}{loc}.{extension}"),
-        None => format!("{base}.{extension}"),
-    }
+    scheme.filename(&FilenameParts {
+        date: &date,
+        time: &time,
+        location: &location,
+        extension,
+        original_stem,
+    })
 }
 
 /// The number of destination candidates tried before a move gives up.
@@ -1297,14 +1312,73 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The scheme a run with no config file uses, so that every assertion below
+    /// pins the *default* behaviour rather than a scheme invented for the test.
+    fn scheme() -> Scheme {
+        crate::settings::Settings::default()
+            .naming_scheme()
+            .expect("the built-in default formats must be valid")
+    }
+
     #[test]
     fn test_date_directory() {
-        let dt = chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-            .unwrap()
-            .and_hms_opt(10, 30, 0)
-            .unwrap()
-            .and_utc();
-        assert_eq!(date_directory(&dt), PathBuf::from("2024-03-15"));
+        assert_eq!(
+            scheme().date_directory(
+                &chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                    .unwrap()
+                    .and_hms_opt(10, 30, 0)
+                    .unwrap()
+                    .and_utc()
+            ),
+            Some(PathBuf::from("2024-03-15"))
+        );
+    }
+
+    /// The setting the whole of Phase 04 task 5 exists for, asserted through the
+    /// function that files the photograph rather than through the format alone.
+    #[test]
+    fn test_a_configured_date_directory_format_nests_the_tree() {
+        let nested = Scheme::new("%Y/%m/%d", "{date}-{time}{location}.{ext}", true).unwrap();
+        let (dir, filename) =
+            build_target_path(&at(2024, 3, 15), "jpg", "IMG_0001", geo(), &nested);
+        assert_eq!(dir, PathBuf::from("2024/03/15"));
+        assert_eq!(filename, "2024-03-15-103000.jpg");
+    }
+
+    /// And the other half: the name, with a token the default never uses.
+    #[test]
+    fn test_a_configured_filename_format_is_applied() {
+        let renamed = Scheme::new("%Y-%m-%d", "{original_stem}-{date}.{ext}", true).unwrap();
+        let (dir, filename) =
+            build_target_path(&at(2024, 3, 15), "jpg", "IMG_0001", geo(), &renamed);
+        assert_eq!(dir, PathBuf::from("2024-03-15"));
+        assert_eq!(filename, "IMG_0001-2024-03-15.jpg");
+    }
+
+    /// `include_location = false` reaches the filename even for a file that has
+    /// coordinates — the token expands to nothing rather than the lookup being
+    /// spelled and then discarded.
+    #[test]
+    fn test_include_location_off_drops_the_location_token() {
+        let mut located = at(2024, 3, 15);
+        located.latitude = Some(51.5);
+        located.longitude = Some(-0.12);
+
+        let (_, with) = build_target_path(&located, "jpg", "IMG_0001", geo(), &scheme());
+        let without = Scheme::new("%Y-%m-%d", "{date}-{time}{location}.{ext}", false).unwrap();
+        let (_, plain) = build_target_path(&located, "jpg", "IMG_0001", geo(), &without);
+
+        assert!(
+            with.len() > plain.len(),
+            "the located name {with} should carry a place the plain name {plain} does not"
+        );
+        assert_eq!(plain, "2024-03-15-103000.jpg");
+    }
+
+    /// The geocoder loads a dataset; one per test binary is enough.
+    fn geo() -> &'static GeoLookup {
+        static GEO: std::sync::OnceLock<GeoLookup> = std::sync::OnceLock::new();
+        GEO.get_or_init(GeoLookup::new)
     }
 
     fn at(year: i32, month: u32, day: u32) -> FileMetadata {
@@ -1327,7 +1401,8 @@ mod tests {
     /// documents.
     #[test]
     fn test_a_low_year_is_padded_to_four_digits() {
-        let (dir, filename) = build_target_path(&at(44, 3, 15), "jpg", &GeoLookup::new());
+        let (dir, filename) =
+            build_target_path(&at(44, 3, 15), "jpg", "IMG_0001", geo(), &scheme());
         assert_eq!(dir, PathBuf::from("0044-03-15"));
         assert_eq!(filename, "0044-03-15-103000.jpg");
     }
@@ -1337,7 +1412,8 @@ mod tests {
     /// every command-line tool that met it would read as a flag.
     #[test]
     fn test_a_year_outside_four_digits_goes_to_unsorted() {
-        let (dir, filename) = build_target_path(&at(-44, 3, 15), "jpg", &GeoLookup::new());
+        let (dir, filename) =
+            build_target_path(&at(-44, 3, 15), "jpg", "IMG_0001", geo(), &scheme());
         assert_eq!(dir, PathBuf::from("unsorted"));
         assert_eq!(filename, "unknown.jpg");
     }
@@ -1348,8 +1424,13 @@ mod tests {
     /// than that caller's discipline.
     #[test]
     fn test_a_hostile_extension_cannot_add_path_separators() {
-        let (dir, filename) =
-            build_target_path(&at(2024, 3, 15), "../../etc/passwd", &GeoLookup::new());
+        let (dir, filename) = build_target_path(
+            &at(2024, 3, 15),
+            "../../etc/passwd",
+            "IMG_0001",
+            geo(),
+            &scheme(),
+        );
         assert_eq!(dir, PathBuf::from("2024-03-15"));
         assert_eq!(filename, "2024-03-15-103000.______etc_passwd");
         assert!(!filename.contains('/'));
@@ -2595,8 +2676,7 @@ mod tests {
             longitude: None,
             date_source: DateSource::None,
         };
-        let geo = GeoLookup::new();
-        let (dir, name) = build_target_path(&meta, "jpg", &geo);
+        let (dir, name) = build_target_path(&meta, "jpg", "IMG_0001", geo(), &scheme());
         assert_eq!(dir, PathBuf::from("unsorted"));
         assert_eq!(name, "unknown.jpg");
     }

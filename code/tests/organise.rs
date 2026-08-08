@@ -49,6 +49,7 @@ use mmm::reporter::{
     CHUNK_PROMPT_PREFIX, COMMIT_BANNER, DRY_RUN_BANNER, HASH_SKIPPED_LABEL, JOURNAL_LABEL,
     NO_JOURNAL_NOTICE, SCAN_SKIPPED_LABEL, UNPROCESSED_LABEL,
 };
+use mmm::settings::Settings;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -370,7 +371,10 @@ fn the_unsorted_path_is_used_when_a_file_genuinely_has_no_date() {
         date_source: DateSource::None,
     };
 
-    let (dir, filename) = build_target_path(&meta, "jpg", &GeoLookup::new());
+    let scheme = Settings::default()
+        .naming_scheme()
+        .expect("the built-in default formats must be valid");
+    let (dir, filename) = build_target_path(&meta, "jpg", "IMG_0001", &GeoLookup::new(), &scheme);
     assert_eq!(dir, Path::new("unsorted"));
     assert_eq!(filename, "unknown.jpg");
 }

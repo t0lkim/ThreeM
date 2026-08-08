@@ -29,9 +29,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
+use crate::naming::{DateDirectoryFormat, FilenameFormat, FormatError, Scheme};
 use crate::scanner::{IMAGE_EXTENSIONS, VIDEO_EXTENSIONS};
 
 /// Files processed between prompts, when nothing says otherwise.
@@ -223,7 +224,9 @@ pub struct PartialSettings {
     pub no_prompt: Option<bool>,
     pub verbose: Option<u8>,
     pub journal_dir: Option<PathBuf>,
+    #[serde(default, deserialize_with = "de_date_directory_format")]
     pub date_directory_format: Option<String>,
+    #[serde(default, deserialize_with = "de_filename_format")]
     pub filename_format: Option<String>,
     pub include_location: Option<bool>,
     pub duplicates_dir: Option<PathBuf>,
@@ -270,7 +273,63 @@ impl PartialSettings {
     }
 }
 
+/// Read `date_directory_format`, refusing a pattern that is not one.
+///
+/// Validation hangs off deserialisation rather than off a pass over the resolved
+/// [`Settings`] for two reasons, and the second is the one that matters. The
+/// first is *when*: a broken pattern is a broken config file whether or not a
+/// higher layer would have overridden it, which is the same rule
+/// `deny_unknown_fields` applies one line up. The second is *where*: an error
+/// raised here carries the TOML span of the value that caused it, so
+/// [`parse_layer`] reports `mmm.toml:7:25` and the reader is looking at the
+/// right line. A check run after the fold would know only that some layer,
+/// somewhere, had said something wrong.
+fn de_date_directory_format<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let pattern = Option::<String>::deserialize(deserializer)?;
+    if let Some(pattern) = &pattern {
+        DateDirectoryFormat::new(pattern).map_err(serde::de::Error::custom)?;
+    }
+    Ok(pattern)
+}
+
+/// Read `filename_format`, refusing a pattern that is not one.
+///
+/// See [`de_date_directory_format`] for why this is a deserialiser.
+fn de_filename_format<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let pattern = Option::<String>::deserialize(deserializer)?;
+    if let Some(pattern) = &pattern {
+        FilenameFormat::new(pattern).map_err(serde::de::Error::custom)?;
+    }
+    Ok(pattern)
+}
+
 impl Settings {
+    /// The validated naming scheme this run files and names files with.
+    ///
+    /// Every layer that can supply a format validates it as it is read — the
+    /// file layers in [`parse_layer`], the environment in [`env_layer`] — so in
+    /// a real run this cannot fail. It returns a `Result` anyway because
+    /// [`Settings`] is an ordinary struct that a caller may build by hand, and
+    /// the alternative to an error here would be the organiser discovering the
+    /// problem with half a library already moved.
+    ///
+    /// # Errors
+    ///
+    /// The first [`FormatError`] either pattern produces.
+    pub fn naming_scheme(&self) -> Result<Scheme, FormatError> {
+        Scheme::new(
+            &self.date_directory_format,
+            &self.filename_format,
+            self.include_location,
+        )
+    }
+
     /// Fold `layers` lowest-priority-first, then fill what nobody set.
     ///
     /// The caller owns the order, and the order is the precedence rule: built-in
@@ -704,8 +763,17 @@ where
             "journal_dir" => layer.journal_dir = Some(PathBuf::from(value)),
             "duplicates_dir" => layer.duplicates_dir = Some(PathBuf::from(value)),
             "unsorted_dir" => layer.unsorted_dir = Some(PathBuf::from(value)),
-            "date_directory_format" => layer.date_directory_format = Some(value),
-            "filename_format" => layer.filename_format = Some(value),
+            // Validated here rather than after the fold for the same reason the
+            // file layers are, minus the span: the variable's own name is the
+            // thing the reader has to go and fix.
+            "date_directory_format" => {
+                DateDirectoryFormat::new(&value).map_err(|error| env_refusal(&variable, &error))?;
+                layer.date_directory_format = Some(value);
+            }
+            "filename_format" => {
+                FilenameFormat::new(&value).map_err(|error| env_refusal(&variable, &error))?;
+                layer.filename_format = Some(value);
+            }
             "chunk_size" => layer.chunk_size = Some(parse_number(&variable, &value)?),
             "verbose" => layer.verbose = Some(parse_number(&variable, &value)?),
             "no_prompt" => layer.no_prompt = Some(parse_bool(&variable, &value)?),
@@ -735,6 +803,14 @@ where
         layer.extensions = Some(extensions);
     }
     Ok(layer)
+}
+
+/// Dress a [`FormatError`] as the environment's refusal of one variable.
+fn env_refusal(variable: &str, error: &FormatError) -> ConfigError {
+    ConfigError::Environment {
+        variable: variable.to_string(),
+        message: error.to_string(),
+    }
 }
 
 /// Parse a whole-number setting, naming the variable if it will not.
@@ -1100,6 +1176,93 @@ mod tests {
         let merged =
             layer(r#"{"skip_patterns": ["*.tmp"]}"#).merge(layer(r#"{"skip_patterns": []}"#));
         assert_eq!(merged.skip_patterns, Some(Vec::new()));
+    }
+
+    // -----------------------------------------------------------------
+    // Formats are refused by the layer that carries them
+    // -----------------------------------------------------------------
+
+    /// The rule the task names, applied where the value is read rather than
+    /// after the fold — so a broken pattern in a layer a higher one would have
+    /// overridden is still a broken config file.
+    #[test]
+    fn a_layer_refuses_a_date_format_that_could_leave_the_output_tree() {
+        assert!(
+            layer_err(r#"{"date_directory_format": "/%Y/%m"}"#).contains("absolute path"),
+            "an absolute pattern must be named as one"
+        );
+        assert!(layer_err(r#"{"date_directory_format": "%Y/../%m"}"#).contains(".."));
+        assert!(layer_err(r#"{"date_directory_format": "%Y/%Q"}"#).contains("strftime"));
+    }
+
+    #[test]
+    fn a_layer_refuses_a_filename_format_that_is_not_one_filename() {
+        assert!(
+            layer_err(r#"{"filename_format": "{date}/{time}.{ext}"}"#).contains("path separator")
+        );
+        assert!(layer_err(r#"{"filename_format": "{date}-{time}"}"#).contains("{ext}"));
+        assert!(layer_err(r#"{"filename_format": "{stem}.{ext}"}"#).contains("unknown token"));
+    }
+
+    /// And the patterns a person would actually write are accepted, so the
+    /// refusals above are a rule rather than a wall.
+    #[test]
+    fn a_layer_accepts_the_formats_the_documentation_offers() {
+        let settings = Settings::resolve([layer(
+            r#"{"date_directory_format": "%Y/%Y-%m", "filename_format": "{original_stem}-{date}.{ext}"}"#,
+        )]);
+        assert_eq!(settings.date_directory_format, "%Y/%Y-%m");
+        assert_eq!(settings.filename_format, "{original_stem}-{date}.{ext}");
+        assert!(settings.naming_scheme().is_ok());
+    }
+
+    /// A config file gets the file, the line and the column, because that is
+    /// what the reader has to go and edit.
+    #[test]
+    fn a_broken_format_in_a_file_is_reported_at_its_position() {
+        let error = parse_layer(
+            "chunk_size = 10\ndate_directory_format = \"/%Y\"\n",
+            Path::new("mmm.toml"),
+        )
+        .expect_err("an absolute date format must be refused");
+
+        let message = error.to_string();
+        assert!(message.starts_with("mmm.toml:2:"), "got {message}");
+        assert!(message.contains("absolute path"), "got {message}");
+    }
+
+    /// The environment applies the same rule and names the variable, which is
+    /// its equivalent of a line number.
+    #[test]
+    fn a_broken_format_in_the_environment_names_the_variable() {
+        let error = env_layer([(
+            "MMM_FILENAME_FORMAT".to_string(),
+            "{date}/{time}.{ext}".to_string(),
+        )])
+        .expect_err("a filename format with a separator must be refused");
+
+        let message = error.to_string();
+        assert!(message.starts_with("MMM_FILENAME_FORMAT:"), "got {message}");
+        assert!(message.contains("path separator"), "got {message}");
+
+        assert!(
+            env_layer([(
+                "MMM_DATE_DIRECTORY_FORMAT".to_string(),
+                "%Y/%m/%d".to_string()
+            )])
+            .is_ok(),
+            "a pattern that is fine in a file must be fine in the environment"
+        );
+    }
+
+    /// The built-in defaults are themselves a scheme, and a default that could
+    /// not be built would break every run rather than only a configured one.
+    #[test]
+    fn the_default_settings_resolve_to_a_scheme() {
+        let scheme = Settings::default()
+            .naming_scheme()
+            .expect("the built-in defaults must be valid");
+        assert!(scheme.include_location());
     }
 
     // -----------------------------------------------------------------

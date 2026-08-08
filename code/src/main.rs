@@ -381,6 +381,13 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
         anyhow::bail!(refusal);
     }
 
+    // Built once, here, and for the same reason as the refusal above: every
+    // layer already validated its own patterns as it was read, so this is the
+    // last line of defence rather than the first, and it belongs before the
+    // banner so that a run which cannot name its files never announces that it
+    // is about to move them.
+    let scheme = settings.naming_scheme()?;
+
     // Say which posture we are in before doing any work, not after — a user
     // who expected a preview must not learn otherwise from the aftermath.
     reporter::print_mode_banner(config.is_dry_run());
@@ -458,7 +465,13 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     let mut plan_errors = 0;
 
     for unique in &dedup_result.unique {
-        match organiser::plan_move(&unique.file, output_dir, &geo, unique.known_hash.clone()) {
+        match organiser::plan_move(
+            &unique.file,
+            output_dir,
+            &geo,
+            &scheme,
+            unique.known_hash.clone(),
+        ) {
             Ok(planned) => planned_moves.push(planned),
             Err(e) => {
                 error!(path = %unique.file.path.display(), error = %e, "failed to plan move");

@@ -6,8 +6,8 @@
 //! next one, because every example is a place somebody thought to look.
 //!
 //! These tests state the *invariants* instead and let `proptest` hunt for
-//! inputs that break them. Four of them, all of which the phase's earlier
-//! tasks assumed without ever asserting:
+//! inputs that break them. Five of them, the first four of which the phase's
+//! earlier tasks assumed without ever asserting:
 //!
 //! 1. **A dated file lands in a `YYYY-MM-DD` directory**, and its filename
 //!    begins with the matching `YYYY-MM-DD-HHMMSS`. The whole tool is a promise
@@ -23,6 +23,11 @@
 //!    the `exists()`-then-rename shape with a candidate walk; this asserts the
 //!    end-to-end consequence over arbitrary occupancy rather than over the two
 //!    hand-written cases in `organiser`'s own tests.
+//! 5. **All of the above still hold once the layout is configurable.** Phase 04
+//!    lets a config file choose the dated directory and the filename, so the
+//!    inputs are no longer only the file — they include the *format*. The last
+//!    section generates those too, quantifying properties 2 and 3 over every
+//!    pattern the loader will accept rather than over the one it ships with.
 //!
 //! Where a property is stated over a restricted domain, the restriction is
 //! itself asserted — property 1 covers the four-digit years the naming scheme
@@ -42,8 +47,11 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use mmm::geocoder::GeoLookup;
 use mmm::metadata::{DateSource, FileMetadata};
-use mmm::naming::{sanitise_for_filename, year_is_representable};
+use mmm::naming::{
+    sanitise_for_filename, year_is_representable, DateDirectoryFormat, FilenameFormat, Scheme,
+};
 use mmm::organiser::{build_target_path, collision_candidate, execute_move, PlannedMove};
+use mmm::settings::Settings;
 use proptest::prelude::*;
 use tempfile::TempDir;
 
@@ -53,6 +61,24 @@ fn geo() -> &'static GeoLookup {
     static GEO: OnceLock<GeoLookup> = OnceLock::new();
     GEO.get_or_init(GeoLookup::new)
 }
+
+/// The naming scheme a run with no config file uses.
+///
+/// Every property above is stated about the *default* layout, which is what the
+/// tool promises when nobody has configured it. The configured case has its own
+/// section at the bottom of this file, where the format is generated too.
+fn scheme() -> &'static Scheme {
+    static SCHEME: OnceLock<Scheme> = OnceLock::new();
+    SCHEME.get_or_init(|| {
+        Settings::default()
+            .naming_scheme()
+            .expect("the built-in default formats must be valid")
+    })
+}
+
+/// A stand-in original filename, for the `{original_stem}` token the default
+/// format does not use.
+const STEM: &str = "IMG_0001";
 
 fn dated(date: Option<DateTime<Utc>>, gps: Option<(f64, f64)>) -> FileMetadata {
     FileMetadata {
@@ -181,7 +207,7 @@ proptest! {
         ext in extension(),
         gps in gps(),
     ) {
-        let (dir, filename) = build_target_path(&dated(Some(dt), gps), &ext, geo());
+        let (dir, filename) = build_target_path(&dated(Some(dt), gps), &ext, STEM, geo(), scheme());
         let dir = dir.to_string_lossy().into_owned();
 
         prop_assert!(
@@ -218,7 +244,7 @@ proptest! {
     ) {
         prop_assert!(!year_is_representable(dt.year()));
 
-        let (dir, _) = build_target_path(&dated(Some(dt), gps), &ext, geo());
+        let (dir, _) = build_target_path(&dated(Some(dt), gps), &ext, STEM, geo(), scheme());
 
         prop_assert_eq!(
             dir,
@@ -275,7 +301,7 @@ proptest! {
         ext in extension(),
         gps in gps(),
     ) {
-        let (_, filename) = build_target_path(&dated(dt, gps), &ext, geo());
+        let (_, filename) = build_target_path(&dated(dt, gps), &ext, STEM, geo(), scheme());
         assert_single_safe_component(&filename)?;
     }
 
@@ -306,7 +332,7 @@ proptest! {
         raw in prop::sample::select(NASTY_STRINGS),
         gps in gps(),
     ) {
-        let (_, filename) = build_target_path(&dated(Some(dt), gps), raw, geo());
+        let (_, filename) = build_target_path(&dated(Some(dt), gps), raw, STEM, geo(), scheme());
         assert_single_safe_component(&filename)?;
     }
 }
@@ -326,7 +352,7 @@ proptest! {
         gps in gps(),
     ) {
         let output = Path::new(output);
-        let (dir, filename) = build_target_path(&dated(dt, gps), &ext, geo());
+        let (dir, filename) = build_target_path(&dated(dt, gps), &ext, STEM, geo(), scheme());
         let destination = output.join(&dir).join(&filename);
 
         prop_assert!(
@@ -375,7 +401,7 @@ proptest! {
             source.display()
         );
 
-        let planned = mmm::organiser::plan_move(&scan.files[0], &output, geo(), None)
+        let planned = mmm::organiser::plan_move(&scan.files[0], &output, geo(), scheme(), None)
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
 
         prop_assert!(
@@ -504,5 +530,289 @@ proptest! {
         unique.sort();
         unique.dedup();
         prop_assert_eq!(unique.len(), landed.len(), "two files landed on one name");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. The invariants above survive *any* format a config file can supply
+// ---------------------------------------------------------------------------
+//
+// Everything so far is stated about the built-in layout, because until Phase 04
+// there was only one. `date_directory_format` and `filename_format` turn that
+// single layout into a family of them, which moves the question: the tool no
+// longer promises "files land in `YYYY-MM-DD`", it promises "files land where
+// your pattern says, *inside the output tree*". The second half of that is the
+// safety property, and it now has to hold for patterns nobody has read.
+//
+// So the formats are generated too. Both strategies build a pattern out of
+// pieces and then push it through the real constructor, keeping what it
+// accepts — which means these properties are quantified over exactly the set
+// `mmm` will load from a config file, and no smaller set the test author
+// happened to think of. `the_format_strategies_are_not_vacuous` asserts the
+// filters do not simply throw everything away.
+
+/// Fragments a generated `date_directory_format` is assembled from.
+///
+/// A mixture of the specifiers people actually write, the separators that give
+/// the pattern its shape, and a few literals — including ones whose *rendered*
+/// form carries characters the pattern itself does not show. `%c` expands to
+/// spaces and colons, `%D` to slashes of its own, `%Z` to a timezone name.
+const DATE_FRAGMENTS: &[&str] = &[
+    "%Y", "%m", "%d", "%H", "%M", "%S", "%j", "%B", "%b", "%C", "%y", "%e", "%A", "%Z", "%c", "%D",
+    "%s", "%%", "/", "-", "_", ".", "photos", " ", "",
+];
+
+/// Fragments a generated `filename_format` is assembled from.
+const NAME_FRAGMENTS: &[&str] = &[
+    "{date}",
+    "{time}",
+    "{location}",
+    "{original_stem}",
+    "-",
+    "_",
+    ".",
+    "img",
+    " ",
+    "",
+];
+
+/// A `date_directory_format` the loader would accept.
+fn date_format() -> impl Strategy<Value = DateDirectoryFormat> {
+    prop::collection::vec(
+        prop_oneof![
+            8 => prop::sample::select(DATE_FRAGMENTS).prop_map(str::to_owned),
+            1 => arbitrary_text(),
+        ],
+        1..6,
+    )
+    .prop_map(|pieces| pieces.concat())
+    .prop_filter_map("not a pattern the loader accepts", |pattern| {
+        DateDirectoryFormat::new(&pattern).ok()
+    })
+}
+
+/// A `filename_format` the loader would accept.
+///
+/// `{ext}` is planted rather than hoped for: a pattern without it is refused,
+/// and generating patterns that are thrown away nineteen times in twenty would
+/// test the rejection path rather than the acceptance one.
+fn filename_format() -> impl Strategy<Value = FilenameFormat> {
+    (
+        prop::collection::vec(
+            prop_oneof![
+                8 => prop::sample::select(NAME_FRAGMENTS).prop_map(str::to_owned),
+                1 => arbitrary_text(),
+            ],
+            0..4,
+        ),
+        prop::collection::vec(
+            prop::sample::select(NAME_FRAGMENTS).prop_map(str::to_owned),
+            0..3,
+        ),
+    )
+        .prop_map(|(before, after)| format!("{}{{ext}}{}", before.concat(), after.concat()))
+        .prop_filter_map("not a pattern the loader accepts", |pattern| {
+            FilenameFormat::new(&pattern).ok()
+        })
+}
+
+/// Both formats at once, as a run holds them.
+fn naming_scheme() -> impl Strategy<Value = Scheme> {
+    (date_format(), filename_format(), any::<bool>()).prop_filter_map(
+        "not a scheme the loader accepts",
+        |(date, name, include_location)| {
+            Scheme::new(date.pattern(), name.pattern(), include_location).ok()
+        },
+    )
+}
+
+proptest! {
+    /// The filters above must be leaving something behind. A strategy that
+    /// rejected everything would make every property below vacuously true, and
+    /// proptest reports that as a pass.
+    #[test]
+    fn the_format_strategies_are_not_vacuous(scheme in naming_scheme()) {
+        let dt = NaiveDate::from_ymd_opt(2024, 3, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap()
+            .and_utc();
+        prop_assert!(
+            scheme.date_directory(&dt).is_some(),
+            "an accepted format must render something for an ordinary date"
+        );
+    }
+
+    /// Property 1's safety half, restated for a configured layout. The shape is
+    /// the user's business — one directory per day, a nested tree, or a name
+    /// with the month spelled out — but a relative path of ordinary components
+    /// is not negotiable, whatever they wrote.
+    #[test]
+    fn any_accepted_date_format_renders_inside_the_output_tree(
+        format in date_format(),
+        dt in representable_datetime(),
+    ) {
+        let Some(dir) = format.render(&dt) else { return Ok(()) };
+
+        prop_assert!(
+            dir.is_relative(),
+            "{:?} rendered {} for {dt:?}, which is not relative",
+            format.pattern(),
+            dir.display()
+        );
+        for component in dir.components() {
+            prop_assert!(
+                matches!(component, Component::Normal(_)),
+                "{:?} rendered {} for {dt:?}, which contains {component:?}",
+                format.pattern(),
+                dir.display()
+            );
+        }
+        prop_assert!(
+            !dir.as_os_str().is_empty(),
+            "{:?} rendered an empty directory for {dt:?}",
+            format.pattern()
+        );
+    }
+
+    /// Property 2, restated for a configured filename. `{location}` can be empty
+    /// and `{ext}` can be empty, so a pattern that is one safe component when it
+    /// is read is not necessarily one when it is rendered — which is the whole
+    /// reason the render path has a guard of its own.
+    #[test]
+    fn any_accepted_filename_format_renders_one_safe_component(
+        scheme in naming_scheme(),
+        dt in representable_datetime(),
+        ext in extension(),
+        stem in extension(),
+        gps in gps(),
+    ) {
+        let (_, filename) = build_target_path(&dated(Some(dt), gps), &ext, &stem, geo(), &scheme);
+        assert_single_safe_component(&filename)?;
+        prop_assert!(
+            !filename.is_empty(),
+            "{:?} rendered nothing at all",
+            scheme
+        );
+    }
+
+    /// Property 3, the one that matters most, restated over both formats at
+    /// once: whatever the config file said, the file lands under the output
+    /// directory the run was pointed at.
+    #[test]
+    fn a_configured_scheme_never_escapes_the_output_directory(
+        scheme in naming_scheme(),
+        output in prop::sample::select(&["/photos", "/tmp/out", "relative/out", "."][..]),
+        dt in prop::option::of(any_datetime()),
+        ext in extension(),
+        stem in extension(),
+        gps in gps(),
+    ) {
+        let output = Path::new(output);
+        let (dir, filename) = build_target_path(&dated(dt, gps), &ext, &stem, geo(), &scheme);
+        let destination = output.join(&dir).join(&filename);
+
+        prop_assert!(
+            destination.starts_with(output),
+            "{} is not inside {}",
+            destination.display(),
+            output.display()
+        );
+
+        let tail = destination
+            .strip_prefix(output)
+            .map_err(|e| TestCaseError::fail(format!("{e}")))?;
+        for component in tail.components() {
+            prop_assert!(
+                matches!(component, Component::Normal(_)),
+                "the derived tail {} must be ordinary components only; found {component:?}",
+                tail.display()
+            );
+        }
+    }
+
+    /// The sanitising half, asserted where it is applied rather than assumed:
+    /// no component of a rendered directory is a name the filesystem reads as
+    /// navigation, however the specifier expanded.
+    #[test]
+    fn a_rendered_directory_component_is_never_navigation(
+        format in date_format(),
+        dt in representable_datetime(),
+    ) {
+        let Some(dir) = format.render(&dt) else { return Ok(()) };
+        for component in &dir {
+            let component = component.to_string_lossy();
+            prop_assert!(
+                component != "." && component != ".." && !component.contains('\0'),
+                "{:?} rendered the component {component:?} for {dt:?}",
+                format.pattern()
+            );
+            prop_assert_eq!(
+                &sanitise_for_filename(&component),
+                &component.to_string(),
+                "every component must already be sanitised"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The refusals, stated as properties rather than as examples
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// Whatever else is in the pattern, a `..` is refused. Stated over generated
+    /// surroundings because the danger is not the pattern `..` — nobody writes
+    /// that — but `%Y/../..%m`, which looks like a typo and is a path traversal.
+    #[test]
+    fn a_date_format_containing_a_parent_reference_is_always_refused(
+        before in prop::sample::select(DATE_FRAGMENTS),
+        after in prop::sample::select(DATE_FRAGMENTS),
+    ) {
+        let pattern = format!("{before}..{after}");
+        prop_assert!(
+            DateDirectoryFormat::new(&pattern).is_err(),
+            "{pattern:?} was accepted"
+        );
+    }
+
+    /// And an absolute one, which would file photographs at the root of the
+    /// filesystem rather than in the library.
+    #[test]
+    fn an_absolute_date_format_is_always_refused(tail in prop::sample::select(DATE_FRAGMENTS)) {
+        let pattern = format!("/{tail}");
+        prop_assert!(
+            DateDirectoryFormat::new(&pattern).is_err(),
+            "{pattern:?} was accepted"
+        );
+    }
+
+    /// A filename pattern is one filename. A separator anywhere in it is a
+    /// directory the organiser never made and `undo` never recorded.
+    #[test]
+    fn a_filename_format_containing_a_separator_is_always_refused(
+        before in prop::sample::select(NAME_FRAGMENTS),
+        separator in prop::sample::select(&["/", "\\"][..]),
+        after in prop::sample::select(NAME_FRAGMENTS),
+    ) {
+        let pattern = format!("{before}{separator}{after}{{ext}}");
+        prop_assert!(
+            FilenameFormat::new(&pattern).is_err(),
+            "{pattern:?} was accepted"
+        );
+    }
+
+    /// A pattern with no `{ext}` strips every file's extension, which no other
+    /// program on the machine will forgive.
+    #[test]
+    fn a_filename_format_without_an_extension_token_is_always_refused(
+        pieces in prop::collection::vec(prop::sample::select(NAME_FRAGMENTS), 1..5),
+    ) {
+        let pattern = pieces.concat();
+        prop_assume!(!pattern.is_empty() && !pattern.starts_with('.'));
+        prop_assert!(
+            FilenameFormat::new(&pattern).is_err(),
+            "{pattern:?} has no {{ext}} and was accepted"
+        );
     }
 }
