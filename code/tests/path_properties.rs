@@ -119,6 +119,7 @@ fn date_source() -> impl Strategy<Value = DateSource> {
     prop::sample::select(
         &[
             DateSource::Exif,
+            DateSource::Sidecar,
             DateSource::Filesystem,
             DateSource::Unreadable,
             DateSource::Unsupported,
@@ -370,7 +371,7 @@ proptest! {
         ext in prop::sample::select(KNOWN_EXTENSIONS),
         stem in arbitrary_text(),
         gps in gps(),
-        source in date_source().prop_filter("refused only", |s| !s.is_embedded()),
+        source in date_source().prop_filter("refused only", |s| !s.is_recorded()),
     ) {
         let (dir, filename) = build_target_path(
             &dated_from(Some(dt), gps, source),

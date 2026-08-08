@@ -50,6 +50,7 @@
 )]
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -320,6 +321,29 @@ impl MediaTree {
         self.write(rel, &body)
     }
 
+    /// An XMP sidecar whose contents are actually read — a real RDF/XML packet
+    /// carrying the properties given, in the serialisation given.
+    ///
+    /// Distinct from [`Self::sidecar`], which writes arbitrary bytes because the
+    /// pairing rules do not care what is inside. They do not; the *date* does,
+    /// and once a sidecar can answer "when was this taken" its contents are an
+    /// input to where its parent lands rather than mere freight.
+    ///
+    /// `properties` are written verbatim as `("xmp:CreateDate", "2024-03-15…")`,
+    /// prefix included, so a test can write a value the parser is meant to
+    /// refuse, or bind a property under a prefix nothing declares. The four
+    /// customary namespaces are always declared; a property under any other
+    /// prefix is therefore deliberately unbound, which is itself a case worth
+    /// being able to build.
+    ///
+    /// The provenance marker rides in an XML comment rather than being appended,
+    /// so the packet stays well-formed — a fixture with trailing rubbish after
+    /// the root element would be testing the malformed path by accident in every
+    /// test that used it.
+    pub fn xmp(self, rel: &str, form: XmpForm, properties: &[(&str, &str)]) -> Self {
+        self.write(rel, xmp_packet(rel, form, properties).as_bytes())
+    }
+
     /// A byte-identical copy of a file already declared at `existing`.
     ///
     /// Being byte-identical, it necessarily carries the *same* marker as its
@@ -352,6 +376,60 @@ impl MediaTree {
             .unwrap_or_else(|e| panic!("writing fixture {}: {e}", path.display()));
         self
     }
+}
+
+/// Which RDF/XML serialisation an [`MediaTree::xmp`] fixture is written in.
+///
+/// Both are legal and both are in the wild — Adobe writes the first, darktable
+/// the second — so a reader that handles one and not the other passes every test
+/// written against whichever fixture came first and fails silently against half
+/// the libraries in the world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XmpForm {
+    /// `<rdf:Description xmp:CreateDate="…"/>`
+    Attribute,
+    /// `<rdf:Description><xmp:CreateDate>…</xmp:CreateDate></rdf:Description>`
+    Element,
+}
+
+/// Build the packet [`MediaTree::xmp`] writes.
+fn xmp_packet(rel: &str, form: XmpForm, properties: &[(&str, &str)]) -> String {
+    let body = match form {
+        XmpForm::Attribute => {
+            let attributes = properties
+                .iter()
+                .fold(String::new(), |mut out, (name, value)| {
+                    let _ = write!(out, "\n     {name}=\"{value}\"");
+                    out
+                });
+            format!("  <rdf:Description rdf:about=\"\"{attributes}/>")
+        }
+        XmpForm::Element => {
+            let elements = properties
+                .iter()
+                .fold(String::new(), |mut out, (name, value)| {
+                    let _ = write!(out, "\n    <{name}>{value}</{name}>");
+                    out
+                });
+            format!("  <rdf:Description rdf:about=\"\">{elements}\n  </rdf:Description>")
+        }
+    };
+
+    let marker = String::from_utf8_lossy(&marker_bytes(rel)).into_owned();
+    format!(
+        r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<!-- {marker} -->
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+          xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+          xmlns:exif="http://ns.adobe.com/exif/1.0/"
+          xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/">
+{body}
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>
+"#
+    )
 }
 
 /// Terse `NaiveDateTime` constructor for fixture declarations.

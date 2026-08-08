@@ -88,7 +88,7 @@ impl DatePolicy {
     pub fn admits(self, source: DateSource) -> bool {
         match self {
             Self::AnyDate => true,
-            Self::EmbeddedOnly => source.is_embedded(),
+            Self::EmbeddedOnly => source.is_recorded(),
         }
     }
 }
@@ -114,7 +114,13 @@ pub fn plan_move(
     sidecars: &SidecarIndex,
     known_hash: Option<String>,
 ) -> Result<PlannedMove> {
+    // Read once and used twice: the companions decide where the sidecars go
+    // after the move, and — for an `.xmp` — they may also decide the date the
+    // move is planned around in the first place.
+    let companions = sidecars.for_parent(&file.path);
+
     let meta = metadata::extract_metadata(&file.path, file.is_video, tz)?;
+    let meta = metadata::apply_sidecar_date(meta, companions, tz);
 
     // The stem is only read by the `{original_stem}` token, but it is derived
     // here for every file rather than inside the format: a file whose name is
@@ -137,7 +143,7 @@ pub fn plan_move(
         timezone_source: meta.timezone_source,
         has_location: meta.latitude.is_some() && meta.longitude.is_some(),
         known_hash,
-        sidecars: sidecars.for_parent(&file.path).to_vec(),
+        sidecars: companions.to_vec(),
     })
 }
 

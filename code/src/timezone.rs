@@ -42,6 +42,15 @@ pub enum TimezoneSource {
     /// This is the only variant that is evidence rather than inference.
     ExifOffsetTag,
 
+    /// An XMP sidecar beside the file stated the offset — see [`crate::xmp`].
+    ///
+    /// Evidence rather than inference, like [`Self::ExifOffsetTag`], and kept
+    /// apart from it because the two were written by different things in
+    /// different files. A run that reports `[tz:exif]` for an offset it read out
+    /// of a text file next to the photograph is telling a small lie about the
+    /// one thing this enum exists to be honest about.
+    SidecarOffset,
+
     /// Derived from the file's GPS coordinates.
     ///
     /// **Nothing produces this yet.** Mapping a latitude and longitude to a
@@ -71,6 +80,7 @@ impl TimezoneSource {
     pub fn tag(self) -> &'static str {
         match self {
             Self::ExifOffsetTag => "exif",
+            Self::SidecarOffset => "sidecar",
             Self::GpsDerived => "gps",
             Self::ConfiguredDefault => "config",
             Self::SystemLocal => "system",
@@ -82,6 +92,7 @@ impl TimezoneSource {
     pub fn describe(self) -> &'static str {
         match self {
             Self::ExifOffsetTag => "the file's own offset tag",
+            Self::SidecarOffset => "the offset in the file's XMP sidecar",
             Self::GpsDerived => "the file's GPS coordinates",
             Self::ConfiguredDefault => "the configured default_timezone",
             Self::SystemLocal => "this machine's timezone",
@@ -89,12 +100,16 @@ impl TimezoneSource {
         }
     }
 
-    /// Whether the file itself said which zone it was in.
+    /// Whether the offset was recorded rather than inferred.
     ///
     /// Everything else is the tool's inference, and a user auditing a run wants
-    /// that line drawn.
+    /// that line drawn. A sidecar's offset falls on the recorded side of it for
+    /// the same reason its date does — see [`crate::metadata::DateSource::is_recorded`].
     pub fn came_from_the_file(self) -> bool {
-        matches!(self, Self::ExifOffsetTag | Self::GpsDerived)
+        matches!(
+            self,
+            Self::ExifOffsetTag | Self::SidecarOffset | Self::GpsDerived
+        )
     }
 }
 

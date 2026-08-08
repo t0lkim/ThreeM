@@ -7,7 +7,9 @@ use chrono::{DateTime, Datelike, FixedOffset, NaiveDateTime, Utc};
 use nom_exif::{parse_exif, parse_metadata, EntryValue, Exif, ExifIter, ExifTag};
 use tracing::{debug, warn};
 
+use crate::sidecar::Sidecar;
 use crate::timezone::{attach_offset, TimezonePolicy, TimezoneSource};
+use crate::xmp;
 
 /// Extracted metadata from a media file
 ///
@@ -56,6 +58,16 @@ impl FileMetadata {
 pub enum DateSource {
     /// The file's own metadata said when it was made.
     Exif,
+    /// An XMP sidecar beside the file said when it was made.
+    ///
+    /// Consulted only when the file itself yielded nothing usable — see
+    /// [`apply_sidecar_date`]. It is grouped with [`Self::Exif`] by
+    /// [`Self::is_recorded`] and apart from it here, because those are two
+    /// different questions: *did somebody record this date, or did we infer it
+    /// from the filesystem* (they answer the same), and *where was it written*
+    /// (they do not). A person auditing a run wants the second, and a person
+    /// passing `--require-exif` wants the first.
+    Sidecar,
     /// A filesystem date, because the file's metadata records no date.
     ///
     /// The honest case: a scan, a screenshot, an export that stripped its
@@ -87,13 +99,27 @@ pub enum DateSource {
 }
 
 impl DateSource {
-    /// Whether the date came from the file's own metadata.
+    /// Whether somebody recorded this date, as opposed to the tool inferring it.
     ///
     /// The question `--require-exif` asks, in one place, so that a variant added
     /// later cannot answer it two different ways in two different modules.
+    ///
+    /// **A sidecar date counts.** The flag is named after EXIF, but what it is
+    /// *for* is stated in its own help text and in [`Self::is_filesystem`]: a
+    /// filesystem timestamp on a library that has been copied between disks is
+    /// the date of the copy, and somebody passing this flag is refusing to file
+    /// photographs under it. An `xmp:CreateDate` is not that. It is a date a
+    /// camera or an editor wrote down about the photograph — usually a verbatim
+    /// copy of the EXIF tag, relocated because the RAW file it describes must
+    /// never be written into.
+    ///
+    /// Excluding it would also defeat the flag for the people most likely to
+    /// reach for it. `nom-exif` reads no TIFF-based RAW at all, so a CR2 library
+    /// under `--require-exif` would send every frame to `unsorted/` while the
+    /// date sat in the `.xmp` beside it.
     #[must_use]
-    pub fn is_embedded(self) -> bool {
-        matches!(self, Self::Exif)
+    pub fn is_recorded(self) -> bool {
+        matches!(self, Self::Exif | Self::Sidecar)
     }
 
     /// Whether the date came from the filesystem — for any of the three reasons.
@@ -208,6 +234,94 @@ pub fn extract_metadata(path: &Path, is_video: bool, tz: &TimezonePolicy) -> Res
     };
 
     extract_filesystem_metadata(path, tz, fallback_source(path, reason))
+}
+
+/// Take the date from an XMP sidecar, when the file itself had none worth
+/// having.
+///
+/// Applied after [`extract_metadata`] rather than inside it, because the two
+/// answer to different things: extraction is a question about one file, and this
+/// is a question about a file's *neighbours*, which only the caller holding the
+/// [`crate::sidecar::SidecarIndex`] can answer.
+///
+/// # What it will not overwrite
+///
+/// A date the media file itself recorded. The file is the primary witness; a
+/// sidecar is a note somebody wrote beside it, and an editor that rewrites
+/// `xmp:CreateDate` on export would otherwise silently re-file a photograph
+/// under the date it was edited. Everything else — a filesystem timestamp, an
+/// unreadable EXIF block, an unsupported container, no date at all — is
+/// something this can only improve on.
+///
+/// # Which sidecar
+///
+/// Only `.xmp` ones. An Apple `.aae` is a binary property list of edit
+/// adjustments and a `.thm` is a thumbnail; neither records a capture time this
+/// reads, and asking an XML parser to read them would produce nothing but log
+/// noise. Where a file has more than one `.xmp` — which the index permits — the
+/// first that yields a date wins, and the index has already sorted them by path
+/// so that choice is the same on every machine.
+///
+/// GPS coordinates are *not* read from the sidecar, even though XMP can carry
+/// them. A file whose date came from a sidecar keeps whatever coordinates the
+/// extraction stage found, and no more: reading them would change the filenames
+/// a `{city}` layout produces, which is a separate change owing a separate
+/// changelog entry.
+#[must_use]
+pub fn apply_sidecar_date(
+    meta: FileMetadata,
+    sidecars: &[Sidecar],
+    tz: &TimezonePolicy,
+) -> FileMetadata {
+    if meta.date_source.is_recorded() {
+        return meta;
+    }
+
+    let found = sidecars
+        .iter()
+        .filter(|sidecar| is_xmp(&sidecar.path))
+        .find_map(|sidecar| xmp::read_date(&sidecar.path).map(|date| (&sidecar.path, date)));
+
+    let Some((path, found)) = found else {
+        return meta;
+    };
+
+    // An offset the sidecar stated is believed, exactly as an EXIF
+    // `OffsetTimeOriginal` is — it is the file's own testimony rather than our
+    // inference. Without one the reading stays a bare wall clock and goes
+    // through the run's resolution order, which is the same treatment a naive
+    // `DateTimeOriginal` gets and for the same reason.
+    let (date, timezone_source) = match found.offset {
+        Some(offset) => (
+            attach_offset(found.naive, offset),
+            TimezoneSource::SidecarOffset,
+        ),
+        None => Reading::WallClock(found.naive).resolve(tz),
+    };
+
+    debug!(
+        sidecar = %path.display(),
+        property = found.property.name(),
+        local = %date.naive_local(),
+        timezone = timezone_source.tag(),
+        "took a file's date from its XMP sidecar"
+    );
+
+    FileMetadata {
+        date: Some(date),
+        timezone_source: Some(timezone_source),
+        date_source: DateSource::Sidecar,
+        ..meta
+    }
+}
+
+/// Whether a path names an XMP sidecar.
+///
+/// Case-insensitive, like the pairing in [`crate::sidecar`]: the same file is
+/// `IMG_1234.xmp` on one volume and `IMG_1234.XMP` on another.
+fn is_xmp(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xmp"))
 }
 
 /// Why a file is falling back to its filesystem timestamp.
@@ -595,7 +709,12 @@ fn entry_to_offset(value: &EntryValue) -> Option<FixedOffset> {
 }
 
 /// Parse the date strings a media file may carry, and any offset in them.
-fn parse_wall_clock(s: &str) -> Option<(NaiveDateTime, Option<FixedOffset>)> {
+///
+/// Visible to the crate because [`crate::xmp`] meets the same spellings: an
+/// `exif:DateTimeOriginal` relocated into a sidecar is sometimes relocated
+/// verbatim, EXIF colons and all, and a second copy of this list would be a
+/// second place to fix when a camera turns up writing a fourth spelling.
+pub(crate) fn parse_wall_clock(s: &str) -> Option<(NaiveDateTime, Option<FixedOffset>)> {
     // EXIF standard: "YYYY:MM:DD HH:MM:SS"
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y:%m:%d %H:%M:%S") {
         return Some((dt, None));

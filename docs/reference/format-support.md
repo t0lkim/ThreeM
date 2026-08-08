@@ -111,10 +111,16 @@ order.
 - **`TimezoneSource::GpsDerived` is declared and never produced.** Turning
   coordinates into a zone needs a boundary database; a place-name lookup is not
   one.
-- **RAW dates are not read at all**, per the table above. A second parser would
-  be needed. Until then, `--require-exif` is the conservative posture for a RAW
-  library: every row marked *filesystem only* goes to `unsorted/` under its own
-  filename rather than being filed under a modification time.
+- **RAW dates are not read out of the RAW itself**, per the table above. A second
+  parser would be needed. What *is* read is the `.xmp` sidecar beside it: a file
+  with no usable embedded date takes `exif:DateTimeOriginal`,
+  `photoshop:DateCreated` or `xmp:CreateDate` from its sidecar and is tagged
+  `[SIDECAR]` — which for a darktable or Lightroom library covers the whole of
+  the gap, since a RAW file must never be written into and so always has one.
+  `--require-exif` admits a sidecar date for that reason, and remains the
+  conservative posture for a RAW library without sidecars: every row marked
+  *filesystem only* goes to `unsorted/` under its own filename rather than being
+  filed under a modification time.
 
 ## Verifying this page
 

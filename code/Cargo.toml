@@ -33,6 +33,13 @@ globset = "0.4"
 # no setting. Default features off: the tz database is all that is wanted, not
 # the build-time regeneration machinery.
 chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
+# XMP sidecars, which are RDF/XML. A pull parser rather than an RDF stack: the
+# whole of what this reads is three date properties out of one description, and
+# an RDF library would bring a graph model, a triple store and a resolver to
+# answer a question a streaming reader answers in one pass. Default features
+# only — no serde, no encoding detection; an XMP packet is XML and declares
+# itself UTF-8.
+quick-xml = "0.41"
 
 [dev-dependencies]
 assert_cmd = "2"

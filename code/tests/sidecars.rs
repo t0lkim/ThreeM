@@ -53,7 +53,7 @@ use std::path::Path;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-use common::{file_contents_by_marker, journals_in, naive, snapshot_tree, MediaTree};
+use common::{file_contents_by_marker, journals_in, naive, snapshot_tree, MediaTree, XmpForm};
 use mmm::journal::{IntentKind, JournalEntry};
 use mmm::reporter::{
     ORPHAN_SIDECAR_HEADING, SIDECARS_FOUND_LABEL, SIDECARS_MOVED_LABEL, SIDECAR_ORPHANS_LABEL,
@@ -650,5 +650,330 @@ fn no_sidecars_false_overrides_a_config_that_switched_them_off() {
     assert!(
         landed.contains_key("IMG_1234.xmp"),
         "the flag must outrank the file: {landed:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A sidecar as a witness, not just a passenger
+// ---------------------------------------------------------------------------
+//
+// Everything above is about a sidecar arriving where its parent did. These are
+// about a sidecar deciding where its parent goes.
+//
+// The fixture throughout is a TIFF-based RAW, and that is the point rather than
+// a convenience. `nom-exif` recognises four containers and no RAW is one of
+// them (`docs/reference/format-support.md`), so a `.cr2` has *never* had a
+// readable date in this tool — the whole family files under filesystem
+// timestamps. It is also the family that always has an `.xmp` beside it, because
+// a RAW file must never be written into. So this is not an edge case bolted on
+// to the date logic; it is the only route by which the largest family of files
+// the scanner claims to handle can be filed under the date it was taken.
+//
+// `code/src/xmp.rs` unit-tests the parsing itself — both serialisations, the
+// namespace rules, every date spelling, the malformed cases. None of that
+// establishes that the index reaches the planner, that the date it yields
+// survives into a destination path, or that `--require-exif` treats it as
+// recorded. Only a run through `main` crosses those.
+
+/// The headline case: a RAW whose container this tool cannot read, filed under
+/// the date sitting in the text file beside it.
+#[test]
+fn a_raw_takes_its_date_from_the_xmp_beside_it() {
+    let tree = MediaTree::new()
+        .tiff_raw(
+            "IMG_1234.cr2",
+            Some(b"CR\x02\x00"),
+            naive(2024, 3, 15, 14, 30, 0),
+            Some("+00:00"),
+            None,
+        )
+        .xmp(
+            "IMG_1234.xmp",
+            XmpForm::Attribute,
+            &[("xmp:CreateDate", "2019-07-04T23:30:00+08:00")],
+        );
+
+    let stdout = preview(tree.path(), &[]);
+    assert!(
+        stdout.contains("[SIDECAR]"),
+        "the listing must say the date came from the sidecar; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[tz:sidecar]"),
+        "and must not report an offset read from a text file as the file's own EXIF tag; \
+         got:\n{stdout}"
+    );
+
+    let run = organise(tree.path(), &[]);
+    let parent = run.at("IMG_1234.cr2");
+
+    assert_eq!(
+        dir_of(parent),
+        "2019-07-04",
+        "the RAW must be filed under the sidecar's date, not the filesystem's; got {parent}"
+    );
+    assert_eq!(
+        parent, "2019-07-04/2019-07-04-233000.cr2",
+        "and named after the sidecar's wall clock — 23:30 stays 23:30, as it does for EXIF"
+    );
+    // The sidecar is still a passenger as well as a witness.
+    assert_eq!(stem_of(run.at("IMG_1234.xmp")), stem_of(parent));
+    assert!(
+        run.stdout.contains("Date from XMP sidecar: 1"),
+        "the summary must count it apart from EXIF; got:\n{}",
+        run.stdout
+    );
+}
+
+/// The other serialisation, end to end. darktable writes this one, and it is
+/// darktable's users who have the RAW libraries this feature is for.
+#[test]
+fn the_element_serialisation_dates_a_file_too() {
+    let tree = MediaTree::new()
+        .tiff_raw(
+            "IMG_1234.cr2",
+            None,
+            naive(2024, 3, 15, 14, 30, 0),
+            Some("+00:00"),
+            None,
+        )
+        .xmp(
+            "IMG_1234.cr2.xmp",
+            XmpForm::Element,
+            &[("exif:DateTimeOriginal", "2019-07-04T23:30:00+08:00")],
+        );
+
+    let run = organise(tree.path(), &[]);
+
+    assert_eq!(
+        run.at("IMG_1234.cr2"),
+        "2019-07-04/2019-07-04-233000.cr2",
+        "an element-form date must file the same as an attribute-form one"
+    );
+    assert_eq!(
+        run.at("IMG_1234.cr2.xmp"),
+        "2019-07-04/2019-07-04-233000.cr2.xmp",
+        "and the darktable naming convention still travels intact"
+    );
+}
+
+/// A malformed sidecar is a warning and a skip. The run finishes, the
+/// photograph is filed under the date it does have, and the sidecar still
+/// travels — losing the file because we could not read it would be worse than
+/// never having read it.
+#[test]
+fn a_malformed_sidecar_does_not_stop_the_run() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("IMG_1234.jpg", naive(2024, 3, 15, 14, 30, 0), None)
+        .tiff_raw(
+            "IMG_5678.cr2",
+            None,
+            naive(2024, 3, 15, 14, 30, 0),
+            Some("+00:00"),
+            None,
+        )
+        .sidecar(
+            "IMG_5678.xmp",
+            b"<x:xmpmeta><rdf:RDF><rdf:Description xmp:CreateDate=\"2019-",
+        );
+
+    let run = organise(tree.path(), &[]);
+
+    assert_eq!(
+        run.at("IMG_1234.jpg"),
+        "2024-03-15/2024-03-15-143000.jpg",
+        "the rest of the run must be untouched by one unreadable text file"
+    );
+    assert_eq!(
+        stem_of(run.at("IMG_5678.xmp")),
+        stem_of(run.at("IMG_5678.cr2")),
+        "the sidecar we could not read still belongs to its parent and still travels"
+    );
+    assert!(
+        run.stdout.contains("Date from XMP sidecar: 0"),
+        "nothing was dated from a sidecar; got:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("format not supported: 1"),
+        "the RAW must still report why it took a filesystem date; got:\n{}",
+        run.stdout
+    );
+}
+
+/// The file is the primary witness. An editor that rewrites `xmp:CreateDate` on
+/// export would otherwise silently re-file a photograph under the date somebody
+/// edited it.
+#[test]
+fn a_date_the_photograph_recorded_is_not_overridden_by_its_sidecar() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("IMG_1234.jpg", naive(2024, 3, 15, 14, 30, 0), None)
+        .xmp(
+            "IMG_1234.xmp",
+            XmpForm::Attribute,
+            &[("xmp:CreateDate", "2019-07-04T23:30:00+00:00")],
+        );
+
+    let run = organise(tree.path(), &[]);
+
+    assert_eq!(
+        run.at("IMG_1234.jpg"),
+        "2024-03-15/2024-03-15-143000.jpg",
+        "the JPEG's own EXIF must win over the sidecar's date"
+    );
+    assert!(
+        run.stdout.contains("Date from XMP sidecar: 0"),
+        "and the run must not claim to have used the sidecar; got:\n{}",
+        run.stdout
+    );
+}
+
+/// `--require-exif` admits a sidecar date, and this is the decision worth
+/// pinning: the flag refuses *filesystem timestamps*, and an `xmp:CreateDate` is
+/// not one. Excluding it would send an entire RAW library to `unsorted/` while
+/// the date sat in the file beside every frame — defeating the flag for exactly
+/// the people most likely to reach for it.
+#[test]
+fn require_exif_admits_a_sidecar_date_and_still_refuses_a_filesystem_one() {
+    let tree = MediaTree::new()
+        .tiff_raw(
+            "IMG_1234.cr2",
+            None,
+            naive(2024, 3, 15, 14, 30, 0),
+            Some("+00:00"),
+            None,
+        )
+        .xmp(
+            "IMG_1234.xmp",
+            XmpForm::Attribute,
+            &[("xmp:CreateDate", "2019-07-04T23:30:00+08:00")],
+        )
+        .tiff_raw(
+            "IMG_5678.cr2",
+            None,
+            naive(2024, 3, 15, 14, 30, 0),
+            Some("+00:00"),
+            None,
+        );
+
+    let run = organise(tree.path(), &["--require-exif"]);
+
+    assert_eq!(
+        run.at("IMG_1234.cr2"),
+        "2019-07-04/2019-07-04-233000.cr2",
+        "a sidecar-dated file is a recorded date, and --require-exif must admit it"
+    );
+    assert_eq!(
+        dir_of(run.at("IMG_5678.cr2")),
+        "unsorted",
+        "and the one with no sidecar still has only a filesystem date, which it refuses"
+    );
+}
+
+/// `--no-sidecars` switches off the whole of it, dates included. The flag is
+/// implemented by handing the scan an empty sidecar list, so there is no stage
+/// at which a sidecar exists to be read — and this is what proves that the date
+/// path did not quietly acquire its own route to the file.
+#[test]
+fn no_sidecars_switches_off_the_date_as_well_as_the_move() {
+    let tree = MediaTree::new()
+        .tiff_raw(
+            "IMG_1234.cr2",
+            None,
+            naive(2024, 3, 15, 14, 30, 0),
+            Some("+00:00"),
+            None,
+        )
+        .xmp(
+            "IMG_1234.xmp",
+            XmpForm::Attribute,
+            &[("xmp:CreateDate", "2019-07-04T23:30:00+08:00")],
+        );
+
+    let run = organise(tree.path(), &["--no-sidecars"]);
+
+    assert_ne!(
+        dir_of(run.at("IMG_1234.cr2")),
+        "2019-07-04",
+        "a run told not to look at sidecars must not read a date out of one"
+    );
+    assert_eq!(
+        snapshot_tree(tree.path()),
+        ["IMG_1234.xmp"],
+        "and the sidecar stays exactly where it was"
+    );
+}
+
+/// A `.aae` and a `.thm` are sidecars for moving, not for reading. An Apple
+/// `.aae` is a binary property list and a `.thm` is a thumbnail; putting an XML
+/// parser on either would produce nothing but log noise, and a `.thm` that
+/// happened to parse would be reporting its *own* metadata as its parent's.
+#[test]
+fn only_an_xmp_is_read_for_a_date() {
+    let tree = MediaTree::new()
+        .tiff_raw(
+            "IMG_1234.cr2",
+            None,
+            naive(2024, 3, 15, 14, 30, 0),
+            Some("+00:00"),
+            None,
+        )
+        // The same packet an .xmp would be believed for, under the wrong
+        // extension. If the extension were not the gate, this would file the
+        // RAW under 2019.
+        .xmp(
+            "IMG_1234.aae",
+            XmpForm::Attribute,
+            &[("xmp:CreateDate", "2019-07-04T23:30:00+08:00")],
+        );
+
+    let run = organise(tree.path(), &[]);
+
+    assert_ne!(
+        dir_of(run.at("IMG_1234.cr2")),
+        "2019-07-04",
+        "only a .xmp is read for a date"
+    );
+    // It still travels, which is the half that is not being switched off.
+    assert_eq!(
+        stem_of(run.at("IMG_1234.aae")),
+        stem_of(run.at("IMG_1234.cr2"))
+    );
+}
+
+/// A sidecar date with no offset is a bare wall clock, and goes through the
+/// run's resolution order exactly as a naive EXIF `DateTimeOriginal` does.
+///
+/// Both halves matter. The wall clock must survive untouched — 23:30 files
+/// under the 4th, not the 5th, which is the defect this whole phase exists to
+/// fix — and the run must say `config` rather than `sidecar`, because nothing in
+/// the sidecar said which zone it was.
+#[test]
+fn a_sidecar_date_with_no_offset_resolves_through_the_run_policy() {
+    let tree = MediaTree::new()
+        .tiff_raw(
+            "IMG_1234.cr2",
+            None,
+            naive(2024, 3, 15, 14, 30, 0),
+            Some("+00:00"),
+            None,
+        )
+        .xmp(
+            "IMG_1234.xmp",
+            XmpForm::Attribute,
+            &[("xmp:CreateDate", "2019-07-04T23:30:00")],
+        );
+
+    let stdout = preview(tree.path(), &["--timezone", "+08:00"]);
+    assert!(
+        stdout.contains("[tz:config]"),
+        "an offset nothing stated must be reported as the run's own choice; got:\n{stdout}"
+    );
+
+    let run = organise(tree.path(), &["--timezone", "+08:00"]);
+    assert_eq!(
+        run.at("IMG_1234.cr2"),
+        "2019-07-04/2019-07-04-233000.cr2",
+        "attaching an offset must not move the wall clock, here as everywhere else"
     );
 }

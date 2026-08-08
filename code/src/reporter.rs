@@ -153,12 +153,13 @@ fn orphan_reason(orphan: &Orphan) -> &'static str {
 
 /// The marker beside a planned move saying where its date came from.
 ///
-/// Three of the four say "the filesystem" and differ only in why, which is the
+/// Three of the five say "the filesystem" and differ only in why, which is the
 /// whole point: they are indistinguishable in the output tree, so the listing is
 /// the only place the difference can be seen.
 fn date_source_tag(source: DateSource) -> &'static str {
     match source {
         DateSource::Exif => "[EXIF]",
+        DateSource::Sidecar => "[SIDECAR]",
         DateSource::Filesystem => "[FS]",
         DateSource::Unreadable => "[FS: UNREADABLE]",
         DateSource::Unsupported => "[FS: UNSUPPORTED]",
@@ -188,6 +189,14 @@ pub struct FallbackWarning(pub u8);
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DateSourceTally {
     pub exif: usize,
+    /// Files dated from an XMP sidecar rather than from their own metadata.
+    ///
+    /// Counted apart from `exif` even though [`DateSource::is_recorded`] groups
+    /// the two: for a RAW library this figure is the difference between a run
+    /// that read the dates and one that read the disk, and burying it inside the
+    /// EXIF count would hide the single most useful thing the summary can say
+    /// about such a library.
+    pub sidecar: usize,
     pub filesystem: usize,
     pub unreadable: usize,
     pub unsupported: usize,
@@ -202,6 +211,7 @@ impl DateSourceTally {
         for planned in moves {
             match planned.date_source {
                 DateSource::Exif => tally.exif += 1,
+                DateSource::Sidecar => tally.sidecar += 1,
                 DateSource::Filesystem => tally.filesystem += 1,
                 DateSource::Unreadable => tally.unreadable += 1,
                 DateSource::Unsupported => tally.unsupported += 1,
@@ -224,7 +234,7 @@ impl DateSourceTally {
     /// run already saying so.
     #[must_use]
     pub fn dated(self) -> usize {
-        self.exif + self.from_filesystem()
+        self.exif + self.sidecar + self.from_filesystem()
     }
 
     /// Whether the filesystem share is above `warn_above`.
@@ -257,6 +267,7 @@ impl DateSourceTally {
     /// occur or was not looked for.
     fn print(self, warn_above: FallbackWarning) {
         println!("  Date from EXIF: {}", self.exif);
+        println!("  Date from XMP sidecar: {}", self.sidecar);
         println!("  Date from filesystem: {}", self.filesystem);
         // Counted apart from the line above rather than folded into it: all
         // three dates come from the filesystem, but only these two are the tool
@@ -324,7 +335,11 @@ struct TimezoneTally {
 impl TimezoneTally {
     fn count(&mut self, source: Option<TimezoneSource>) {
         match source {
-            Some(TimezoneSource::ExifOffsetTag | TimezoneSource::GpsDerived) => {
+            Some(
+                TimezoneSource::ExifOffsetTag
+                | TimezoneSource::SidecarOffset
+                | TimezoneSource::GpsDerived,
+            ) => {
                 self.from_the_file += 1;
             }
             Some(TimezoneSource::ConfiguredDefault) => self.configured += 1,

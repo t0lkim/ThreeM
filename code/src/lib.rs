@@ -29,3 +29,4 @@ pub mod settings_report;
 pub mod sidecar;
 pub mod timezone;
 pub mod undo;
+pub mod xmp;
