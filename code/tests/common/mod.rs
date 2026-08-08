@@ -6,7 +6,7 @@
 //! real files, so the inputs have to be reproducible on any machine, in CI,
 //! offline, forever.
 //!
-//! Three pieces:
+//! Four pieces:
 //!
 //! * [`MediaTree`] — a fluent builder over a [`TempDir`] that declares a
 //!   media tree file by file.
@@ -14,6 +14,13 @@
 //!   carrying a hand-built EXIF APP1 segment (TIFF header, IFD0, Exif
 //!   `SubIFD` with `DateTimeOriginal` and an optional `OffsetTimeOriginal`,
 //!   optional GPS IFD).
+//! * Synthesisers for the other three container families the scanner claims:
+//!   [`MediaTree::heif`] (ISO-BMFF `ftyp` + `meta` with an `Exif` item),
+//!   [`MediaTree::tiff_raw`] (the TIFF/IFD structure DNG, NEF, ARW and CR2
+//!   share) and [`MediaTree::iso_video`] (`moov/mvhd` plus the Apple
+//!   `com.apple.quicktime.*` keys). All three reuse the same
+//!   [`build_tiff`]/EXIF machinery as the JPEG, so a datetime written into any
+//!   of them is written the same way.
 //! * [`snapshot_tree`] / [`file_contents_by_marker`] — golden-tree
 //!   assertion helpers.
 //!
@@ -150,6 +157,105 @@ impl MediaTree {
             }),
             rel,
         );
+        self.write(rel, &bytes)
+    }
+
+    /// A minimal ISO-BMFF still image — `ftyp`, a `meta` box declaring an
+    /// `Exif` item, and the EXIF payload itself in an `mdat`.
+    ///
+    /// `brand` is the `ftyp` major brand, and it is the whole reason this takes
+    /// a parameter rather than hard-coding one: `heic` and `mif1` are the two
+    /// spellings a real HEIC file uses, `avif` is the same container carrying a
+    /// different codec, and which of them a parser accepts is exactly the
+    /// question the format-coverage suite is asking. See
+    /// [`Self::heic_with_exif`] for the ordinary case.
+    ///
+    /// The EXIF block is byte-for-byte the one [`Self::jpeg_with_offset`]
+    /// writes — same TIFF builder, same tags — so a difference in what the tool
+    /// extracts is a difference in *container* handling and nothing else.
+    pub fn heif(
+        self,
+        rel: &str,
+        brand: [u8; 4],
+        datetime: NaiveDateTime,
+        offset: Option<&str>,
+        gps: Option<(f64, f64)>,
+    ) -> Self {
+        let bytes = synth_heif(
+            brand,
+            &ExifSpec {
+                datetime,
+                offset,
+                gps,
+            },
+            rel,
+        );
+        self.write(rel, &bytes)
+    }
+
+    /// A HEIC carrying `DateTimeOriginal` and an `OffsetTimeOriginal` of
+    /// `+00:00` — the [`Self::jpeg_with_exif`] of the HEIF family.
+    pub fn heic_with_exif(
+        self,
+        rel: &str,
+        datetime: NaiveDateTime,
+        gps: Option<(f64, f64)>,
+    ) -> Self {
+        self.heif(rel, *b"heic", datetime, Some("+00:00"), gps)
+    }
+
+    /// A minimal TIFF-based RAW: a bare TIFF/IFD structure with an Exif
+    /// `SubIFD`, which is what DNG, NEF, ARW, RW2 and friends all are.
+    ///
+    /// `signature` is the four bytes some vendors plant at offset 8, before
+    /// IFD0 — Canon's CR2 writes `CR\x02\x00` there. Passing `None` gives the
+    /// plain TIFF layout (DNG, NEF, ARW); passing `Some` covers the vendor
+    /// variants without a second builder, because underneath the signature they
+    /// are the same file.
+    pub fn tiff_raw(
+        self,
+        rel: &str,
+        signature: Option<&[u8; 4]>,
+        datetime: NaiveDateTime,
+        offset: Option<&str>,
+        gps: Option<(f64, f64)>,
+    ) -> Self {
+        let tiff = build_tiff(
+            &ExifSpec {
+                datetime,
+                offset,
+                gps,
+            },
+            signature,
+        );
+        // Trailing bytes after the last IFD are ignored by any TIFF reader —
+        // the IFD chain says where everything is — so the marker rides along
+        // without disturbing the structure.
+        let bytes = with_marker(&tiff, rel);
+        self.write(rel, &bytes)
+    }
+
+    /// A minimal ISO-BMFF video — `ftyp`, then a `moov` holding `mvhd` and, if
+    /// the spec asks for them, the Apple `moov/meta/keys`+`ilst` pairs.
+    ///
+    /// See [`VideoSpec`] for what the two date sources mean and why a fixture
+    /// can carry both at once.
+    pub fn iso_video(self, rel: &str, spec: &VideoSpec<'_>) -> Self {
+        let bytes = synth_iso_video(spec, rel);
+        self.write(rel, &bytes)
+    }
+
+    /// A byte-valid JPEG carrying no EXIF at all — a scan, a screenshot, an
+    /// export that stripped its metadata.
+    ///
+    /// The counterpart to [`Self::jpeg_raw`], and the pair is what separates the
+    /// two ways a file can end up dated from the filesystem. This one *is* a
+    /// JPEG: the container reads, and there is simply nothing in it to read.
+    /// `jpeg_raw` is not a container the tool knows at all. They land in the
+    /// same directory and the run reports them differently, so a fixture for
+    /// each is the only way to hold that distinction still.
+    pub fn jpeg_without_exif(self, rel: &str) -> Self {
+        let bytes = synth_jpeg(None, rel);
         self.write(rel, &bytes)
     }
 
@@ -482,7 +588,7 @@ fn synth_jpeg(exif: Option<ExifSpec<'_>>, marker: &str) -> Vec<u8> {
     let mut jpeg: Vec<u8> = vec![0xFF, 0xD8]; // SOI
 
     if let Some(spec) = exif {
-        let tiff = build_tiff(&spec);
+        let tiff = build_tiff(&spec, None);
         let payload_len = 6 + tiff.len(); // "Exif\0\0" + TIFF block
         let seg_len = u16::try_from(payload_len + 2).expect("EXIF segment fits in a JPEG marker");
         jpeg.extend_from_slice(&[0xFF, 0xE1]);
@@ -543,11 +649,23 @@ const TY_UNDEFINED: u16 = 7;
 
 /// Build the TIFF block that sits inside the `APP1` segment, little-endian.
 ///
-/// Layout: TIFF header, IFD0 (pointers only), Exif `SubIFD`, optional GPS IFD,
-/// then a data area holding the values too large to sit inline in a 4-byte
-/// field. Pointer fields are written as zero and patched once their target
-/// offset is known — hand-computing them is where these things go wrong.
-fn build_tiff(spec: &ExifSpec<'_>) -> Vec<u8> {
+/// Layout: TIFF header, optional vendor signature, IFD0 (pointers only), Exif
+/// `SubIFD`, optional GPS IFD, then a data area holding the values too large to
+/// sit inline in a 4-byte field. Pointer fields are written as zero and patched
+/// once their target offset is known — hand-computing them is where these
+/// things go wrong.
+///
+/// Every offset in a TIFF block is measured from the start of that block, and
+/// `t` starts at the TIFF header, so a byte index into `t` *is* the offset to
+/// write. That is what makes the signature below a one-line change rather than
+/// an arithmetic rewrite: inserting four bytes moves every structure along, and
+/// every pointer to them is computed after the move.
+///
+/// The same block serves a JPEG `APP1` segment, a HEIF `Exif` item and a
+/// standalone RAW file, because in all three the payload is this and nothing
+/// else. `signature` is the only thing a standalone RAW adds — see
+/// [`MediaTree::tiff_raw`].
+fn build_tiff(spec: &ExifSpec<'_>, signature: Option<&[u8; 4]>) -> Vec<u8> {
     let ExifSpec {
         datetime,
         offset,
@@ -555,10 +673,14 @@ fn build_tiff(spec: &ExifSpec<'_>) -> Vec<u8> {
     } = *spec;
     let mut t: Vec<u8> = Vec::new();
 
-    // --- TIFF header: little-endian, magic 42, IFD0 at offset 8 ---
+    // --- TIFF header: little-endian, magic 42, then IFD0 ---
     t.extend_from_slice(b"II");
     t.extend_from_slice(&0x002Au16.to_le_bytes());
-    t.extend_from_slice(&8u32.to_le_bytes());
+    let ifd0_off: u32 = if signature.is_some() { 12 } else { 8 };
+    t.extend_from_slice(&ifd0_off.to_le_bytes());
+    if let Some(signature) = signature {
+        t.extend_from_slice(signature);
+    }
 
     // --- IFD0: nothing but pointers into the sub-IFDs ---
     let ifd0_entries: u16 = if gps.is_some() { 2 } else { 1 };
@@ -696,6 +818,261 @@ fn dms_rationals(decimal: f64) -> [u8; 24] {
         slot[4..].copy_from_slice(&den.to_le_bytes());
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// ISO base media file format — HEIF/HEIC stills and MP4/MOV videos
+// ---------------------------------------------------------------------------
+//
+// Both families are the same container: a flat sequence of boxes, each
+// `[u32 size][4-byte type][body]`, where `size` counts the header. A "full
+// box" adds a version byte and three flag bytes at the front of its body. The
+// helpers below are that and nothing more; the shapes assembled from them are
+// the *minimum* each parser will accept, which is the point — a fixture with a
+// real encoder's worth of boxes in it would not tell you which box mattered.
+
+/// `[u32 size][type][body]`.
+fn bmff_box(box_type: [u8; 4], body: &[u8]) -> Vec<u8> {
+    let size = u32::try_from(body.len() + 8).expect("a fixture box fits in 32 bits");
+    let mut out = Vec::with_capacity(body.len() + 8);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(&box_type);
+    out.extend_from_slice(body);
+    out
+}
+
+/// The same, with the version-and-flags word every "full box" carries.
+///
+/// Flags are always zero here; nothing the fixtures build uses them.
+fn bmff_full_box(box_type: [u8; 4], version: u8, body: &[u8]) -> Vec<u8> {
+    let mut with_header = Vec::with_capacity(body.len() + 4);
+    with_header.push(version);
+    with_header.extend_from_slice(&[0, 0, 0]); // flags
+    with_header.extend_from_slice(body);
+    bmff_box(box_type, &with_header)
+}
+
+/// Byte offset of a full box's body from the start of that box.
+const FULL_BOX_BODY: usize = 12;
+
+/// The `ftyp` box that opens the file and says what it is.
+fn bmff_ftyp(major: [u8; 4], compatible: &[[u8; 4]]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + 4 * compatible.len());
+    body.extend_from_slice(&major);
+    body.extend_from_slice(&0u32.to_be_bytes()); // minor version
+    for brand in compatible {
+        body.extend_from_slice(brand);
+    }
+    bmff_box(*b"ftyp", &body)
+}
+
+/// Assemble a minimal HEIF/HEIC still carrying `spec` as its `Exif` item.
+///
+/// Shape: `ftyp`, `meta` (holding `iinf` and `iloc`), `free` (the provenance
+/// marker), `mdat` (the EXIF payload).
+///
+/// The indirection is what makes HEIF different from JPEG and worth its own
+/// fixture: a JPEG's EXIF sits in a segment you meet by reading forwards, while
+/// a HEIF's sits wherever `iloc` says, addressed by an absolute file offset that
+/// is only knowable once every preceding box has been laid down. That offset is
+/// written as zero and patched at the end, for the same reason the TIFF pointers
+/// are.
+fn synth_heif(brand: [u8; 4], spec: &ExifSpec<'_>, marker: &str) -> Vec<u8> {
+    /// Arbitrary; the item id only has to agree between `iinf` and `iloc`.
+    const EXIF_ITEM_ID: u16 = 1;
+
+    // The payload an `Exif` item holds: a 4-byte offset to the TIFF header,
+    // then the same `Exif\0\0` + TIFF block a JPEG `APP1` segment carries.
+    let tiff = build_tiff(spec, None);
+    let mut item = Vec::with_capacity(tiff.len() + 10);
+    item.extend_from_slice(&6u32.to_be_bytes());
+    item.extend_from_slice(b"Exif\0\0");
+    item.extend_from_slice(&tiff);
+
+    // `iinf` — one entry, declaring item 1 to be of type `Exif`. Version 2 is
+    // the one that carries a four-character item type; earlier versions are
+    // matched on the item *name* instead.
+    let mut infe_body = Vec::new();
+    infe_body.extend_from_slice(&EXIF_ITEM_ID.to_be_bytes());
+    infe_body.extend_from_slice(&0u16.to_be_bytes()); // protection index
+    infe_body.extend_from_slice(b"Exif"); // item type
+    infe_body.extend_from_slice(b"Exif\0"); // item name, NUL-terminated
+    let infe = bmff_full_box(*b"infe", 2, &infe_body);
+
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&1u16.to_be_bytes()); // entry count
+    iinf_body.extend_from_slice(&infe);
+    let iinf = bmff_full_box(*b"iinf", 0, &iinf_body);
+
+    // `iloc` — where item 1 lives. Version 0 with 4-byte offsets and lengths,
+    // no base offset and no extent index: the plainest shape there is, so a
+    // failure to read it is a failure to read `iloc` at all.
+    let mut iloc_body = Vec::new();
+    iloc_body.push(0x44); // offset_size 4, length_size 4
+    iloc_body.push(0x00); // base_offset_size 0, index_size 0
+    iloc_body.extend_from_slice(&1u16.to_be_bytes()); // item count
+    iloc_body.extend_from_slice(&EXIF_ITEM_ID.to_be_bytes());
+    iloc_body.extend_from_slice(&0u16.to_be_bytes()); // data reference index
+    iloc_body.extend_from_slice(&1u16.to_be_bytes()); // extent count
+    let extent_offset_at = iloc_body.len();
+    iloc_body.extend_from_slice(&0u32.to_be_bytes()); // extent offset, patched below
+    let item_len = u32::try_from(item.len()).expect("a fixture EXIF item fits in 32 bits");
+    iloc_body.extend_from_slice(&item_len.to_be_bytes());
+    let iloc = bmff_full_box(*b"iloc", 0, &iloc_body);
+
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&iinf);
+    // Where the extent offset sits, counted from the start of the `meta` box:
+    // past `meta`'s own full-box header, past `iinf`, then into `iloc`.
+    let extent_offset_in_meta = FULL_BOX_BODY + meta_body.len() + FULL_BOX_BODY + extent_offset_at;
+    meta_body.extend_from_slice(&iloc);
+    let meta = bmff_full_box(*b"meta", 0, &meta_body);
+
+    // Real HEIC and AVIF files both list `mif1` among their compatible brands,
+    // so the fixture does too — a parser that accepts the file on that ground
+    // rather than on the major brand is behaving as it would in the field.
+    let mut out = bmff_ftyp(brand, &[brand, *b"mif1"]);
+    let extent_offset_at = out.len() + extent_offset_in_meta;
+    out.extend_from_slice(&meta);
+    out.extend_from_slice(&bmff_box(*b"free", &marker_bytes(marker)));
+
+    let item_at = u32::try_from(out.len() + 8).expect("a fixture file fits in 32 bits");
+    out.extend_from_slice(&bmff_box(*b"mdat", &item));
+    out[extent_offset_at..extent_offset_at + 4].copy_from_slice(&item_at.to_be_bytes());
+    out
+}
+
+/// What a synthesised MP4/MOV is to say about when it was recorded.
+///
+/// The two date fields are deliberately independent, because in the wild they
+/// are: `mvhd` is a container field the specification pins to UTC, while
+/// `com.apple.quicktime.creationdate` is a string an iPhone writes with the
+/// offset it was standing in. A real iPhone video carries *both*, and they
+/// disagree by the phone's distance from Greenwich — which is precisely the
+/// case a fixture has to be able to build.
+pub struct VideoSpec<'a> {
+    /// `ftyp` major brand — `b"qt  "` for a MOV, `b"mp42"` or `b"isom"` for an
+    /// MP4. Which one is in force changes how the file is parsed, so it is not
+    /// cosmetic.
+    pub brand: [u8; 4],
+    /// `moov/mvhd` creation time, in UTC, as the container defines it.
+    pub mvhd_utc: Option<NaiveDateTime>,
+    /// `com.apple.quicktime.creationdate`, written verbatim — offset and all.
+    pub apple_creationdate: Option<&'a str>,
+    /// `com.apple.quicktime.location.ISO6709`, written verbatim.
+    pub location: Option<&'a str>,
+}
+
+impl Default for VideoSpec<'_> {
+    fn default() -> Self {
+        Self {
+            brand: *b"mp42",
+            mvhd_utc: None,
+            apple_creationdate: None,
+            location: None,
+        }
+    }
+}
+
+impl VideoSpec<'_> {
+    /// An MP4 whose only date is the container's own, in UTC.
+    pub fn mp4(mvhd_utc: NaiveDateTime) -> Self {
+        Self {
+            mvhd_utc: Some(mvhd_utc),
+            ..Self::default()
+        }
+    }
+
+    /// A `QuickTime` `.mov` whose only date is the container's own, in UTC.
+    pub fn mov(mvhd_utc: NaiveDateTime) -> Self {
+        Self {
+            brand: *b"qt  ",
+            ..Self::mp4(mvhd_utc)
+        }
+    }
+}
+
+/// Assemble a minimal MP4/MOV: `ftyp`, `moov` (holding `mvhd` and, when the
+/// spec asks for them, the Apple `meta/keys`+`ilst` pairs), `free`.
+///
+/// Note that `moov/meta` is written as a *plain* box rather than a full one.
+/// That is the `QuickTime` spelling, and it is what `nom-exif` reads; a leading
+/// version-and-flags word here would shift `keys` by four bytes and the
+/// metadata would silently vanish.
+fn synth_iso_video(spec: &VideoSpec<'_>, marker: &str) -> Vec<u8> {
+    let mut moov_body = Vec::new();
+
+    if let Some(created) = spec.mvhd_utc {
+        moov_body.extend_from_slice(&bmff_mvhd(created));
+    }
+
+    // `keys` names the metadata items and `ilst` holds their values; the two
+    // are matched by position, not by any identifier, so they are built from
+    // one list to keep them in step.
+    let mut keyed: Vec<(&str, &str)> = Vec::new();
+    if let Some(text) = spec.apple_creationdate {
+        keyed.push(("com.apple.quicktime.creationdate", text));
+    }
+    if let Some(text) = spec.location {
+        keyed.push(("com.apple.quicktime.location.ISO6709", text));
+    }
+
+    if !keyed.is_empty() {
+        let mut keys_body = Vec::new();
+        let count = u32::try_from(keyed.len()).expect("a handful of keys");
+        keys_body.extend_from_slice(&count.to_be_bytes());
+        for (key, _) in &keyed {
+            let size = u32::try_from(key.len() + 8).expect("a key is a short string");
+            keys_body.extend_from_slice(&size.to_be_bytes());
+            keys_body.extend_from_slice(b"mdta"); // namespace
+            keys_body.extend_from_slice(key.as_bytes());
+        }
+
+        let mut ilst_body = Vec::new();
+        for (index, (_, value)) in keyed.iter().enumerate() {
+            let value = value.as_bytes();
+            let size = u32::try_from(value.len() + 24).expect("a value is a short string");
+            let data_len = u32::try_from(value.len() + 16).expect("a value is a short string");
+            let index = u32::try_from(index + 1).expect("a handful of items");
+            ilst_body.extend_from_slice(&size.to_be_bytes());
+            ilst_body.extend_from_slice(&index.to_be_bytes()); // 1-based
+            ilst_body.extend_from_slice(&data_len.to_be_bytes());
+            ilst_body.extend_from_slice(b"data");
+            ilst_body.push(0); // type set: well-known
+            ilst_body.extend_from_slice(&[0, 0, 1]); // type code 1: UTF-8 text
+            ilst_body.extend_from_slice(&0u32.to_be_bytes()); // locale
+            ilst_body.extend_from_slice(value);
+        }
+
+        let mut meta_body = bmff_full_box(*b"keys", 0, &keys_body);
+        meta_body.extend_from_slice(&bmff_box(*b"ilst", &ilst_body));
+        moov_body.extend_from_slice(&bmff_box(*b"meta", &meta_body));
+    }
+
+    let mut out = bmff_ftyp(spec.brand, &[spec.brand]);
+    out.extend_from_slice(&bmff_box(*b"moov", &moov_body));
+    out.extend_from_slice(&bmff_box(*b"free", &marker_bytes(marker)));
+    out
+}
+
+/// The `moov/mvhd` movie header, version 0.
+///
+/// Its two timestamps count seconds from midnight on 1 January 1904, UTC —
+/// which is the only reason a fixture can state a video's creation time as a
+/// naive datetime and mean something unambiguous by it.
+fn bmff_mvhd(created_utc: NaiveDateTime) -> Vec<u8> {
+    let seconds = (created_utc - naive(1904, 1, 1, 0, 0, 0)).num_seconds();
+    let seconds =
+        u32::try_from(seconds).expect("a fixture video date is after 1904 and before 2040");
+
+    let mut body = Vec::with_capacity(96);
+    body.extend_from_slice(&seconds.to_be_bytes()); // creation time
+    body.extend_from_slice(&seconds.to_be_bytes()); // modification time
+    body.extend_from_slice(&600u32.to_be_bytes()); // time scale: units per second
+    body.extend_from_slice(&600u32.to_be_bytes()); // duration: one second
+    body.extend_from_slice(&[0u8; 76]); // rate, volume, matrix, pre-defined
+    body.extend_from_slice(&2u32.to_be_bytes()); // next track id
+    bmff_full_box(*b"mvhd", 0, &body)
 }
 
 // --- Baseline JPEG tables (ITU T.81 Annex K) -------------------------------

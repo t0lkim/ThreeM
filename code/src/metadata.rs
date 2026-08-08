@@ -43,6 +43,23 @@ impl FileMetadata {
 pub enum DateSource {
     Exif,
     Filesystem,
+    /// A filesystem date, because nothing here could read the file's container.
+    ///
+    /// Distinct from [`Self::Filesystem`], which means the container *was* read
+    /// and had no date in it. The two land in the same directory and look
+    /// identical in the output tree, which is exactly why they must not look
+    /// identical in the report: the first is a fact about the photograph and the
+    /// second is a limitation of this tool. Somebody organising a library of
+    /// camera RAW files deserves to be told that every date in it came from a
+    /// file's modification time rather than from the shutter, because on a
+    /// library that has been copied between disks those are not close to the
+    /// same number.
+    ///
+    /// Decided by asking the EXIF parser to identify the container — see
+    /// [`fallback_source`] — rather than by matching the extension, so the
+    /// answer tracks what the tool can actually do rather than a list somebody
+    /// has to remember to update.
+    Unsupported,
     None,
 }
 
@@ -111,7 +128,43 @@ pub fn extract_metadata(path: &Path, is_video: bool, tz: &TimezonePolicy) -> Res
         }
     }
 
-    extract_filesystem_metadata(path, tz)
+    extract_filesystem_metadata(path, tz, fallback_source(path))
+}
+
+/// Why a file is falling back to its filesystem timestamp.
+///
+/// Asked only once the format-specific extraction has already come up empty, so
+/// the extra read costs nothing on the path that worked.
+///
+/// The question is put to the EXIF parser itself — "do you recognise this
+/// container?" — because that is the only source of an answer that stays true.
+/// A hard-coded list of unsupported extensions would be a second thing to
+/// maintain, and it would begin lying the day the parser gained a format.
+fn fallback_source(path: &Path) -> DateSource {
+    let Ok(file) = File::open(path) else {
+        // Unreadable is not unsupported, and this run is about to fail on the
+        // file anyway when it asks the filesystem for a timestamp.
+        return DateSource::Filesystem;
+    };
+
+    match nom_exif::FileFormat::try_from_read(BufReader::new(file)) {
+        Ok(format) => {
+            debug!(
+                path = %path.display(),
+                %format,
+                "container recognised but carried no usable date"
+            );
+            DateSource::Filesystem
+        }
+        Err(e) => {
+            debug!(
+                path = %path.display(),
+                error = %e,
+                "container not recognised; falling back to the filesystem timestamp"
+            );
+            DateSource::Unsupported
+        }
+    }
 }
 
 /// Assemble the answer for a file whose date was found, logging the resolution.
@@ -257,7 +310,11 @@ fn extract_video_metadata(path: &Path, tz: &TimezonePolicy) -> Result<FileMetada
     Ok(dated(path, reading, tz, latitude, longitude))
 }
 
-fn extract_filesystem_metadata(path: &Path, tz: &TimezonePolicy) -> Result<FileMetadata> {
+fn extract_filesystem_metadata(
+    path: &Path,
+    tz: &TimezonePolicy,
+    date_source: DateSource,
+) -> Result<FileMetadata> {
     let meta = fs::metadata(path)
         .with_context(|| format!("reading filesystem metadata for {}", path.display()))?;
 
@@ -281,7 +338,7 @@ fn extract_filesystem_metadata(path: &Path, tz: &TimezonePolicy) -> Result<FileM
         timezone_source: Some(timezone_source),
         latitude: None,
         longitude: None,
-        date_source: DateSource::Filesystem,
+        date_source,
     })
 }
 
@@ -342,8 +399,34 @@ fn entry_to_wall_clock(value: &EntryValue) -> Option<NaiveDateTime> {
 /// Unlike the EXIF path above, an offset here is real: it is either a string the
 /// camera wrote with the offset in it, or an `mvhd` timestamp the container
 /// specification defines as UTC.
+///
+/// # Why a non-zero offset is treated as the file's own testimony
+///
+/// `nom-exif` hands both of those over as the same `EntryValue::Time`, under the
+/// same `com.apple.quicktime.creationdate` key: it parses an Apple
+/// `2024-03-15T23:30:00+08:00` string into a zoned datetime, and it *also*
+/// synthesises that key from `mvhd` when the string is absent. Calling
+/// `to_utc()` on both — which is what this did — throws away the only thing that
+/// distinguishes them, and an iPhone video then files under the machine's
+/// distance from Greenwich rather than the phone's. That is the same defect this
+/// phase fixed for JPEG, surviving in the video path because the offset arrived
+/// pre-applied instead of in a separate tag.
+///
+/// An `mvhd`-derived value is always exactly `+00:00`, because it is a UTC
+/// instant given a zero offset on the way out. So a **non-zero** offset can only
+/// have come from a string the file wrote, and is believed as
+/// [`Reading::Zoned`].
+///
+/// At exactly `+00:00` the two are indistinguishable, and this reads them as
+/// [`Reading::Instant`]. That is a deliberate bet, not an oversight: every MP4
+/// and MOV has an `mvhd`, while an Apple `creationdate` of `+00:00` means a
+/// video shot in the UTC zone specifically. Getting the common case right costs
+/// the rare one its wall clock when the run's zone is not UTC, and telling them
+/// apart properly would mean re-reading the container ourselves. The gap is
+/// recorded in `docs/reference/format-support.md`.
 fn entry_to_reading(value: &EntryValue) -> Option<Reading> {
     match value {
+        EntryValue::Time(dt) if dt.offset().local_minus_utc() != 0 => Some(Reading::Zoned(*dt)),
         EntryValue::Time(dt) => Some(Reading::Instant(dt.to_utc())),
         EntryValue::Text(s) => Some(match parse_wall_clock(s)? {
             (naive, Some(offset)) => Reading::Zoned(attach_offset(naive, offset)),
@@ -637,7 +720,9 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"test data").unwrap();
 
-        let meta = extract_filesystem_metadata(tmp.path(), &policy("+08:00")).unwrap();
+        let meta =
+            extract_filesystem_metadata(tmp.path(), &policy("+08:00"), DateSource::Filesystem)
+                .unwrap();
         assert!(meta.date.is_some());
         assert_eq!(meta.date_source, DateSource::Filesystem);
         assert_eq!(
@@ -655,7 +740,12 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"test data").unwrap();
 
-        let dated = extract_filesystem_metadata(tmp.path(), &TimezonePolicy::default()).unwrap();
+        let dated = extract_filesystem_metadata(
+            tmp.path(),
+            &TimezonePolicy::default(),
+            DateSource::Filesystem,
+        )
+        .unwrap();
         assert_eq!(dated.date.is_some(), dated.timezone_source.is_some());
 
         let undated = FileMetadata::undated(DateSource::None);

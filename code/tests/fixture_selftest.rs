@@ -268,29 +268,40 @@ fn jpeg_without_gps_reports_no_coordinates() {
     );
 }
 
+/// The negative control, in both of its forms.
+///
+/// Without this, `DateSource::Exif` everywhere above could be asserting nothing.
+/// It proves the extractor really does fall back when there is no EXIF to find,
+/// so the `Exif` results are a signal and not the default.
+///
+/// The two fixtures are the two *different* fallbacks, and telling them apart is
+/// the point rather than a detail: `photo.jpg` is a real JPEG that simply has no
+/// metadata — a scan, or an export that stripped it — and there is nothing the
+/// tool could have done differently. `garbage.jpg` is not a container the tool
+/// can read at all, and its date being wrong is a limitation of this program.
+/// The output tree cannot show the difference; the run has to.
 #[test]
-fn a_file_that_is_not_valid_exif_falls_back_to_the_filesystem() {
-    // The negative control. Without this, `DateSource::Exif` above could be
-    // asserting nothing — this proves the extractor really does report
-    // `Filesystem` when there is no EXIF to find, so the `Exif` results are a
-    // signal and not the default.
-    let tree = MediaTree::new().jpeg_raw("garbage.jpg", b"this is not a JPEG");
+fn a_file_with_no_readable_exif_falls_back_to_the_filesystem_and_says_which_kind() {
+    let tree = MediaTree::new()
+        .jpeg_without_exif("photo.jpg")
+        .jpeg_raw("garbage.jpg", b"this is not a JPEG");
 
-    let meta = read_image(&tree, "garbage.jpg");
+    for (rel, expected) in [
+        ("photo.jpg", DateSource::Filesystem),
+        ("garbage.jpg", DateSource::Unsupported),
+    ] {
+        let meta = read_image(&tree, rel);
 
-    assert_eq!(
-        meta.date_source,
-        DateSource::Filesystem,
-        "expected the fallback path for a file with no parseable EXIF"
-    );
-    assert_eq!(
-        meta.timezone_source,
-        Some(TimezoneSource::SystemLocal),
-        "a filesystem timestamp is a real instant, but it still has to be read against \
-         some wall clock, and with nothing configured that is the machine's"
-    );
-    assert_eq!(meta.latitude, None);
-    assert_eq!(meta.longitude, None);
+        assert_eq!(meta.date_source, expected, "{rel}: wrong fallback reported");
+        assert_eq!(
+            meta.timezone_source,
+            Some(TimezoneSource::SystemLocal),
+            "{rel}: a filesystem timestamp is a real instant, but it still has to be read \
+             against some wall clock, and with nothing configured that is the machine's"
+        );
+        assert_eq!(meta.latitude, None, "{rel}");
+        assert_eq!(meta.longitude, None, "{rel}");
+    }
 }
 
 #[test]

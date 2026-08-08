@@ -65,6 +65,7 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
 
     let mut exif_count = 0;
     let mut fs_count = 0;
+    let mut unsupported_count = 0;
     let mut no_date_count = 0;
     let mut with_location = 0;
     let mut timezones = TimezoneTally::default();
@@ -78,6 +79,10 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
             DateSource::Filesystem => {
                 fs_count += 1;
                 "[FS]"
+            }
+            DateSource::Unsupported => {
+                unsupported_count += 1;
+                "[FS: UNSUPPORTED]"
             }
             DateSource::None => {
                 no_date_count += 1;
@@ -104,6 +109,11 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
     println!("  Total files: {}", moves.len());
     println!("  Date from EXIF: {exif_count}");
     println!("  Date from filesystem: {fs_count}");
+    // Counted apart from the line above rather than folded into it: both dates
+    // come from the filesystem, but only this one is the tool admitting a gap,
+    // and a figure a person is meant to act on cannot be hidden inside a figure
+    // they are not.
+    println!("  Date from filesystem — format not supported: {unsupported_count}");
     println!("  No date (unsorted): {no_date_count}");
     println!("  With GPS location: {with_location}");
     timezones.print();
