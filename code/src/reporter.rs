@@ -607,9 +607,15 @@ fn describe_entry(entry: &JournalEntry) -> String {
     }
 }
 
+/// Opens the question asked at a chunk boundary.
+///
+/// Exported so a test can prove a chunk boundary was *reached* — which is how
+/// the configured `chunk_size` is observable from outside the process.
+pub const CHUNK_PROMPT_PREFIX: &str = "Processed chunk";
+
 /// Prompt the user to continue processing the next chunk
 pub fn prompt_continue(chunk_number: usize, remaining: usize) -> bool {
-    print!("\nProcessed chunk {chunk_number}. {remaining} files remaining. Continue? [Y/n] ");
+    print!("\n{CHUNK_PROMPT_PREFIX} {chunk_number}. {remaining} files remaining. Continue? [Y/n] ");
     if io::stdout().flush().is_err() {
         // We could not even show the prompt, so we have no consent to continue.
         return false;

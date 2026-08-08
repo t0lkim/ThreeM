@@ -13,6 +13,7 @@ use mmm::geocoder::GeoLookup;
 use mmm::journal::{Journal, JournalEntry, RunHeader};
 use mmm::organiser::{ChunkController, MoveRecorder};
 use mmm::reporter::JournalStatus;
+use mmm::settings::Settings;
 use mmm::undo::RestorePlan;
 
 /// Drives the chunked move phase from the terminal: the progress bar, and the
@@ -61,8 +62,8 @@ impl ChunkController for CliController<'_> {
 /// Returns an error if the journal cannot be created. Nothing has moved at that
 /// point, and nothing will: a run that cannot record what it is about to do
 /// must not do it.
-fn open_journal(config: &Config) -> Result<Option<Journal>> {
-    let Some(dir) = config.resolve_journal_dir() else {
+fn open_journal(config: &Config, settings: &Settings) -> Result<Option<Journal>> {
+    let Some(dir) = config.resolve_journal_dir(settings) else {
         println!();
         reporter::print_journal_location(JournalStatus::Disabled);
         return Ok(None);
@@ -70,7 +71,7 @@ fn open_journal(config: &Config) -> Result<Option<Journal>> {
 
     let header = RunHeader::new(
         journal::generate_run_id(),
-        config.output_dir(),
+        config.output_dir(settings),
         RunHeader::current_argv(),
     );
     let journal = Journal::create(&dir, &header)
@@ -135,8 +136,8 @@ fn open_undo_journal(dir: &Path, plan: &RestorePlan) -> Result<Journal> {
 }
 
 /// `mmm undo` — replay one run's journal in reverse.
-fn run_undo(args: &UndoArgs) -> Result<()> {
-    let dir = args.location.resolve();
+fn run_undo(args: &UndoArgs, settings: &Settings) -> Result<()> {
+    let dir = args.location.resolve(settings);
 
     let journal_path = match &args.run {
         Some(run_id) => {
@@ -234,19 +235,20 @@ fn run_undo(args: &UndoArgs) -> Result<()> {
 }
 
 /// `mmm journal list` / `mmm journal show` — read-only, always.
-fn run_journal(action: &JournalAction) -> Result<()> {
+fn run_journal(action: &JournalAction, settings: &Settings) -> Result<()> {
     match action {
         JournalAction::List(location) => {
-            let rows = undo::summarise_runs(&location.resolve())?;
+            let rows = undo::summarise_runs(&location.resolve(settings))?;
             reporter::print_run_list(&rows);
         }
         JournalAction::Show(args) => {
-            let path = journal::journal_path(&args.location.resolve(), &args.run_id);
+            let dir = args.location.resolve(settings);
+            let path = journal::journal_path(&dir, &args.run_id);
             if !path.is_file() {
                 anyhow::bail!(
                     "no run {} was recorded in {} — `mmm journal list` shows the runs that were",
                     args.run_id,
-                    args.location.resolve().display()
+                    dir.display()
                 );
             }
             let (header, entries) = undo::read_run(&path)?;
@@ -256,11 +258,9 @@ fn run_journal(action: &JournalAction) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // Initialise tracing
-    let filter = match cli.verbose {
+/// Install the tracing subscriber for a resolved verbosity.
+fn init_tracing(verbose: u8) {
+    let filter = match verbose {
         0 => "warn",
         1 => "info",
         2 => "debug",
@@ -270,25 +270,48 @@ fn main() -> Result<()> {
         .with_env_filter(filter)
         .with_target(false)
         .init();
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
 
     // Read before any work starts, and for every subcommand: a config that
     // cannot be understood has to stop the run here rather than be discovered
     // halfway through moving somebody's library. `--no-config` is the way past a
     // file that is in the way.
+    //
+    // Before tracing is initialised, too, because the verbosity is itself a
+    // setting: a `verbose = 2` in a config file has to reach the subscriber, and
+    // a subscriber already installed from the flag alone could not be told about
+    // it afterwards. The cost is that a load error is reported by `main`'s
+    // `Result` rather than through the log — which is where an error naming a
+    // file and a line belongs anyway.
     let loaded = settings::load(&cli.load_options())?;
+
+    // The command line goes on last, so it wins: the layers arrive
+    // lowest-priority first and `resolve` folds them in that order.
+    let mut layers = loaded.opinions();
+    layers.push(cli.settings_layer());
+    let settings = Settings::resolve(layers);
+
+    init_tracing(settings.verbose);
     for layer in &loaded.layers {
         debug!(source = %layer.source, "read config layer");
     }
 
     match cli.resolve() {
-        Command::Organise(config) => run_organise(&config),
-        Command::Undo(args) => run_undo(&args),
-        Command::Journal { action } => run_journal(&action),
+        Command::Organise(config) => run_organise(&config, &settings),
+        Command::Undo(args) => run_undo(&args, &settings),
+        Command::Journal { action } => run_journal(&action, &settings),
     }
 }
 
 /// `mmm organise` — the scan, plan, and move pipeline.
-fn run_organise(config: &Config) -> Result<()> {
+///
+/// Takes both types deliberately. `config` answers the questions only the
+/// command line may answer — which directories, and whether this run moves
+/// anything; `settings` answers everything the config layers had a voice in.
+fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     if let Some(notice) = config.deprecation_notice() {
         eprintln!("{notice}");
     }
@@ -371,7 +394,7 @@ fn run_organise(config: &Config) -> Result<()> {
         "[{elapsed_precise}] {bar:40.green/white} {pos}/{len} planning",
     ));
 
-    let output_dir = config.output_dir();
+    let output_dir = config.output_dir(settings);
     let mut planned_moves = Vec::new();
     let mut plan_errors = 0;
 
@@ -411,7 +434,7 @@ fn run_organise(config: &Config) -> Result<()> {
     }
 
     // === JOURNAL: opened before the first move, closed on every way out ===
-    let mut journal = open_journal(config)?;
+    let mut journal = open_journal(config, settings)?;
     let journal_path = journal.as_ref().map(|j| j.path().to_path_buf());
     let journal_status = || match journal_path.as_deref() {
         Some(path) => JournalStatus::At(path),
@@ -449,12 +472,12 @@ fn run_organise(config: &Config) -> Result<()> {
 
     let mut controller = CliController {
         bar: &move_pb,
-        prompt: !config.no_prompt,
+        prompt: !settings.no_prompt,
     };
     let mut recorder = MoveRecorder::new(journal.as_mut());
     let run = organiser::process_moves(
         &planned_moves,
-        config.chunk_size,
+        settings.chunk_size,
         &mut controller,
         &mut recorder,
     );

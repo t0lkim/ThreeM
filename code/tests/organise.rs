@@ -46,8 +46,8 @@ use mmm::journal::{IntentKind, Journal, JournalEntry, RunHeader};
 use mmm::metadata::{DateSource, FileMetadata};
 use mmm::organiser::build_target_path;
 use mmm::reporter::{
-    COMMIT_BANNER, DRY_RUN_BANNER, HASH_SKIPPED_LABEL, JOURNAL_LABEL, NO_JOURNAL_NOTICE,
-    SCAN_SKIPPED_LABEL, UNPROCESSED_LABEL,
+    CHUNK_PROMPT_PREFIX, COMMIT_BANNER, DRY_RUN_BANNER, HASH_SKIPPED_LABEL, JOURNAL_LABEL,
+    NO_JOURNAL_NOTICE, SCAN_SKIPPED_LABEL, UNPROCESSED_LABEL,
 };
 
 // ---------------------------------------------------------------------------
@@ -1026,5 +1026,200 @@ fn an_unjournalled_run_says_it_cannot_be_undone() {
         stdout_of(&out).contains(NO_JOURNAL_NOTICE),
         "the summary must say the run cannot be undone:\n{}",
         stdout_of(&out)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Settings reaching the run
+// ---------------------------------------------------------------------------
+//
+// A layer that resolves correctly in a unit test and never reaches the pipeline
+// is a setting that does not work. These drive the real binary with a real
+// project `mmm.toml` on disk, discovered the way a user's would be — by walking
+// up from the working directory — and assert on what the run actually did.
+
+/// A directory holding a project `mmm.toml`, to be used as the run's working
+/// directory so discovery finds it.
+fn project_config(contents: &str) -> TempDir {
+    let dir = TempDir::new().expect("creating project TempDir");
+    std::fs::write(dir.path().join("mmm.toml"), contents).expect("writing the project mmm.toml");
+    dir
+}
+
+/// Run `mmm` from inside `project`, so the config walk starts there.
+fn run_in_project(project: &Path, args: &[&str]) -> std::process::Output {
+    Command::cargo_bin("mmm")
+        .unwrap()
+        .current_dir(project)
+        .args(args)
+        .output()
+        .expect("running mmm inside a project directory")
+}
+
+/// A path as a TOML string. Temporary directories hold no quotes or backslashes
+/// on the platforms this suite runs on, so no escaping is needed — and if that
+/// ever stops being true, the parse error names the file.
+fn toml_path(path: &Path) -> String {
+    format!("\"{}\"", path.display())
+}
+
+/// The setting nobody can type twice without noticing: where the run writes.
+#[test]
+fn a_project_config_supplies_the_output_directory() {
+    let tree = plain_tree();
+    let (_scratch, out_dir) = scratch_output();
+    let project = project_config(&format!("output_dir = {}\n", toml_path(&out_dir)));
+
+    let out = run_in_project(
+        project.path(),
+        &[
+            &tree.path().display().to_string(),
+            "--commit",
+            "--no-prompt",
+        ],
+    );
+    assert_ok(
+        &out,
+        "a commit run taking its output directory from a config",
+    );
+
+    assert_eq!(
+        file_contents_by_marker(&out_dir).len(),
+        3,
+        "every file should have landed in the configured tree: {:?}",
+        snapshot_tree(&out_dir)
+    );
+    assert!(
+        snapshot_tree(tree.path()).is_empty(),
+        "and left the input tree drained: {:?}",
+        snapshot_tree(tree.path())
+    );
+}
+
+/// The precedence rule, end to end: the flag wins.
+#[test]
+fn the_output_flag_outranks_a_project_config() {
+    let tree = plain_tree();
+    let (_configured, configured_dir) = scratch_output();
+    let (_asked_for, asked_for_dir) = scratch_output();
+    let project = project_config(&format!("output_dir = {}\n", toml_path(&configured_dir)));
+
+    let out = run_in_project(
+        project.path(),
+        &[
+            &tree.path().display().to_string(),
+            "-o",
+            &asked_for_dir.display().to_string(),
+            "--commit",
+            "--no-prompt",
+        ],
+    );
+    assert_ok(&out, "a commit run whose flag contradicts the config");
+
+    assert_eq!(
+        file_contents_by_marker(&asked_for_dir).len(),
+        3,
+        "the flag names where the files go"
+    );
+    assert!(
+        !configured_dir.exists(),
+        "the configured directory should not even have been created"
+    );
+}
+
+/// `chunk_size` is the regression this phase's wiring exists for: it used to
+/// carry a clap default, which would have arrived as an opinion of the
+/// highest-priority layer and outranked every config file on the machine.
+///
+/// Observable from outside because reaching a chunk boundary prints a question.
+/// Three files with a configured size of one reaches two; the built-in default
+/// of 100 would reach none.
+#[test]
+fn a_project_config_supplies_the_chunk_size() {
+    let tree = plain_tree();
+    let (_scratch, out_dir) = scratch_output();
+    let project = project_config(&format!(
+        "output_dir = {}\nchunk_size = 1\n",
+        toml_path(&out_dir)
+    ));
+
+    let out = run_in_project(
+        project.path(),
+        &[&tree.path().display().to_string(), "--commit"],
+    );
+    assert_ok(&out, "a commit run taking its chunk size from a config");
+
+    assert!(
+        stdout_of(&out).contains(CHUNK_PROMPT_PREFIX),
+        "a chunk size of one must reach a chunk boundary:\n{}",
+        stdout_of(&out)
+    );
+    assert_eq!(
+        file_contents_by_marker(&out_dir).len(),
+        3,
+        "and the run still organises everything"
+    );
+}
+
+/// The other half of the rule, on the same setting.
+#[test]
+fn the_chunk_size_flag_outranks_a_project_config() {
+    let tree = plain_tree();
+    let (_scratch, out_dir) = scratch_output();
+    let project = project_config(&format!(
+        "output_dir = {}\nchunk_size = 1\n",
+        toml_path(&out_dir)
+    ));
+
+    let out = run_in_project(
+        project.path(),
+        &[
+            &tree.path().display().to_string(),
+            "--chunk-size",
+            "100",
+            "--commit",
+        ],
+    );
+    assert_ok(
+        &out,
+        "a commit run whose flag contradicts the configured size",
+    );
+
+    assert!(
+        !stdout_of(&out).contains(CHUNK_PROMPT_PREFIX),
+        "one chunk of 100 holds all three files, so no boundary is reached:\n{}",
+        stdout_of(&out)
+    );
+    assert_eq!(file_contents_by_marker(&out_dir).len(), 3);
+}
+
+/// A config file cannot make a run destructive. The file below is refused at the
+/// parse, so nothing is scanned, nothing is planned, and nothing moves.
+#[test]
+fn a_config_file_cannot_turn_on_committing() {
+    let tree = plain_tree();
+    let before = snapshot_tree_hashed(tree.path());
+    let project = project_config("commit = true\n");
+
+    let out = run_in_project(project.path(), &[&tree.path().display().to_string()]);
+
+    assert!(
+        !out.status.success(),
+        "a config naming a command-line-only key must stop the run:\n{}",
+        stdout_of(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("commit"),
+        "the refusal must name it:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("command line"),
+        "and say where it belongs:\n{stderr}"
+    );
+    assert_eq!(
+        snapshot_tree_hashed(tree.path()),
+        before,
+        "the library must be untouched"
     );
 }
