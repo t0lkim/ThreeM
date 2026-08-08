@@ -338,6 +338,67 @@ fn a_full_filename_sidecar_lands_under_the_parents_whole_new_filename() {
     assert_eq!(dir_of(sidecar), dir_of(parent));
 }
 
+/// The same convention over a Canon RAW, where the two names disagree about
+/// case: the camera writes `IMG_1234.CR2` and darktable writes
+/// `IMG_1234.cr2.xmp` beside it, lowercasing the extension it embeds.
+///
+/// Two things meet here that the `.dng` case above cannot separate, because
+/// every name in it is already lowercase.
+///
+/// The first is the *pairing*. A full-filename sidecar is looked up by the whole
+/// parent filename, which is a different key from the stem — so the
+/// case-insensitivity proved for `img_1234.XMP` next to `IMG_1234.JPG` says
+/// nothing about this one. Fold the case on only one side of that key and every
+/// Canon shooter using darktable gets a directory full of orphans, reported as
+/// having no parent while the parent sits next to them.
+///
+/// The second is the *derived name*. The tool lowercases extensions on the way
+/// out, so the parent lands as `<stem>.cr2` while its sidecar still spells the
+/// middle component `.CR2` in its own filename. Deriving the sidecar's name from
+/// anything other than where the parent actually landed produces
+/// `<stem>.CR2.xmp` beside a `<stem>.cr2` — which pairs on a case-insensitive
+/// volume and not on the ext4 one the library gets copied to next.
+///
+/// So the assertion is the parent's real filename plus `.xmp`, and both halves
+/// have to be right for it to hold.
+#[test]
+fn the_full_filename_convention_survives_a_case_difference_in_the_extension() {
+    let tree = MediaTree::new()
+        .tiff_raw(
+            "IMG_1234.CR2",
+            Some(b"CR\x02\x00"),
+            naive(2024, 3, 15, 14, 30, 0),
+            Some("+00:00"),
+            None,
+        )
+        .sidecar("IMG_1234.cr2.XMP", b"<x:xmpmeta/>");
+
+    let run = organise(tree.path(), &[]);
+    let parent = run.at("IMG_1234.CR2");
+    let sidecar = run.at("IMG_1234.cr2.XMP");
+
+    let parent_name = Path::new(parent).file_name().unwrap().to_string_lossy();
+    assert_eq!(
+        Path::new(sidecar).file_name().unwrap().to_string_lossy(),
+        format!("{parent_name}.xmp"),
+        "the sidecar must name the parent's whole new filename as the parent actually spells \
+         it; parent {parent}, sidecar {sidecar}"
+    );
+    assert_eq!(dir_of(sidecar), dir_of(parent));
+
+    // Stated rather than assumed: this really did go through the full-filename
+    // route. Under the stem convention the sidecar's stem is `IMG_1234.cr2`,
+    // which matches nothing, so a run that produced the pairing above by the
+    // other path is not a run that could exist — but the extension check is what
+    // makes that visible, since `<stem>.cr2.xmp` and `<stem>.xmp` differ only
+    // there.
+    assert!(
+        parent_name.ends_with(".cr2"),
+        "the parent's extension should have been lowercased on the way out, which is the \
+         whole reason the two names disagree; got {parent}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A sidecar is not a media file
 // ---------------------------------------------------------------------------
