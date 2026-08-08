@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -71,7 +72,30 @@ pub struct HashGroups<'a> {
 pub struct DuplicateGroup {
     pub hash: String,
     pub size: u64,
+    /// Every file sharing this content, in [`by_depth_then_path`] order.
+    ///
+    /// **`files[0]` is the original**, the one copy left where it is; every
+    /// other entry is relocated into `duplicates/NNN/`. That is a rule, not an
+    /// accident of iteration — see [`by_depth_then_path`].
     pub files: Vec<PathBuf>,
+}
+
+/// The order two paths take when the choice between them must not depend on
+/// how a `HashMap` happened to iterate: **shallower first, then
+/// lexicographically smaller**.
+///
+/// Depth leads because the first file of a duplicate group is the one that is
+/// *kept*. Of two identical photographs, the one nearer the top of the tree is
+/// far more likely to be the one somebody filed deliberately — copies
+/// accumulate downwards, in `old-phone/DCIM/backup/`. Lexicographic order then
+/// breaks the tie, which makes the rule total: for any two distinct paths it
+/// names one of them, with no appeal to iteration order, filesystem walk order
+/// or (once this cascade is parallel) thread completion order.
+fn by_depth_then_path(a: &Path, b: &Path) -> Ordering {
+    a.components()
+        .count()
+        .cmp(&b.components().count())
+        .then_with(|| a.cmp(b))
 }
 
 /// Three-phase dedup cascade:
@@ -82,6 +106,17 @@ pub struct DuplicateGroup {
 /// Infallible by construction. A file that cannot be read is dropped from the
 /// analysis with a warning and counted in [`DedupResult::skipped`]; it never
 /// takes the rest of the run down with it.
+///
+/// **Deterministic by construction too.** The cascade's working sets are
+/// `HashMap`s, and a `HashMap` iterates in an order that differs between two
+/// runs over the same tree — so which file a group kept as its original, and
+/// the order the groups came back in, used to be decided by a random seed.
+/// That is not a cosmetic difference: the retained original is the copy that is
+/// *not* moved into `duplicates/`, and the order of `unique` decides which of
+/// two files competing for one name gets `photo.jpg` and which gets
+/// `photo-1.jpg`. Both are now settled by [`by_depth_then_path`] and by the
+/// content hash, applied *after* the hashing is finished — which is also what
+/// keeps the answer stable once the hashing runs on several threads.
 pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupResult {
     progress.set_message("Phase 1: grouping by file size");
     let size_groups = group_by_size(files);
@@ -141,7 +176,12 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
     for group in &phase3_candidates {
         let full = group_by_full_hash(group);
         skipped += full.skipped;
-        for (hash, fgroup) in full.groups {
+        for (hash, mut fgroup) in full.groups {
+            // Before anything reads `fgroup[0]`, and before the group is
+            // emitted: the members arrive here in whatever order phase 3
+            // bucketed them, and index 0 is the file that will be left alone.
+            fgroup.sort_by(|a, b| by_depth_then_path(&a.path, &b.path));
+
             if fgroup.len() == 1 {
                 // Fully hashed to prove it was not a duplicate; the digest is
                 // already paid for, so the journal gets it.
@@ -151,7 +191,8 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
                 });
             } else {
                 // Keep the first file as the "original", rest are duplicates.
-                // It carries the group's digest for the same reason.
+                // Which one that is, is `by_depth_then_path`'s answer, applied
+                // just above. It carries the group's digest for the same reason.
                 unique.push(UniqueFile {
                     file: fgroup[0].clone(),
                     known_hash: Some(hash.clone()),
@@ -165,6 +206,23 @@ pub fn find_duplicates(files: &[ScannedFile], progress: &ProgressBar) -> DedupRe
         }
         progress.inc(group.len() as u64);
     }
+
+    // Both output lists are assembled from `HashMap` iteration, so both are
+    // sorted here rather than relied upon to arrive in order. Groups go by
+    // their content hash — the one property of a group that is derived from
+    // nothing but its contents — with the retained original's path as a
+    // tie-break, so the order is total even if two groups ever shared a digest.
+    duplicate_groups.sort_by(|a, b| {
+        a.hash
+            .cmp(&b.hash)
+            .then_with(|| match (a.files.first(), b.files.first()) {
+                (Some(x), Some(y)) => by_depth_then_path(x, y),
+                _ => Ordering::Equal,
+            })
+    });
+    // `unique` is what the organiser plans moves from, in order. Left unsorted
+    // it decides collision suffixes by coin toss.
+    unique.sort_by(|a, b| by_depth_then_path(&a.file.path, &b.file.path));
 
     if skipped > 0 {
         warn!(count = skipped, "files excluded from duplicate detection");
@@ -399,6 +457,7 @@ pub fn styled_bar(template: &str) -> ProgressStyle {
 )]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::fs;
     use tempfile::TempDir;
 
@@ -681,5 +740,213 @@ mod tests {
         let result = find_duplicates(&files, &ProgressBar::hidden());
         assert_eq!(result.unique.len(), 2);
         assert!(result.duplicate_groups.is_empty());
+    }
+
+    /// Write `body` to `tmp/relative`, creating the directories on the way, and
+    /// return the `ScannedFile` the scan would have produced for it.
+    fn plant(tmp: &TempDir, relative: &str, body: &[u8]) -> ScannedFile {
+        let path = tmp.path().join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, body).unwrap();
+        make_scanned(path, body.len() as u64)
+    }
+
+    /// A tree with two duplicate groups, a size-collision pair that is not
+    /// duplicated, and a file unique by size — laid out so that the correct
+    /// answers are *not* the ones any accidental ordering would give.
+    ///
+    /// `zzz.jpg` sits at the top of the tree and sorts lexicographically last of
+    /// its group, so a plain path sort would pick `aaa/deep/one.jpg` as the
+    /// original and a `HashMap` would pick whichever it felt like. The depth
+    /// rule picks `zzz.jpg`, and only the depth rule does.
+    fn deterministic_fixture(tmp: &TempDir) -> Vec<ScannedFile> {
+        // 40 KB apiece: over one buffer, under the 64 KB partial-hash window,
+        // so both hashing phases actually run.
+        let a: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let b: Vec<u8> = (0..40_000u32).map(|i| (i % 241) as u8).collect();
+
+        vec![
+            // Group A — three copies at three depths.
+            plant(tmp, "aaa/deep/one.jpg", &a),
+            plant(tmp, "zzz.jpg", &a),
+            plant(tmp, "bbb/two.jpg", &a),
+            // Group B — two copies at the same depth, so the tie-break decides.
+            plant(tmp, "ccc/bravo.jpg", &b),
+            plant(tmp, "ccc/alpha.jpg", &b),
+            // Same length as group A, different bytes: reaches phase 3 and is
+            // separated there.
+            plant(tmp, "ddd/impostor.jpg", &{
+                let mut v = a.clone();
+                v[39_999] ^= 0xFF;
+                v
+            }),
+            // Unique by size — eliminated in phase 1.
+            plant(tmp, "eee/lonely.jpg", b"short"),
+        ]
+    }
+
+    /// Everything about a result that a caller could observe, as one string.
+    fn render(result: &DedupResult) -> String {
+        let mut out = format!("skipped={}\n", result.skipped);
+        for group in &result.duplicate_groups {
+            let _ = writeln!(out, "group {} size={}", group.hash, group.size);
+            for path in &group.files {
+                let _ = writeln!(out, "  {}", path.display());
+            }
+        }
+        for unique in &result.unique {
+            let _ = writeln!(
+                out,
+                "unique {} hash={}",
+                unique.file.path.display(),
+                unique.known_hash.as_deref().unwrap_or("-")
+            );
+        }
+        out
+    }
+
+    /// The same tree must produce byte-identical output every time.
+    ///
+    /// Each `HashMap` in a process gets its own `RandomState` seed, so the
+    /// repeats below really do re-roll the iteration order the cascade used to
+    /// take its answers from — this fails on the unsorted implementation.
+    #[test]
+    fn test_find_duplicates_is_byte_identical_across_repeated_runs() {
+        let tmp = TempDir::new().unwrap();
+        let files = deterministic_fixture(&tmp);
+
+        let first = render(&find_duplicates(&files, &ProgressBar::hidden()));
+        for run in 1..20 {
+            assert_eq!(
+                render(&find_duplicates(&files, &ProgressBar::hidden())),
+                first,
+                "run {run} disagreed with run 0"
+            );
+        }
+    }
+
+    /// Reordering the input — which is all a different filesystem walk order
+    /// is — must not change the answer either.
+    #[test]
+    fn test_find_duplicates_does_not_depend_on_the_order_it_is_handed_files() {
+        let tmp = TempDir::new().unwrap();
+        let mut files = deterministic_fixture(&tmp);
+
+        let forwards = render(&find_duplicates(&files, &ProgressBar::hidden()));
+        files.reverse();
+        let backwards = render(&find_duplicates(&files, &ProgressBar::hidden()));
+
+        assert_eq!(forwards, backwards);
+    }
+
+    /// The retained original is the shallowest path, *not* the lexicographically
+    /// smallest one — and the rest of the group follows the same rule.
+    #[test]
+    fn test_the_retained_original_is_the_shallowest_path() {
+        let tmp = TempDir::new().unwrap();
+        let files = deterministic_fixture(&tmp);
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+
+        let group = result
+            .duplicate_groups
+            .iter()
+            .find(|g| g.files.len() == 3)
+            .expect("the three-copy group must be detected");
+
+        assert_eq!(
+            group.files,
+            vec![
+                tmp.path().join("zzz.jpg"),
+                tmp.path().join("bbb/two.jpg"),
+                tmp.path().join("aaa/deep/one.jpg"),
+            ],
+            "shallowest first, then lexicographic — a plain path sort would have \
+             kept aaa/deep/one.jpg"
+        );
+    }
+
+    /// At equal depth the tie-break is lexicographic on the whole path.
+    #[test]
+    fn test_the_retained_original_breaks_a_depth_tie_lexicographically() {
+        let tmp = TempDir::new().unwrap();
+        let files = deterministic_fixture(&tmp);
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+
+        let group = result
+            .duplicate_groups
+            .iter()
+            .find(|g| g.files.len() == 2)
+            .expect("the two-copy group must be detected");
+
+        assert_eq!(
+            group.files,
+            vec![
+                tmp.path().join("ccc/alpha.jpg"),
+                tmp.path().join("ccc/bravo.jpg"),
+            ],
+            "same depth, so the smaller path is the original"
+        );
+    }
+
+    /// The original a group keeps is also the copy handed on as unique, with the
+    /// group's digest — the two lists must not disagree about which file that is.
+    #[test]
+    fn test_the_retained_original_is_the_file_offered_to_the_organiser() {
+        let tmp = TempDir::new().unwrap();
+        let files = deterministic_fixture(&tmp);
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+
+        for group in &result.duplicate_groups {
+            let original = &group.files[0];
+            let carried = result
+                .unique
+                .iter()
+                .find(|u| &u.file.path == original)
+                .unwrap_or_else(|| panic!("{} must survive as unique", original.display()));
+            assert_eq!(carried.known_hash.as_ref(), Some(&group.hash));
+
+            for duplicate in group.files.iter().skip(1) {
+                assert!(
+                    !result.unique.iter().any(|u| &u.file.path == duplicate),
+                    "{} is a duplicate and must not also be offered as unique",
+                    duplicate.display()
+                );
+            }
+        }
+    }
+
+    /// Groups come back ordered by their content hash, so a report or a
+    /// `duplicates/NNN/` numbering is stable between runs.
+    #[test]
+    fn test_duplicate_groups_are_ordered_by_hash() {
+        let tmp = TempDir::new().unwrap();
+        let files = deterministic_fixture(&tmp);
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+
+        assert_eq!(result.duplicate_groups.len(), 2);
+        let hashes: Vec<&str> = result
+            .duplicate_groups
+            .iter()
+            .map(|g| g.hash.as_str())
+            .collect();
+        let mut sorted = hashes.clone();
+        sorted.sort_unstable();
+        assert_eq!(hashes, sorted);
+    }
+
+    /// `unique` is the order the organiser plans moves in, so it is sorted by
+    /// the same rule rather than by whatever the last `HashMap` said.
+    #[test]
+    fn test_unique_files_come_back_in_path_order() {
+        let tmp = TempDir::new().unwrap();
+        let files = deterministic_fixture(&tmp);
+        let result = find_duplicates(&files, &ProgressBar::hidden());
+
+        let paths: Vec<PathBuf> = result.unique.iter().map(|u| u.file.path.clone()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_by(|a, b| by_depth_then_path(a, b));
+        assert_eq!(paths, sorted);
     }
 }

@@ -13,18 +13,26 @@
 //! asserted, and each one would have produced a plausible-looking but wrong
 //! test if it had been guessed instead:
 //!
-//! 1. **Scan order is not declaration order and not alphabetical.** `WalkDir`
-//!    returns whatever the filesystem hands it — on APFS a tree declared
-//!    `a.jpg` then `b.jpg` scanned back as `b.jpg`, `a.jpg`. "The first file
-//!    is kept" therefore means *first in scan order*, so every test derives
-//!    that expectation from [`mmm::scanner::scan_directories`] rather than
-//!    hard-coding a name.
-//! 2. **`duplicates/NNN` numbering is not stable across runs.** The groups are
-//!    accumulated by iterating a `HashMap`, whose order is randomly seeded per
-//!    process. Two groups in one tree came back as `000`/`001` in one run and
-//!    swapped in the next, over six consecutive runs. `000` is only reliable
-//!    when the tree contains exactly one group; the multi-group test is
-//!    written order-agnostically for that reason.
+//! 1. **Which copy is kept is a documented rule, and it is not scan order.**
+//!    `WalkDir` returns whatever the filesystem hands it — on APFS a tree
+//!    declared `a.jpg` then `b.jpg` scans back as `b.jpg`, `a.jpg`, and ext4
+//!    disagrees with APFS. These tests used to derive their expectations from
+//!    [`mmm::scanner::scan_directories`] for exactly that reason. They no
+//!    longer need to: the retained original is now **the shallowest path, then
+//!    the lexicographically smallest**, decided after hashing, so `a.jpg` is
+//!    kept over `b.jpg` and a top-level file is kept over a nested one on every
+//!    platform. The expectations below are therefore written out by name — and
+//!    a test that names a file is a test that would catch the rule silently
+//!    reverting to a coin toss.
+//! 2. **`duplicates/NNN` numbering follows content-hash order.** The groups
+//!    used to be accumulated by iterating a `HashMap`, whose order is randomly
+//!    seeded per process: two groups in one tree came back `000`/`001` in one
+//!    run and swapped in the next, over six consecutive runs. They are now
+//!    sorted by their BLAKE3 digest, so the numbering is stable between runs —
+//!    but which group lands on `000` still depends on how the fixtures' bytes
+//!    happen to hash, which is nothing a test should predict. `000` is asserted
+//!    only where the tree contains exactly one group; the multi-group test
+//!    stays order-agnostic.
 //! 3. **The manifest records *input* paths, so it goes stale the moment the
 //!    run finishes.** See
 //!    [`the_manifest_records_input_paths_which_go_stale_when_the_run_moves_them`].
@@ -108,13 +116,13 @@ fn scratch_output() -> (TempDir, PathBuf) {
     (dir, out)
 }
 
-/// The order in which the binary will encounter the media files in `input`.
+/// The media files in `input`, as the binary's own scanner admits them.
 ///
-/// Filesystem walk order is neither declaration order nor alphabetical, and
-/// "the first file in the group is kept" is defined against it — so tests ask
-/// the scanner rather than assuming. This calls the same function the binary
-/// calls, over the same unmodified directory.
-fn scan_order(input: &Path) -> Vec<PathBuf> {
+/// Used to assert the *set* a fixture produced — which is still worth checking,
+/// since a file the scan quietly passed over would otherwise look like a file
+/// the dedup pass correctly ignored. It is deliberately unsorted: nothing
+/// downstream is defined against this order any more.
+fn scanned_files(input: &Path) -> Vec<PathBuf> {
     mmm::scanner::scan_directories(&[input.to_path_buf()], &ScanFilter::default())
         .files
         .into_iter()
@@ -233,16 +241,16 @@ fn leaf(path: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn two_identical_jpegs_make_one_group_keeping_the_first_and_setting_the_second_aside() {
+fn two_identical_jpegs_make_one_group_keeping_the_lower_path_and_setting_the_other_aside() {
     let tree = MediaTree::new()
         .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
         .duplicate_of("b.jpg", "a.jpg");
 
-    // Which file is "first" is a property of the walk, not of the declaration
-    // order above — see the module note.
-    let order = scan_order(tree.path());
-    assert_eq!(order.len(), 2, "fixture setup: {order:?}");
-    let (expected_kept, expected_moved) = (order[0].clone(), order[1].clone());
+    // Same directory, so same depth: the tie-break decides, and `a.jpg` is
+    // kept on every platform regardless of which one the filesystem hands
+    // back first. See the module note.
+    assert_eq!(scanned_files(tree.path()).len(), 2, "fixture setup");
+    let (expected_kept, expected_moved) = (tree.path().join("a.jpg"), tree.path().join("b.jpg"));
 
     let (_scratch, out_dir) = scratch_output();
     let out = run_commit(tree.path(), &out_dir);
@@ -272,14 +280,14 @@ fn two_identical_jpegs_make_one_group_keeping_the_first_and_setting_the_second_a
         ]
     );
 
-    // The manifest agrees about which file was kept. Asserting this against
-    // the *scan* order is what pins "the first is kept"; without it, a change
-    // that retained the last file would still satisfy everything above.
+    // The manifest agrees about which file was kept. Naming it is what pins
+    // the retention rule; without this, a change that retained the other copy
+    // would still satisfy everything above.
     let manifest = read_manifest(&groups[0].join("manifest.txt"));
     assert_eq!(
         manifest.original,
         expected_kept.display().to_string(),
-        "the retained original was not the first file in scan order"
+        "the retained original was not the lexicographically smallest path"
     );
 
     // Both files left the input tree; neither was copied, both were moved.
@@ -292,8 +300,7 @@ fn the_manifest_names_both_the_retained_original_and_the_moved_duplicate() {
         .jpeg_with_exif("a.jpg", naive(2024, 1, 15, 14, 30, 0), None)
         .duplicate_of("b.jpg", "a.jpg");
 
-    let order = scan_order(tree.path());
-    let (kept, moved) = (order[0].clone(), order[1].clone());
+    let (kept, moved) = (tree.path().join("a.jpg"), tree.path().join("b.jpg"));
 
     let (_scratch, out_dir) = scratch_output();
     assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
@@ -431,11 +438,13 @@ fn three_identical_files_make_one_group_with_two_files_moved_into_it() {
         .duplicate_of("b.jpg", "a.jpg")
         .duplicate_of("nested/c.jpg", "a.jpg");
 
-    let order = scan_order(tree.path());
-    assert_eq!(order.len(), 3, "fixture setup: {order:?}");
-    let kept = order[0].clone();
-    let mut moved: Vec<String> = order[1..].iter().map(|p| leaf(p)).collect();
-    moved.sort();
+    // `a.jpg` and `b.jpg` sit one component deep, `nested/c.jpg` two — so the
+    // depth rule keeps a top-level copy, and the tie-break between the two
+    // top-level ones keeps `a.jpg`. Previously this was whichever the
+    // filesystem walked first, which is why ext4 and APFS disagreed here.
+    assert_eq!(scanned_files(tree.path()).len(), 3, "fixture setup");
+    let kept = tree.path().join("a.jpg");
+    let moved: Vec<String> = vec!["b.jpg".to_string(), "c.jpg".to_string()];
 
     let (_scratch, out_dir) = scratch_output();
     assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
@@ -467,18 +476,16 @@ fn three_identical_files_make_one_group_with_two_files_moved_into_it() {
     );
 
     // Every surplus copy is a flat *file* directly inside the group directory,
-    // under its bare leaf name — including any that came from a subdirectory.
+    // under its bare leaf name — including `nested/c.jpg`, which came from a
+    // subdirectory.
     //
-    // Derived from scan order rather than naming a file, because which of the
-    // three copies is kept is decided by the filesystem, and ext4 and APFS
-    // disagree. Asserting `duplicates/000/c.jpg` here passed on macOS and
-    // failed on Linux, where `nested/c.jpg` is scanned first and so becomes
-    // the *retained* copy, never entering the duplicates set at all.
-    //
-    // Nested flattening specifically is pinned unconditionally by
-    // `duplicates_sharing_a_leaf_name_do_not_overwrite_each_other` below,
-    // where all three copies live in subdirectories — so whichever one is
-    // kept, both survivors are nested and flattening must happen.
+    // This used to be derived from scan order and could not name `c.jpg`:
+    // asserting `duplicates/000/c.jpg` passed on macOS and failed on Linux,
+    // where `nested/c.jpg` was scanned first and so became the *retained*
+    // copy, never entering the duplicates set at all. The depth rule settles
+    // it — a nested copy is never kept over a top-level one — so the nested
+    // file's flattening is now pinned here as well as in
+    // `duplicates_sharing_a_leaf_name_do_not_overwrite_each_other` below.
     for name in &moved {
         assert!(
             groups[0].join(name).is_file(),
