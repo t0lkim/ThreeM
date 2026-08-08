@@ -46,6 +46,18 @@ assert_cmd = "2"
 predicates = "3"
 proptest = "1"
 tempfile = "3"
+# Throughput measurement for the dedup cascade. A parallelisation change with no
+# benchmark is a guess, and the numbers have to survive being compared against
+# each other months apart — criterion's warm-up, outlier detection and saved
+# baselines do that, a hand-rolled `Instant::now()` loop does not.
+#
+# Default features off: `plotters` and `rayon` exist to draw the HTML report,
+# which nothing here reads — the numbers are transcribed into
+# `docs/research/hashing-baseline.md` by hand so they are reviewable in the diff.
+# `cargo_bench_support` is the one that makes `cargo bench` work at all.
+criterion = { version = "0.8", default-features = false, features = [
+    "cargo_bench_support",
+] }
 # NOTE: `walkdir` is a normal dependency above. Cargo makes normal dependencies
 # available to test targets too, so it needs no promotion here for the
 # `snapshot_tree` helper the integration suites will use.
@@ -61,6 +73,12 @@ path = "src/main.rs"
 [[bin]]
 name = "mmm-dedup-verifier"
 path = "src/bin/mmm_dedup_verifier.rs"
+
+# `harness = false` hands `main` to criterion instead of libtest, which is how
+# criterion collects samples at all.
+[[bench]]
+name = "hashing"
+harness = false
 
 [lints.clippy]
 # ThreeM moves other people's photo libraries. A panic mid-run leaves a tree
