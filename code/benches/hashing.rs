@@ -349,6 +349,10 @@ fn bench_cascade(c: &mut Criterion, corpus: &Corpus) {
 fn bench_phases(c: &mut Criterion, corpus: &Corpus) {
     let pool = HashPool::automatic().expect("a default hashing pool must build");
     let mixed = corpus.all();
+    // The hashing passes tick a bar per file. Nobody is watching a benchmark, so
+    // they tick a hidden one — the atomic increment is measured either way,
+    // which is right: it is a cost the real run pays too.
+    let quiet = ProgressBar::hidden();
 
     let size_groups = hasher::group_by_size(&mixed);
     let phase2_candidates: Vec<&ScannedFile> = size_groups
@@ -357,7 +361,7 @@ fn bench_phases(c: &mut Criterion, corpus: &Corpus) {
         .flatten()
         .collect();
 
-    let partial = hasher::group_by_partial_hash(&phase2_candidates, &pool);
+    let partial = hasher::group_by_partial_hash(&phase2_candidates, &quiet, &pool);
     let phase3_candidates: Vec<&ScannedFile> = partial
         .groups
         .values()
@@ -397,6 +401,7 @@ fn bench_phases(c: &mut Criterion, corpus: &Corpus) {
         b.iter(|| {
             black_box(hasher::group_by_partial_hash(
                 black_box(&phase2_candidates),
+                &quiet,
                 &pool,
             ))
         });
@@ -407,6 +412,7 @@ fn bench_phases(c: &mut Criterion, corpus: &Corpus) {
         b.iter(|| {
             black_box(hasher::group_by_full_hash(
                 black_box(&phase3_candidates),
+                &quiet,
                 &pool,
             ))
         });

@@ -25,6 +25,17 @@ const PARTIAL_HASH_BYTES: u64 = 64 * 1024; // 64KB
 const STREAM_BUFFER_BYTES: usize = 128 * 1024;
 
 // =====================================================================
+// What the bar says it is doing
+// =====================================================================
+
+/// The three phase messages, named rather than written inline at the point they
+/// are set, so the tests that pin the *ordering* between them are asserting
+/// against the same strings the run displays.
+const PHASE_1_MESSAGE: &str = "Phase 1: grouping by file size";
+const PHASE_2_MESSAGE: &str = "Phase 2: partial hashing size-matched files";
+const PHASE_3_MESSAGE: &str = "Phase 3: full hashing confirmed candidates";
+
+// =====================================================================
 // How many files may be read at once
 // =====================================================================
 
@@ -233,12 +244,41 @@ fn by_depth_then_path(a: &Path, b: &Path) -> Ordering {
 /// `test_one_thread_gives_the_same_answer_as_the_parallel_default` pins. What it
 /// changes is how many files are open at once, which is a question about the
 /// storage device rather than about duplicate detection — see [`HashPool`].
+///
+/// # What the progress bar counts
+///
+/// **Reads, not files** — and this function owns the bar's position, length and
+/// message for the duration of the call, whatever the caller set them to.
+///
+/// Counting files would make the bar lie about where the time goes. Phase 1 is
+/// metadata only: it retires most of a library in microseconds (12 µs against
+/// phase 3's 94 ms on the project's benchmark corpus). A bar that ticked once
+/// per file would leap to 90% in the first millisecond and then spend the whole
+/// run on the last tenth — technically counting something real, and useless for
+/// answering "how much longer". The bar therefore starts counting at phase 2,
+/// where the first byte of file content is read.
+///
+/// **The length is charged pessimistically and refunded, so it only ever
+/// shrinks.** At the start of phase 2 the cascade knows it must partial-hash
+/// `C₂` candidates and that *up to* `C₂` of them will go on to a full read, so
+/// the length is `2 × C₂`. Phase 2 then rules most of them out, and the length
+/// drops to `C₂ + C₃` for the phase-3 set it actually produced. Charging the
+/// second read only when it was confirmed would be the same arithmetic run the
+/// other way — the bar would reach 100% at the end of phase 2 and then fall
+/// back for the phase that takes 92% of the time, which is the behaviour this
+/// accounting exists to avoid. Position rises and length falls, so the fraction
+/// never goes backwards.
+///
+/// **It ends exactly full.** On return `position() == length()`, without
+/// [`ProgressBar::finish`] having to paper over a shortfall — a file that could
+/// not be read ticks like any other, because the read was still attempted and
+/// the operator still waited for it.
 pub fn find_duplicates(
     files: &[ScannedFile],
     progress: &ProgressBar,
     pool: &HashPool,
 ) -> DedupResult {
-    progress.set_message("Phase 1: grouping by file size");
+    progress.set_message(PHASE_1_MESSAGE);
     let size_groups = group_by_size(files);
 
     // Files with unique sizes are immediately unique
@@ -266,7 +306,15 @@ pub fn find_duplicates(
     );
 
     // Phase 2: Partial hash
-    progress.set_message("Phase 2: partial hashing size-matched files");
+    //
+    // The bar starts counting here, because this is where the reading starts.
+    // Two reads are charged per candidate — the partial hash it is about to get,
+    // and the full hash it may go on to need — and the second is refunded below
+    // for every file phase 2 rules out.
+    let phase2_reads = phase2_candidates.len() as u64;
+    progress.set_position(0);
+    progress.set_length(phase2_reads.saturating_mul(2));
+    progress.set_message(PHASE_2_MESSAGE);
     // Keyed by *size and* digest, not digest alone. A partial hash is only the
     // head (and, past 128 KB, the tail), so two files of different lengths can
     // legitimately share one — a truncated download and the whole file it came
@@ -276,9 +324,9 @@ pub fn find_duplicates(
         &phase2_candidates,
         |file| partial_hash(&file.path),
         |file, digest| (file.size, digest),
+        progress,
         pool,
     );
-    progress.inc(phase2_candidates.len() as u64);
 
     let mut phase3_candidates: Vec<&ScannedFile> = Vec::new();
     for pgroup in partial_groups.into_values() {
@@ -303,12 +351,19 @@ pub fn find_duplicates(
     // Keyed by the digest alone, across what were separate size groups, which
     // merges nothing: two files with the same full hash have the same content
     // and therefore the same size, so they were in one size group already.
-    progress.set_message("Phase 3: full hashing confirmed candidates");
+    //
+    // Phase 2 has finished — `group_by_key` collects, and a collect is a barrier
+    // — so the full-read charge can be settled against the set it actually
+    // produced rather than the worst case. `phase3_candidates` is a subset of
+    // the phase-2 candidates, so this only ever lowers the length, and the
+    // message below cannot be displayed beside a position phase 2 is still
+    // moving.
+    progress.set_length(phase2_reads + phase3_candidates.len() as u64);
+    progress.set_message(PHASE_3_MESSAGE);
     let mut duplicate_groups: Vec<DuplicateGroup> = Vec::new();
 
-    let full = group_by_full_hash(&phase3_candidates, pool);
+    let full = group_by_full_hash(&phase3_candidates, progress, pool);
     skipped += full.skipped;
-    progress.inc(phase3_candidates.len() as u64);
 
     for (hash, mut fgroup) in full.groups {
         // Before anything reads `fgroup[0]`, and before the group is
@@ -380,12 +435,20 @@ pub fn group_by_size(files: &[ScannedFile]) -> HashMap<u64, Vec<ScannedFile>> {
 ///
 /// A file that cannot be opened, seeked or read is left out of the returned
 /// groups and counted in [`HashGroups::skipped`], with a warning naming it.
+///
+/// `progress` is ticked once per file as its read completes; pass
+/// [`ProgressBar::hidden`] if there is nobody watching.
 // exposed for integration tests
-pub fn group_by_partial_hash<'a>(files: &[&'a ScannedFile], pool: &HashPool) -> HashGroups<'a> {
+pub fn group_by_partial_hash<'a>(
+    files: &[&'a ScannedFile],
+    progress: &ProgressBar,
+    pool: &HashPool,
+) -> HashGroups<'a> {
     let (groups, skipped) = group_by_key(
         files,
         |file| partial_hash(&file.path),
         |_, digest| digest,
+        progress,
         pool,
     );
     HashGroups { groups, skipped }
@@ -396,12 +459,20 @@ pub fn group_by_partial_hash<'a>(files: &[&'a ScannedFile], pool: &HashPool) -> 
 /// A file that cannot be opened or read to completion is left out of the
 /// returned groups and counted in [`HashGroups::skipped`], with a warning
 /// naming it.
+///
+/// `progress` is ticked once per file as its read completes; pass
+/// [`ProgressBar::hidden`] if there is nobody watching.
 // exposed for integration tests
-pub fn group_by_full_hash<'a>(files: &[&'a ScannedFile], pool: &HashPool) -> HashGroups<'a> {
+pub fn group_by_full_hash<'a>(
+    files: &[&'a ScannedFile],
+    progress: &ProgressBar,
+    pool: &HashPool,
+) -> HashGroups<'a> {
     let (groups, skipped) = group_by_key(
         files,
         |file| full_hash(&file.path),
         |_, digest| digest,
+        progress,
         pool,
     );
     HashGroups { groups, skipped }
@@ -435,10 +506,28 @@ pub fn group_by_full_hash<'a>(files: &[&'a ScannedFile], pool: &HashPool) -> Has
 /// The parallel half runs inside `pool` rather than on `rayon`'s global pool, so
 /// how many files this opens at once is the caller's decision — see
 /// [`HashPool`].
+///
+/// # Progress
+///
+/// `progress` is ticked from inside the parallel closure, once per file, the
+/// moment that file's read finishes — not once per phase and not once per size
+/// group. A bar that advanced per group would sit motionless through the
+/// longest read in a library and then jump, which under parallelism is most of
+/// the time: the groups are hashed all at once, so "this group is done" stopped
+/// being a milestone the moment the work was flattened.
+///
+/// The tick is unconditional. A file that would not open still ticks, because
+/// the bar measures reads attempted, not reads that succeeded — a run whose bar
+/// stalled two files short of its total would have the operator looking for a
+/// hang instead of reading the skip count.
+///
+/// [`ProgressBar`] is `Send + Sync` and its position is an atomic, so this needs
+/// no synchronisation of its own; the caller owns the length and the message.
 fn group_by_key<'a, K, H, F>(
     files: &[&'a ScannedFile],
     hash: H,
     key: F,
+    progress: &ProgressBar,
     pool: &HashPool,
 ) -> (HashMap<K, Vec<&'a ScannedFile>>, usize)
 where
@@ -446,9 +535,16 @@ where
     H: Fn(&ScannedFile) -> Result<String> + Sync,
     F: Fn(&ScannedFile, String) -> K,
 {
-    let digests: Vec<Result<String>> = pool
-        .pool
-        .install(|| files.par_iter().map(|file| hash(file)).collect());
+    let digests: Vec<Result<String>> = pool.pool.install(|| {
+        files
+            .par_iter()
+            .map(|file| {
+                let digest = hash(file);
+                progress.inc(1);
+                digest
+            })
+            .collect()
+    });
 
     let mut groups: HashMap<K, Vec<&'a ScannedFile>> = HashMap::new();
     let mut skipped = 0;
@@ -608,7 +704,13 @@ pub fn copy_hashing(src: &Path, dst: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Create a progress bar styled for hashing operations
+/// Create a progress bar styled for hashing operations.
+///
+/// `total` is only what the bar shows before the first phase boundary —
+/// [`find_duplicates`] resets the length to the number of reads it is going to
+/// perform as soon as phase 1 tells it what that is, so the scan count passed
+/// here is a placeholder for the microseconds phase 1 takes and not a claim
+/// about the work ahead.
 pub fn hashing_progress_bar(total: u64) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(styled_bar(
@@ -882,7 +984,7 @@ mod tests {
         let denied = File::open(&locked).is_err();
         let a = make_scanned(readable, 16);
         let b = make_scanned(locked.clone(), 16);
-        let grouped = group_by_full_hash(&[&a, &b], &pool());
+        let grouped = group_by_full_hash(&[&a, &b], &ProgressBar::hidden(), &pool());
 
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -1258,10 +1360,14 @@ mod tests {
     /// phase 3, and each buy a full read to discover what their lengths already
     /// said. Keyed by `(size, digest)` each is a bucket of one and neither is
     /// opened again, which is what `known_hash: None` records here.
-    #[test]
-    fn test_phase_2_does_not_regroup_files_phase_1_separated_by_size() {
-        let tmp = TempDir::new().unwrap();
-
+    /// Four files in two size groups of two, where **no** pair survives the
+    /// partial hash — so phase 2 has four candidates and phase 3 has none.
+    ///
+    /// Both size groups hold one file sharing a 64 KB head with the other
+    /// group's and one that does not, so the group splits into two buckets of
+    /// one and nothing is promoted. Every file is under 128 KB, so the partial
+    /// hash covers only that head.
+    fn partial_hash_retires_everything_fixture(tmp: &TempDir) -> Vec<ScannedFile> {
         let head: Vec<u8> = (0..PARTIAL_HASH_BYTES).map(|i| (i % 251) as u8).collect();
         let shared_head = |extra: usize, fill: u8| {
             let mut body = head.clone();
@@ -1275,16 +1381,22 @@ mod tests {
             body
         };
 
-        let files = vec![
+        vec![
             // 70 000 bytes: one file sharing the head, one not — so this size
             // group splits into two buckets of one.
-            plant(&tmp, "small-shared.jpg", &shared_head(5_536, 0x11)),
-            plant(&tmp, "small-other.jpg", &other_head(5_536)),
+            plant(tmp, "small-shared.jpg", &shared_head(5_536, 0x11)),
+            plant(tmp, "small-other.jpg", &other_head(5_536)),
             // 80 000 bytes: same shape, and its shared-head file has exactly
             // the same partial digest as `small-shared.jpg`.
-            plant(&tmp, "large-shared.jpg", &shared_head(15_536, 0x22)),
-            plant(&tmp, "large-other.jpg", &other_head(15_536)),
-        ];
+            plant(tmp, "large-shared.jpg", &shared_head(15_536, 0x22)),
+            plant(tmp, "large-other.jpg", &other_head(15_536)),
+        ]
+    }
+
+    #[test]
+    fn test_phase_2_does_not_regroup_files_phase_1_separated_by_size() {
+        let tmp = TempDir::new().unwrap();
+        let files = partial_hash_retires_everything_fixture(&tmp);
 
         assert_eq!(
             partial_hash(&files[0].path).unwrap(),
@@ -1403,6 +1515,367 @@ mod tests {
                  would mean the bound is not what is being measured above"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // What the progress bar says while all that is happening
+    // -----------------------------------------------------------------
+
+    /// The bar's state after a cascade, as a caller could read it.
+    fn bar_after(files: &[ScannedFile]) -> (u64, u64, String) {
+        let bar = hashing_progress_bar(files.len() as u64);
+        let _ = find_duplicates(files, &bar, &pool());
+        (
+            bar.position(),
+            bar.length().unwrap_or_default(),
+            bar.message(),
+        )
+    }
+
+    /// The bar reaches its total by doing the work, not by
+    /// [`ProgressBar::finish`] setting the position to the length on the way
+    /// out.
+    ///
+    /// This is the property the phase's title is about. Before it, the bar's
+    /// length was the *scan* count while only the hashing candidates ever
+    /// ticked it, so a run over a library of mostly-unique files — which is
+    /// every real library — finished at something like 40/12000 and the
+    /// operator's only clue that it had not stalled was that the program
+    /// exited.
+    ///
+    /// Asserted on a hidden bar, which is what the tests and any non-terminal
+    /// caller get: a hidden bar keeps its position and length exactly as a
+    /// visible one does, so "renders correctly when hidden" is the same claim
+    /// as "the numbers are right when nobody is drawing them".
+    #[test]
+    fn test_the_bar_ends_exactly_full() {
+        let tmp = TempDir::new().unwrap();
+        let files = wide_fixture(&tmp, 32);
+
+        let (position, length, message) = bar_after(&files);
+
+        // 96 files, all one size, in 32 partial-hash groups of three — so every
+        // one of them is partial-hashed and every one is promoted to a full
+        // read. Spelt out rather than derived from `position`, which would make
+        // the assertion true of any number the cascade happened to reach.
+        assert_eq!(
+            length,
+            96 + 96,
+            "one tick per read, and there are two per file"
+        );
+        assert_eq!(position, length, "the bar must arrive at its total");
+        assert_eq!(message, PHASE_3_MESSAGE);
+    }
+
+    /// A library with no size collisions reads nothing, and says so: no reads
+    /// charged, no reads outstanding.
+    ///
+    /// The degenerate case matters because it is the common one — most files in
+    /// a photo library have a size nothing else shares — and because a bar of
+    /// length zero is where an accounting scheme divides by it.
+    #[test]
+    fn test_a_library_with_no_size_collisions_charges_no_reads() {
+        let tmp = TempDir::new().unwrap();
+        let files = vec![
+            plant(&tmp, "a.jpg", b"one"),
+            plant(&tmp, "b.jpg", b"two-"),
+            plant(&tmp, "c.jpg", b"three"),
+        ];
+
+        let (position, length, _) = bar_after(&files);
+
+        assert_eq!(length, 0);
+        assert_eq!(position, length);
+    }
+
+    /// The second read is charged up front and *refunded* when phase 2 rules it
+    /// out — so a corpus phase 2 retires entirely ends at one tick per file,
+    /// not two.
+    #[test]
+    fn test_the_full_read_charge_is_refunded_when_phase_2_retires_a_file() {
+        let tmp = TempDir::new().unwrap();
+        let files = partial_hash_retires_everything_fixture(&tmp);
+
+        let (position, length, _) = bar_after(&files);
+
+        assert_eq!(
+            length,
+            files.len() as u64,
+            "four partial hashes and no full ones — the four full reads charged at the \
+             start of phase 2 must have been given back"
+        );
+        assert_eq!(position, length);
+    }
+
+    /// A file that will not open still ticks.
+    ///
+    /// The bar counts reads *attempted*, because that is what the operator
+    /// waited for. A bar that only counted successes would stall a dozen short
+    /// of its total on a library with a dozen unreadable files, and stalling is
+    /// the one thing a progress bar must not do for a reason it is not going to
+    /// explain — the skip count in the summary is where that is explained.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_unreadable_file_still_ticks_the_bar() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let files = wide_fixture(&tmp, 4);
+        let locked = tmp.path().join("g000/c0/photo.jpg");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let denied = File::open(&locked).is_err();
+        let (position, length, _) = bar_after(&files);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+
+        if !denied {
+            eprintln!(
+                "SKIPPED test_an_unreadable_file_still_ticks_the_bar: a 0o000 file was still \
+                 readable, so this process ignores permission bits (running as root?)"
+            );
+            return;
+        }
+
+        // 12 files partial-hashed; the locked one fails there and is not
+        // promoted, so 11 full reads follow.
+        assert_eq!(length, 12 + 11);
+        assert_eq!(
+            position, length,
+            "the file that would not open was still opened for — the bar must account for it"
+        );
+    }
+
+    /// Every file ticks as *its own* read finishes, not once per phase and not
+    /// once per size group.
+    ///
+    /// Observed from inside the hashing closure: each file records the position
+    /// it saw on the way in. On a one-thread pool, the file that runs `k`th
+    /// finds `k` ticks already banked, whatever order the pool chooses to run
+    /// them in — so the observations are exactly `0..n`, sorted. Batched at the
+    /// end of the phase, as the old code did, every observation would be `0`.
+    #[test]
+    fn test_every_file_ticks_as_its_own_read_finishes() {
+        use std::sync::Mutex;
+
+        let tmp = TempDir::new().unwrap();
+        let files = wide_fixture(&tmp, 4);
+        let candidates: Vec<&ScannedFile> = files.iter().collect();
+
+        let bar = ProgressBar::hidden();
+        bar.set_length(candidates.len() as u64);
+        let observed = Mutex::new(Vec::new());
+        let serial = HashPool::with_threads(NonZeroUsize::MIN).unwrap();
+
+        let (_groups, skipped) = group_by_key(
+            &candidates,
+            |file| {
+                observed
+                    .lock()
+                    .expect("the observation log is never poisoned")
+                    .push(bar.position());
+                full_hash(&file.path)
+            },
+            |_, digest| digest,
+            &bar,
+            &serial,
+        );
+
+        assert_eq!(skipped, 0);
+        let mut seen = observed
+            .into_inner()
+            .expect("the observation log is never poisoned");
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..candidates.len() as u64).collect::<Vec<_>>(),
+            "each file must have found a different number of ticks already banked — all \
+             zeroes means the phase ticked once at the end"
+        );
+        assert_eq!(bar.position(), candidates.len() as u64);
+    }
+
+    /// A terminal that keeps every line drawn to it, so a test can read what a
+    /// watching operator would have seen rather than only the final state.
+    ///
+    /// [`indicatif::ProgressDrawTarget::term_like`] applies no rate limit of its
+    /// own, so every redraw the bar asks for is recorded — including the one
+    /// each `set_message` and `set_length` triggers, which is what makes the
+    /// phase-boundary assertions below deterministic rather than a race against
+    /// the redraw clock.
+    #[derive(Debug, Clone, Default)]
+    struct RecordingTerm {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingTerm {
+        fn record(&self, s: &str) {
+            if !s.trim().is_empty() {
+                self.lines
+                    .lock()
+                    .expect("the frame log is never poisoned")
+                    .push(s.to_string());
+            }
+        }
+
+        /// Every recorded frame, parsed into the position, the length and the
+        /// message the template put on the line.
+        fn frames(&self) -> Vec<(u64, u64, String)> {
+            self.lines
+                .lock()
+                .expect("the frame log is never poisoned")
+                .iter()
+                .filter_map(|line| parse_frame(line))
+                .collect()
+        }
+    }
+
+    impl indicatif::TermLike for RecordingTerm {
+        fn width(&self) -> u16 {
+            // Wide enough that nothing the template emits is truncated away.
+            200
+        }
+        fn move_cursor_up(&self, _n: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_down(&self, _n: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_right(&self, _n: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_left(&self, _n: usize) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_line(&self, s: &str) -> io::Result<()> {
+            self.record(s);
+            Ok(())
+        }
+        fn write_str(&self, s: &str) -> io::Result<()> {
+            self.record(s);
+            Ok(())
+        }
+        fn clear_line(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Pull `pos`, `len` and the message back out of one rendered line.
+    ///
+    /// The template is `... {pos}/{len} {msg}`, so the first whitespace-delimited
+    /// token that reads as two integers around a slash is the counter and
+    /// everything after it is the message.
+    fn parse_frame(line: &str) -> Option<(u64, u64, String)> {
+        let mut rest = line;
+        while let Some(start) = rest.find('/') {
+            let (before, after) = rest.split_at(start);
+            let pos = before
+                .rsplit(|c: char| c.is_whitespace())
+                .next()
+                .and_then(|t| t.parse::<u64>().ok());
+            let after = &after[1..];
+            let end = after
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after.len());
+            let len = after[..end].parse::<u64>().ok();
+            if let (Some(pos), Some(len)) = (pos, len) {
+                return Some((pos, len, after[end..].trim().to_string()));
+            }
+            rest = after;
+        }
+        None
+    }
+
+    /// What a watching operator actually sees: the bar never goes backwards,
+    /// never overshoots, and never shows one phase's message beside another
+    /// phase's outstanding work.
+    ///
+    /// The last is the phase-boundary claim. Phases cannot overlap in wall-clock
+    /// time because `group_by_key` ends in a `collect`, and a collect is a
+    /// barrier — so no frame may carry the phase-3 message while the phase-2
+    /// reads are still landing. If the barrier were ever removed in the name of
+    /// overlapping the phases, this is what would fail, and the message would
+    /// have to become something that could honestly describe both at once.
+    #[test]
+    fn test_the_bar_reads_honestly_frame_by_frame() {
+        /// 32 groups of three, all one size, so every file is partial-hashed.
+        const PHASE_2_READS: u64 = 96;
+
+        let tmp = TempDir::new().unwrap();
+        let files = wide_fixture(&tmp, 32);
+
+        let term = RecordingTerm::default();
+        let bar = hashing_progress_bar(files.len() as u64);
+        bar.set_draw_target(indicatif::ProgressDrawTarget::term_like(Box::new(
+            term.clone(),
+        )));
+
+        let _ = find_duplicates(&files, &bar, &pool());
+
+        let frames = term.frames();
+        assert!(
+            frames.len() >= 3,
+            "the three phase messages alone must have drawn three frames, got {}",
+            frames.len()
+        );
+
+        // Fractions compared as rationals, cross-multiplied, rather than as
+        // floats: the question is whether the bar ever moved backwards, and an
+        // answer that depended on rounding would be no answer. A length of zero
+        // is a finished bar, not a division by it.
+        let fraction = |(position, length): (u64, u64)| {
+            if length == 0 {
+                (1u128, 1u128)
+            } else {
+                (u128::from(position), u128::from(length))
+            }
+        };
+        let mut previous = (0u128, 1u128);
+        let mut length_after_phase_2_began: Option<u64> = None;
+        for (position, length, message) in &frames {
+            assert!(
+                position <= length,
+                "{position}/{length} — the bar showed more work done than there was"
+            );
+
+            let current = fraction((*position, *length));
+            assert!(
+                current.0 * previous.1 >= previous.0 * current.1,
+                "the bar went backwards, from {}/{} to {position}/{length}",
+                previous.0,
+                previous.1
+            );
+            previous = current;
+
+            if message == PHASE_2_MESSAGE {
+                assert!(
+                    *position <= PHASE_2_READS,
+                    "{position} reads shown during phase 2, which only has {PHASE_2_READS}"
+                );
+                length_after_phase_2_began.get_or_insert(*length);
+            }
+            if message == PHASE_3_MESSAGE {
+                assert!(
+                    *position >= PHASE_2_READS,
+                    "phase 3's message was displayed at {position} reads, before phase 2's \
+                     {PHASE_2_READS} had all landed — the phases are overlapping"
+                );
+            }
+            if let Some(charged) = length_after_phase_2_began {
+                assert!(
+                    *length <= charged,
+                    "the length grew from {charged} to {length}; it may only be refunded"
+                );
+            }
+        }
+
+        assert_eq!(
+            frames.last().map(|(_, _, message)| message.as_str()),
+            Some(PHASE_3_MESSAGE),
+            "the run ends in phase 3, so that is what the last frame drawn must say"
+        );
     }
 
     /// `unique` is the order the organiser plans moves in, so it is sorted by
