@@ -289,14 +289,31 @@ jobs:
       # timeout is twenty minutes, so an input that sends a parser into an
       # infinite loop would hang the job until GitHub killed it with no useful
       # output. Ten seconds turns that into a reported failure naming the input.
+      # `--target` is passed explicitly, and it is not decoration.
+      #
+      # `cargo fuzz` defaults its target to the triple *it was built for*, not
+      # the one it is running on. install-action has no entry for cargo-fuzz and
+      # falls back to `cargo-binstall`, which fetched an `x86_64-unknown-linux-
+      # musl` build on Linux and an `x86_64-apple-darwin` build on an arm64 Mac.
+      # Both then targeted themselves: musl gave `sanitizer is incompatible with
+      # statically linked libc`, since a static libc cannot carry ASan, and the
+      # x86_64 macOS build asked for a std that is not installed on an arm64
+      # runner. Neither error names the cause.
+      #
+      # Reading the host out of `rustc -vV` makes the run independent of how the
+      # tool arrived, which is the property that was missing: the job broke
+      # because an installation detail changed, not because anything in this
+      # repository did.
       - name: Run each target
         working-directory: code
         run: |
           set -euo pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          echo "fuzzing for the host triple: $host"
           for target in $(cargo fuzz list); do
             echo "::group::$target"
             mkdir -p "fuzz/scratch/$target"
-            cargo fuzz run "$target" \
+            cargo fuzz run --target "$host" "$target" \
               "fuzz/scratch/$target" "fuzz/corpus/$target" \
               -- -max_total_time=60 -timeout=10 -print_final_stats=1
             echo "::endgroup::"
