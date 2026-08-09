@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-08-09
+
 ### Security
 
 - **XMP sidecars over 10 MB are refused before they are parsed.** The reader streams — `NsReader` over a `BufReader`, not a `read_to_string` — but streaming bounds how much is read at a time, not how much a *single* element can allocate: one unclosed tag holding a gigabyte of text is one buffer growing to a gigabyte. A real sidecar is a few kilobytes, so the cap refuses only files that are not sidecars. Reported as F002.
@@ -303,7 +305,8 @@ Six further defects on the destructive path — every one of them able to lose a
 - No TIFF-based RAW is dated from the RAW itself — `nom-exif` reads four container families and none of them is a bare TIFF. An `.xmp` beside the file covers this for an edited library; a RAW library with no sidecars is dated from the filesystem unless `--require-exif` is passed.
 - A file with GPS coordinates and no readable date loses its coordinates. The undated `FileMetadata` carrying them is discarded in favour of the filesystem timestamp, so the location never reaches the filename. Pre-existing rather than introduced; restoring it would change output filenames, so it is its own change. *(Fixed in 0.3.0.)*
 
-[Unreleased]: https://github.com/t0lkim/ThreeM/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/t0lkim/ThreeM/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/t0lkim/ThreeM/releases/tag/v0.3.1
 [0.3.0]: https://github.com/t0lkim/ThreeM/releases/tag/v0.3.0
 [0.2.1]: https://github.com/t0lkim/ThreeM/commits/main
 [0.2.0]: https://github.com/t0lkim/ThreeM/commits/main
