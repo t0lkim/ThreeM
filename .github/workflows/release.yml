@@ -24,6 +24,21 @@ on:
     tags:
       - 'v*'
 
+  # A rehearsal. Until this existed the first real tag was also the first
+  # execution of this file, and `gh release create` is not idempotent — so a
+  # workflow that failed half way through left a partial release to be deleted
+  # by hand before it could be retried.
+  #
+  # Dispatched runs build, check and package exactly as a tagged run does, and
+  # stop before publishing. The artifacts are on the run, downloadable, so the
+  # binaries can be inspected before anything is public.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to rehearse, without the leading v (e.g. 0.3.0)'
+        required: true
+        type: string
+
 # Read-only by default; only `publish` is granted write, and only to contents.
 permissions:
   contents: read
@@ -50,12 +65,18 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          tag='${{ github.ref_name }}'
-          version="${tag#v}"
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            version='${{ inputs.version }}'
+            tag="v$version"
+            echo "rehearsal for $tag (no tag exists, nothing will be published)"
+          else
+            tag='${{ github.ref_name }}'
+            version="${tag#v}"
+          fi
           declared=$(sed -n 's/^version = "\(.*\)"$/\1/p' code/Cargo.toml | head -1)
           echo "tag $tag → version $version; code/Cargo.toml declares $declared"
           if [ "$version" != "$declared" ]; then
-            echo "::error::tag $tag does not match the version in code/Cargo.toml ($declared)"
+            echo "::error::$tag does not match the version in code/Cargo.toml ($declared)"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -236,6 +257,10 @@ jobs:
   publish:
     name: publish the release
     needs: [verify, build]
+    # Never on a rehearsal. A dispatched run exists to prove the build and
+    # packaging work; publishing from one would make the rehearsal the thing it
+    # was meant to de-risk.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -258,7 +283,15 @@ jobs:
 
       # `gh` is on the runner already, so there is no third-party action in the
       # one step that holds a write token.
-      - name: Create the release
+      #
+      # **A draft.** The release is created with its binaries and notes attached
+      # and is visible only to people who can write to the repository, until
+      # somebody presses publish. That turns the moment of no return from
+      # "pushing a tag" into "reading the release page and deciding" — which
+      # matters because `gh release create` is not idempotent, so recovering
+      # from a bad run means deleting a release the public may already have
+      # seen.
+      - name: Create the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -267,5 +300,9 @@ jobs:
             --repo '${{ github.repository }}' \
             --title 'mmm ${{ needs.verify.outputs.version }}' \
             --notes-file dist/release-notes.md \
+            --draft \
             ${{ needs.verify.outputs.prerelease == 'true' && '--prerelease' || '' }} \
             dist/*.tar.gz dist/*.tar.gz.sha256
+
+          echo "::notice::Draft release created. Review it, then publish with: \
+            gh release edit '${{ github.ref_name }}' --draft=false"
