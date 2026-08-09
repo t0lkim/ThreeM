@@ -25,7 +25,7 @@ env:
 
 jobs:
   test:
-    name: fmt · clippy · test (${{ matrix.os }})
+    name: fmt · clippy · test (${{ matrix.os }} · TZ=${{ matrix.tz }})
     runs-on: ${{ matrix.os }}
     strategy:
       # Both platforms report independently — a Linux failure must not hide a
@@ -35,6 +35,21 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        # The machine's zone is an input to this crate, not a detail of the
+        # runner. `metadata.rs` reads a naive EXIF timestamp against it whenever
+        # the file carries no `OffsetTime*` tag, and getting that wrong files an
+        # evening photograph on the wrong day — the defect 0.2.0 shipped to fix.
+        # UTC alone cannot catch a regression there, because UTC is the one zone
+        # for which the wrong answer and the right answer agree.
+        #
+        # Three zones, chosen for what each can break rather than for coverage:
+        # UTC as the control, a whole-hour zone well east of Greenwich, and one
+        # west of it far enough that a morning photograph crosses midnight the
+        # other way.
+        tz: [UTC, Asia/Singapore, America/New_York]
+
+    env:
+      TZ: ${{ matrix.tz }}
 
     steps:
       - uses: actions/checkout@v7
@@ -49,21 +64,33 @@ jobs:
           # for `Cargo.lock` at the repository root and caches nothing.
           workspaces: code
 
+      # `--locked` on every cargo invocation that resolves dependencies: a
+      # change to `Cargo.toml` that leaves `Cargo.lock` stale was silently
+      # updated in the runner and passed, so CI was testing a dependency set
+      # nobody had committed.
       - name: cargo fmt --check
         working-directory: code
         run: cargo fmt --check
 
       - name: cargo clippy --all-targets -- -D warnings
         working-directory: code
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo test --all-targets
         working-directory: code
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
   msrv:
-    name: MSRV (from Cargo.toml rust-version)
-    runs-on: ubuntu-latest
+    name: MSRV ${{ matrix.os }} (from Cargo.toml rust-version)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Both platforms, because the floor is not a property of the language
+      # alone: `organiser::errno` is `cfg`-split per platform and the two halves
+      # can reach for different std methods, so a macOS-only MSRV break would
+      # otherwise surface on a contributor's machine rather than here.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     # `rust-version` in `code/Cargo.toml` is a promise to anyone running
     # `cargo install mmm` on a distribution's Rust rather than the newest one.
@@ -100,16 +127,17 @@ jobs:
         with:
           workspaces: code
           # A different compiler produces different artifacts; sharing the
-          # `test` job's entry would thrash it on every run.
-          key: msrv
+          # `test` job's entry would thrash it on every run. The platform is in
+          # the key for the same reason, now that this job runs on both.
+          key: msrv-${{ matrix.os }}
 
       - name: cargo build --release
         working-directory: code
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: cargo test --all-targets
         working-directory: code
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
   coverage:
     name: coverage floors (organiser · journal)
@@ -132,7 +160,7 @@ jobs:
 
       - name: cargo llvm-cov
         working-directory: code
-        run: cargo llvm-cov --json --output-path coverage.json
+        run: cargo llvm-cov --locked --json --output-path coverage.json
 
       - name: Upload the report
         uses: actions/upload-artifact@v4
@@ -262,4 +290,4 @@ jobs:
         # The release profile (`lto = true`, `codegen-units = 1`,
         # `strip = true`) exercises code paths the dev profile never compiles.
         # This job exists to catch breakage that only appears there.
-        run: cargo build --release
+        run: cargo build --locked --release
