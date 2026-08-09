@@ -1,5 +1,20 @@
 # MultiMediaManager (ThreeM)
 
+> [!WARNING]
+> **This software moves and reorganises your files. Use it at your own risk.**
+>
+> `mmm` is provided as-is, with no warranty of any kind, and the authors accept
+> no liability for lost, damaged or misfiled data. It is early software: this is
+> the first tagged release, and it has never been run on Windows.
+>
+> **Back up your photographs before pointing it at a library you care about.**
+> Preview every run first — `mmm` shows you the plan and changes nothing until
+> you pass `--commit` — and keep `<output>/.mmm/journal/` if you want to be able
+> to `mmm undo`. Deleting that directory makes a run unreversible.
+>
+> The safety machinery below is real and tested, but no amount of it substitutes
+> for a backup you have checked.
+
 Image and video organiser with deduplication, EXIF-based renaming, and date-based directory structure.
 
 ## Safety

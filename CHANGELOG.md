@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The README opens with a risk warning.** The tool moves and reorganises somebody's photograph library, and the page led with a feature description — the safety machinery was there, but a paragraph down, past the point where a reader decides whether to run it. The header states plainly that the software is provided as-is with no warranty, that this is its first tagged release, that it has never been run on Windows, and that `.mmm/journal/` is what makes a run reversible.
+
+
 ## [0.3.0] — 2026-08-09
 
 ### Fixed
