@@ -17,6 +17,19 @@
 
 Image and video organiser with deduplication, EXIF-based renaming, and date-based directory structure.
 
+## Try it on files that are not yours
+
+The sensible reaction to a tool that moves photographs is to refuse to point it at yours. `mmm-fixtures` builds a library that is safe to be wrong about:
+
+```bash
+mmm-fixtures ~/mmm-demo                    # a few hundred synthetic files
+mmm ~/mmm-demo -o /tmp/organised           # preview — moves nothing
+mmm ~/mmm-demo -o /tmp/organised --commit  # do it
+mmm undo /tmp/organised --commit           # put it all back
+```
+
+They are byte-valid images and videos carrying real EXIF — the same fixtures this project's own test suite runs against. Alongside them it writes `EXPECTED.md`, naming every file and saying where it should end up and why, so the result can be *checked* rather than merely watched. `--profile awkward` builds the malformed half — zero-byte files, unparseable EXIF, coordinates outside the ISO 6709 bounds — where warnings and files landing on their filesystem timestamps are the correct outcome, and the document marks each one. Every run prints its seed; `--seed N` reproduces that library exactly, so a bug report citing a profile and a seed is a complete reproduction. Full detail in the [User Guide](docs/USER-GUIDE.md#trying-it-on-files-that-are-not-yours).
+
 ## Safety
 
 `mmm` moves other people's photograph libraries, so the whole tool is built around one rule: **nothing moves unless you say so, and anything that moved can be put back.**
@@ -37,6 +50,7 @@ The reasoning behind the posture is in [ADR-001](docs/decisions/adr-001-dry-run-
 # Get help
 mmm --help
 mmm-dedup-verifier --help
+mmm-fixtures --help
 
 # Preview what would happen (nothing is modified — this is the default)
 mmm ~/Photos
@@ -72,6 +86,9 @@ mmm ~/Photos --no-sidecars --commit
 # Verify duplicates independently before deleting
 mmm-dedup-verifier ~/Organised/duplicates/
 
+# Build a throwaway library to experiment on, with a statement of what should happen
+mmm-fixtures ~/mmm-demo --profile awkward --seed 99
+
 # See what has been run against a library
 mmm journal list ~/Organised
 
@@ -105,6 +122,7 @@ Review a plain run first, then re-run the same command with `--commit` to apply 
 - **`mmm undo`** — every committing run is journalled before it acts, so it can be replayed backwards and the library put back as it was, even after an interrupted run
 - `mmm journal list` / `mmm journal show` to inspect what has been run against a library
 - Independent `mmm-dedup-verifier` binary using keyed BLAKE3 for safety
+- **`mmm-fixtures`** — generates a seeded synthetic library plus an `EXPECTED.md` stating where every file should land, so the claims above can be verified on files nobody cares about; `tests/generated_library.rs` fails the build if the two ever disagree
 
 ## Building
 
@@ -112,12 +130,19 @@ The crate root is `code/`, not the repository root.
 
 ```bash
 cd code
-cargo build --release          # binaries at code/target/release/{mmm,mmm-dedup-verifier}
-cargo install --path .         # or install both into ~/.cargo/bin
+cargo build --release          # binaries at code/target/release/{mmm,mmm-dedup-verifier,mmm-fixtures}
+cargo install --path .         # or install all three into ~/.cargo/bin
 cargo test --all-targets       # the full suite
 ```
 
-There is no installer and no packaged build yet; `cargo install --path code` is the supported way to get `mmm` onto a `PATH`.
+Prebuilt binaries for x86_64 Linux, Intel macOS and Apple Silicon are attached to
+each [release](https://github.com/t0lkim/ThreeM/releases) — download the archive
+for your platform and put the binaries somewhere on your `PATH`. There is no
+installer, no package-manager entry and nothing signed or notarised, so macOS
+Gatekeeper will quarantine the downloaded binaries until you clear them
+(`xattr -d com.apple.quarantine ./mmm`). Building from source with
+`cargo install --path code` avoids that and is the better option if you have a
+Rust toolchain.
 
 Rust **1.87.0** or newer. That floor is declared as `rust-version` in `code/Cargo.toml` and checked by its own CI job, so it is a measurement rather than an aspiration.
 

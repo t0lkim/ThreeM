@@ -30,7 +30,7 @@ stage="$dist/$name"
 # line and compares it against the `[[bin]]` targets in `code/Cargo.toml` — set
 # against set, so a third binary added to the crate cannot be left out of the
 # tarball in silence, and one deleted from the crate cannot linger here.
-BINARIES="mmm mmm-dedup-verifier"
+BINARIES="mmm mmm-dedup-verifier mmm-fixtures"
 
 # Linux runners have sha256sum, macOS has shasum. Both print `<digest>  <file>`,
 # which is what `sha256sum -c` and `shasum -a 256 -c` each expect to read back.

@@ -1,0 +1,14 @@
+# cargo-mutants configuration.
+#
+# `src/fixtures.rs` and `src/generate.rs` build synthetic photographs by
+# assembling bytes — quantisation tables, IFD offsets, box headers. Mutating a
+# constant in there produces a fixture that is differently shaped rather than
+# wrong, and nothing in the suite asserts on the shape of a fixture, so every
+# such mutant survives. Dozens of unkillable survivors in the report is not a
+# gap in the tests; it is noise that hides the real ones.
+#
+# The right check on this code is not mutation testing but
+# `tests/generated_library.rs`, which organises a generated library and asserts
+# the result against the generator's own predictions — a mutated fixture that
+# changed anything observable fails there.
+exclude_globs = ["src/fixtures.rs", "src/generate.rs"]

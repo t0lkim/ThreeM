@@ -6,7 +6,9 @@ Every other document in the repository is indexed at [`docs/index.md`](index.md)
 
 `mmm` scans one or more directories for images and videos, detects duplicates, renames files by date and location, and sorts them into one directory per day (`YYYY-MM-DD/`). Both the directory layout and the filenames are configurable — see [Configuration](#configuration). A companion tool, `mmm-dedup-verifier`, independently verifies that flagged duplicates are genuine before you delete them.
 
-There is no packaged build yet. Both binaries are produced by `cargo build --release` from the `code/` directory, landing at `code/target/release/mmm` and `code/target/release/mmm-dedup-verifier`; `cargo install --path code` puts both on your `PATH` in `~/.cargo/bin`. Every command below assumes they are on it.
+Prebuilt binaries for x86_64 Linux, Intel macOS and Apple Silicon are attached to each [release](https://github.com/t0lkim/ThreeM/releases); nothing is signed or notarised, so macOS will quarantine them until you clear it (`xattr -d com.apple.quarantine ./mmm`). Building from source avoids that: `cargo build --release` from the `code/` directory produces all three binaries, and `cargo install --path code` puts them on your `PATH` in `~/.cargo/bin`. Every command below assumes they are on it.
+
+A third binary, `mmm-fixtures`, generates a throwaway photo library to try all of this on — see [Trying it on files that are not yours](#trying-it-on-files-that-are-not-yours).
 
 > **`mmm` is safe by default.** Every run is a preview until you pass `--commit`. Without it, `mmm` scans, plans, prints and exits without touching a single file. Note that when no `--output` is given, output defaults to the *first input directory* — so `mmm ~/Photos --commit` reorganises `~/Photos` in place.
 
@@ -37,6 +39,55 @@ After organising, verify the duplicates directory:
 ```bash
 mmm-dedup-verifier ~/Organised/duplicates/
 ```
+
+---
+
+## Trying it on files that are not yours
+
+The sensible thing to do with a tool that moves photographs is to refuse to point it at your photographs. `mmm-fixtures` builds a library that is safe to be wrong about:
+
+```bash
+mmm-fixtures ~/mmm-demo                    # a few hundred synthetic files
+mmm ~/mmm-demo -o /tmp/organised           # preview — moves nothing
+mmm ~/mmm-demo -o /tmp/organised --commit  # do it
+mmm undo /tmp/organised --commit           # put it all back
+```
+
+The files are byte-valid images and videos carrying real EXIF — the same fixtures this project's own test suite runs against, handed over so the claims elsewhere in this guide can be checked rather than taken on trust. None of it is a real photograph and none of it is worth keeping.
+
+Alongside them it writes **`EXPECTED.md`**, which names every generated file and says where it should end up and why. That document is the point: a synthetic library you cannot check your result against tells you only that the tool did *something*. `tests/generated_library.rs` holds the two together — it generates a library, organises it, and fails the build if the outcome and the document disagree — so `EXPECTED.md` cannot quietly go stale.
+
+### Profiles
+
+| `--profile` | What it builds |
+|---|---|
+| `minimal` | A couple of dozen well-formed files. Small enough to read the whole `EXPECTED.md` and follow every case by hand. |
+| `realistic` *(default)* | An ordinary import: several cameras, HEIC and JPEG, video, RAW with XMP sidecars, duplicate groups, a scattering of GPS. Answers "would it file my library correctly". |
+| `awkward` | The malformed and the ambiguous — zero-byte files, EXIF that will not parse, a date that reads `0000:00:00 00:00:00`, coordinates outside the ISO 6709 bounds, an orphaned sidecar, filenames full of spaces, quotes and emoji. |
+| `stress` | `realistic` scaled up with large duplicate groups, for watching the hash cascade work on something that takes more than an instant. |
+
+**The `awkward` profile is meant to be wrong.** A run over it prints warnings and files things on their filesystem timestamps. That is the correct result, not a defect, and `EXPECTED.md` marks every such file with a ⚠ and says what is wrong with it. It is worth running precisely because it is the profile that shows you how the tool behaves when your library is not tidy — which is the case that matters.
+
+### Reproducing a library
+
+Every run prints its seed, and `--seed` rebuilds that exact library:
+
+```bash
+mmm-fixtures ~/mmm-demo --profile awkward --seed 99
+```
+
+That is the whole reproduction. A bug report saying "profile `awkward`, seed 99, the file at X went to Y" is something anyone can reproduce byte for byte on another machine.
+
+### Options
+
+| Flag | Effect |
+|---|---|
+| `--profile <NAME>` | Which library to build. Default `realistic`. |
+| `--seed <N>` | Rebuild a previous library exactly. Omit for a fresh one; the seed is printed either way. |
+| `--force` | Write into a directory that already has files in it. |
+| `--list-profiles` | Print the profiles and what each is for, then exit. |
+
+`mmm-fixtures` refuses a non-empty directory unless you pass `--force`. It writes several hundred files with camera-style names, and into a directory that already holds photographs that is a mess nothing can untangle afterwards — `mmm undo` cannot help, because nothing was moved.
 
 ---
 

@@ -31,7 +31,7 @@ on every step.
 ```sh
 cd code
 cargo build                    # debug
-cargo build --release          # binaries at code/target/release/{mmm,mmm-dedup-verifier}
+cargo build --release          # binaries at code/target/release/{mmm,mmm-dedup-verifier,mmm-fixtures}
 cargo install --path .         # both binaries onto your PATH
 ```
 

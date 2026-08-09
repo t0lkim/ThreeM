@@ -16,7 +16,9 @@ pub const METADATA_DIR_NAME: &str = ".mmm";
 
 pub mod config;
 pub mod error;
+pub mod fixtures;
 pub mod fuzz;
+pub mod generate;
 pub mod geocoder;
 pub mod hasher;
 pub mod journal;

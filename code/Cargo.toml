@@ -107,6 +107,10 @@ path = "src/main.rs"
 name = "mmm-dedup-verifier"
 path = "src/bin/mmm_dedup_verifier.rs"
 
+[[bin]]
+name = "mmm-fixtures"
+path = "src/bin/mmm_fixtures.rs"
+
 # `harness = false` hands `main` to criterion instead of libtest, which is how
 # criterion collects samples at all.
 [[bench]]

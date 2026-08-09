@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`mmm-fixtures`, a third binary, generates a throwaway photo library to try `mmm` on.** The sensible reaction to a tool that moves photographs is to refuse to point it at yours, which leaves a new user nowhere to start. This builds byte-valid images and videos carrying real EXIF — JPEG, HEIC, MP4, QuickTime, TIFF-based RAW with XMP sidecars, duplicate groups, GPS — in a directory that is safe to be wrong about. Four profiles: `minimal`, `realistic` (the default), `awkward` and `stress`. It refuses a non-empty directory unless `--force` is passed, because several hundred files with camera-style names written into a real library is a mess nothing can untangle afterwards — `mmm undo` cannot help, since nothing was moved.
+
+- **Each generated library ships an `EXPECTED.md` naming every file and where it should end up.** This is the part that matters: a synthetic library you cannot check your result against tells you only that the tool did *something*. Every prediction is either a value the generator chose (it wrote the EXIF timestamp, so it knows the date directory) or one it measured afterwards (it stat'd the file, so it knows the filesystem fallback) — none of it re-implements the organiser's naming, since a prediction derived by copying the code under test proves only that the copy matches. Where an outcome genuinely is not predictable, such as a file carrying no UTC offset, the document says the result depends on `--timezone` rather than inventing a directory.
+
+- **`tests/generated_library.rs` holds the generator's claims to what the tool actually does.** It generates a library, organises it, and asserts each file reached the predicted directory — identified by the provenance marker in its bytes, not by its filename, which is the thing the organiser rewrites. A document nothing verifies goes stale the first time the organiser changes; this fails the build instead. It also asserts that one seed reproduces one library byte for byte, that each duplicate group keeps exactly one member in the dated tree, and that the `awkward` profile does not stop the run.
+
+- **`--seed` makes a library reproducible, and every run prints the seed it used.** A bug report citing a profile and a seed is a complete reproduction on any machine. The generator uses an inline xorshift64\* rather than taking a dependency: reproducibility is the requirement, not statistical quality, and it is not worth putting `rand` and its tree into every user's build of a photo organiser.
+
+### Changed
+
+- **The fixture machinery moved from `tests/` into the shipped library** as `mmm::fixtures`, with the new generator beside it as `mmm::generate`. What ships is not a demo written to look like the tests — it is the tests' own inputs, so the claims in the README can be verified rather than taken on trust. The test suite reaches it through a re-export and is otherwise unchanged.
+
+- **The README and User Guide no longer say there is no packaged build.** Prebuilt binaries for x86_64 Linux, Intel macOS and Apple Silicon have been attached to releases since v0.3.0. Both now also state that nothing is signed or notarised, so macOS quarantines the downloads until the attribute is cleared — which is the thing a reader actually needs to know before the binary refuses to run.
+
 ## [0.3.1] — 2026-08-09
 
 ### Security
