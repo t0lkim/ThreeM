@@ -475,11 +475,11 @@ impl GroupManifest {
              # Outcomes follow, appended one line at a time as each move ends.\n\n",
             group.hash,
             group.size,
-            group.files[0].display(),
+            Self::escape_for_manifest(&group.files[0]),
             group.files.len().saturating_sub(1),
         );
         for source in group.files.iter().skip(1) {
-            let _ = writeln!(header, "{}", source.display());
+            let _ = writeln!(header, "{}", Self::escape_for_manifest(source));
         }
         header.push_str("\n# Outcomes\n");
 
@@ -522,14 +522,41 @@ impl GroupManifest {
     /// Record where a duplicate actually landed — suffix and all, because a
     /// record that says only "moved" cannot be used to put anything back.
     ///
+    /// A path rendered safe to write into a line-oriented text file.
+    ///
+    /// `manifest.txt` is the record a *person* reads, and it is one line per
+    /// fact. A filename may legally contain a newline — on every filesystem
+    /// this runs on — so a file called `holiday.jpg\n# moved: evidence.jpg`
+    /// would write two lines and the second would read as an outcome that never
+    /// happened. The same goes for a carriage return, which can hide the rest
+    /// of a line on a terminal.
+    ///
+    /// The escape is deliberately lossy and deliberately visible: `\n` is
+    /// written as the two characters `\` and `n`, so the manifest says what the
+    /// name contains rather than obeying it. Nothing parses these lines — undo
+    /// reads the JSONL journal, which escapes properly through `serde_json` —
+    /// so readability is the only requirement.
+    fn escape_for_manifest(path: &Path) -> String {
+        path.display()
+            .to_string()
+            .chars()
+            .map(|c| match c {
+                '\n' => "\\n".to_string(),
+                '\r' => "\\r".to_string(),
+                c if c.is_control() => format!("\\u{{{:x}}}", c as u32),
+                c => c.to_string(),
+            })
+            .collect()
+    }
+
     /// # Errors
     ///
     /// As [`GroupManifest::append`].
     fn record_move(&mut self, src: &Path, dst: &Path) -> Result<()> {
         self.append(&format!(
             "# moved: {} -> {}\n",
-            src.display(),
-            dst.display()
+            Self::escape_for_manifest(src),
+            Self::escape_for_manifest(dst)
         ))
     }
 
@@ -572,7 +599,10 @@ impl GroupManifest {
     ///
     /// As [`GroupManifest::append`].
     fn record_original_destination(&mut self, dst: &Path) -> Result<()> {
-        self.append(&format!("# Original moved to: {}\n", dst.display()))
+        self.append(&format!(
+            "# Original moved to: {}\n",
+            Self::escape_for_manifest(dst)
+        ))
     }
 
     /// Record a move that did not happen, and why.
@@ -581,7 +611,10 @@ impl GroupManifest {
     ///
     /// As [`GroupManifest::append`].
     fn record_failure(&mut self, src: &Path, reason: &str) -> Result<()> {
-        self.append(&format!("# FAILED: {}: {reason}\n", src.display()))
+        self.append(&format!(
+            "# FAILED: {}: {reason}\n",
+            Self::escape_for_manifest(src)
+        ))
     }
 
     /// Record a sidecar that followed a duplicate into this directory.
@@ -598,8 +631,8 @@ impl GroupManifest {
     fn record_sidecar(&mut self, src: &Path, dst: &Path) -> Result<()> {
         self.append(&format!(
             "# sidecar: {} -> {}\n",
-            src.display(),
-            dst.display()
+            Self::escape_for_manifest(src),
+            Self::escape_for_manifest(dst)
         ))
     }
 }
@@ -1828,21 +1861,29 @@ impl Drop for TempFileGuard {
     }
 }
 
-/// A temp filename unique within this process.
+/// A temp filename unique within this process, and not guessable outside it.
 ///
 /// The millisecond alone is not unique — a run moving small files clears
 /// several per millisecond — and two moves sharing a temp name would have one
 /// overwrite the other's copy. `copy_hashing` creates the temp with
 /// `O_CREAT | O_EXCL` and would refuse rather than corrupt, but refusing a move
 /// over a clock collision is still a failure nobody should have to read about.
+///
+/// The random component answers a different question. A name of only a
+/// timestamp and a counter can be predicted by anyone who can watch the output
+/// directory, and pre-creating that path makes the move fail — `O_CREAT |
+/// O_EXCL` turns it into a clean refusal rather than a lost file, but a refusal
+/// that somebody else chose is still a denial of service. Guessing a name is
+/// cheap; guessing six base36 characters per file is not.
 fn temp_file_name() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     format!(
-        ".tmp-{}-{}",
+        ".tmp-{}-{}-{}",
         chrono::Utc::now().timestamp_millis(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        crate::journal::short_random()
     )
 }
 
@@ -2125,6 +2166,45 @@ mod tests {
         assert_eq!(dir, PathBuf::from("2024-03-15"));
         assert_eq!(filename, "2024-03-15-103000.______etc_passwd");
         assert!(!filename.contains('/'));
+    }
+
+    /// A newline in a filename cannot forge a manifest line.
+    ///
+    /// `manifest.txt` is one line per fact, and a filename may legally hold a
+    /// newline on every filesystem this runs on. Unescaped, a file named to
+    /// look like an outcome line writes one.
+    #[test]
+    fn a_newline_in_a_filename_cannot_forge_a_manifest_line() {
+        let hostile = Path::new("holiday.jpg\n# moved: /evidence.jpg -> /gone.jpg");
+        let rendered = GroupManifest::escape_for_manifest(hostile);
+
+        assert!(
+            !rendered.contains('\n'),
+            "the rendering still holds a real newline: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\n"),
+            "the newline should be visible as an escape: {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with("holiday.jpg"),
+            "the ordinary part of the name must survive: {rendered:?}"
+        );
+
+        // A carriage return hides the rest of a line on a terminal, and a raw
+        // control character can reposition the cursor.
+        assert!(!GroupManifest::escape_for_manifest(Path::new("a\rb")).contains('\r'));
+        assert_eq!(
+            GroupManifest::escape_for_manifest(Path::new("a\u{1b}b")),
+            "a\\u{1b}b",
+            "an escape character is rendered, not emitted"
+        );
+
+        // And an ordinary path is left exactly as it was.
+        assert_eq!(
+            GroupManifest::escape_for_manifest(Path::new("/photos/2024-03-15/a.jpg")),
+            "/photos/2024-03-15/a.jpg"
+        );
     }
 
     /// A planned move with the metadata fields pinned inert — nothing in the

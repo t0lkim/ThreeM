@@ -61,9 +61,19 @@ fn contributing_states_the_msrv_the_crate_declares() {
 #[test]
 fn the_security_policy_carries_a_disclosure_contact() {
     let security = read("SECURITY.md");
+
+    // The address itself is not pinned. It used to be, and the literal here was
+    // a second copy of a fact that lives in SECURITY.md — so changing the
+    // contact broke this test, which is the test reporting its own duplication
+    // rather than a defect. What must hold is that *an* address is there and
+    // reachable, not which one somebody chose.
+    let has_contact = security
+        .split_whitespace()
+        .any(|word| word.contains('@') && word.contains('.') && word.len() > 5);
     assert!(
-        security.contains('@') && security.contains("me@t0lkim.dev"),
-        "SECURITY.md has no disclosure contact in it"
+        has_contact,
+        "SECURITY.md has no disclosure contact in it — a reporter arriving \
+         there has nowhere to send anything"
     );
 
     for (name, body) in [

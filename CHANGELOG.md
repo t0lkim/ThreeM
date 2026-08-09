@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **XMP sidecars over 10 MB are refused before they are parsed.** The reader streams — `NsReader` over a `BufReader`, not a `read_to_string` — but streaming bounds how much is read at a time, not how much a *single* element can allocate: one unclosed tag holding a gigabyte of text is one buffer growing to a gigabyte. A real sidecar is a few kilobytes, so the cap refuses only files that are not sidecars. Reported as F002.
+- **`anyhow` floor raised to 1.0.103.** RUSTSEC-2026-0190 is an unsoundness advisory against `Error::downcast_mut()` in 1.0.102 and earlier. Nothing here calls `downcast_mut`, so the path was never reachable — but a floor of `1` let a fresh resolve land back on the advisory version, and somebody running `cargo audit` cannot tell an unreachable advisory from a live one. Reported as F001.
+- **Every CI action is pinned to a commit SHA.** A tag is mutable: whoever controls an action's repository can move `v4` to a different commit, and every workflow trusting that tag runs the new code on its next build. Each pin carries its tag in a trailing comment, and both workflows document how to re-resolve one. Reported as F009.
+- **Cross-volume temp filenames carry six characters of entropy.** They were a timestamp and a counter, so anyone able to watch the output directory could predict the next one and pre-create it. `O_CREAT | O_EXCL` already made that a clean refusal rather than a lost file, but a refusal somebody else chose is still a denial of service. Reported as F003.
+- **`manifest.txt` escapes control characters in paths.** A filename may legally contain a newline, and the manifest is one line per fact, so a file named to look like an outcome line wrote one. Undo was never affected — it reads the JSONL journal, which escapes through `serde_json` — but the manifest is what a person reads before deleting a `duplicates/` directory. Reported as F011.
+- **A config file writable by group or world is called out on stderr.** A layer cannot enable `commit`, which is why this is a warning rather than a refusal, but it can change `skip_patterns` so a run passes over files, or `duplicates_dir` so copies are set aside somewhere unexpected. On a shared machine those decisions should not be silently someone else's. Unix only — Windows permissions are an ACL, and guessing at one from `readonly()` would report the wrong thing in both directions. Reported as F006.
+
+
 ### Changed
 
 - **The README opens with a risk warning.** The tool moves and reorganises somebody's photograph library, and the page led with a feature description — the safety machinery was there, but a paragraph down, past the point where a reader decides whether to run it. The header states plainly that the software is provided as-is with no warranty, that this is its first tagged release, that it has never been run on Windows, and that `.mmm/journal/` is what makes a run reversible.

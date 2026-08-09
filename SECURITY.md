@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Email **me@t0lkim.dev** with `ThreeM security` in the subject. Please do not
+Email **security@t0lkim.dev** with `ThreeM Security` in the subject. Please do not
 open a public issue for anything in scope below — the issue tracker is public,
 and `mmm` is pointed at people's photograph libraries.
 

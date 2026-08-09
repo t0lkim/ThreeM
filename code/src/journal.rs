@@ -470,7 +470,11 @@ pub fn generate_run_id() -> String {
 }
 
 /// Six base36 characters of entropy.
-fn short_random() -> String {
+///
+/// Crate-visible because `organiser`'s cross-volume temp names want the same
+/// thing for a different reason — see [`crate::organiser`] — and two entropy
+/// sources in one binary is one more than anybody can reason about.
+pub(crate) fn short_random() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};

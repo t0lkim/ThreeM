@@ -28,7 +28,12 @@ categories = [
 rust-version = "1.87.0"
 
 [dependencies]
-anyhow = "1"
+# 1.0.103 is the floor, not a preference: RUSTSEC-2026-0190 is an unsoundness
+# advisory against `Error::downcast_mut()` in 1.0.102 and earlier. Nothing here
+# calls `downcast_mut`, so the unsound path was never reachable — but `1` as a
+# floor lets a fresh resolve land back on the advisory version, and a user
+# running `cargo audit` cannot tell an unreachable advisory from a live one.
+anyhow = "1.0.103"
 blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }

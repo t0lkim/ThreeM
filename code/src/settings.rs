@@ -971,6 +971,8 @@ pub fn parse_layer(text: &str, path: &Path) -> Result<PartialSettings, ConfigErr
 /// it cannot be opened, [`ConfigError::Parse`] if its contents are not a valid
 /// layer.
 pub fn load_file(path: &Path) -> Result<PartialSettings, ConfigError> {
+    warn_if_writable_by_others(path);
+
     let text = fs::read_to_string(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             ConfigError::Missing {
@@ -985,6 +987,64 @@ pub fn load_file(path: &Path) -> Result<PartialSettings, ConfigError> {
     })?;
     parse_layer(&text, path)
 }
+
+/// Say so when a config file can be edited by somebody other than its owner.
+///
+/// A config layer cannot enable `commit` — that is checked elsewhere and is the
+/// reason this is a warning rather than a refusal — but it can change
+/// `skip_patterns` so a run quietly passes over files, or `duplicates_dir` so
+/// copies are set aside somewhere unexpected. On a shared machine a
+/// group-writable `~/.config/mmm/config.toml` means those decisions are not
+/// only the owner's.
+///
+/// A warning, not an error, and deliberately: `git`, `rg` and `fd` all read
+/// their configs without checking the mode, so refusing would surprise somebody
+/// whose umask is merely loose. The value is that the run says out loud whose
+/// settings it is obeying.
+///
+/// Unix only. Windows permissions are an ACL rather than a mode, and guessing
+/// at one from `readonly()` would report the wrong thing in both directions.
+#[cfg(unix)]
+fn warn_if_writable_by_others(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Ok(meta) = fs::metadata(path) else {
+        // Unreadable metadata is the caller's problem to report; a file that
+        // cannot be stat-ed is about to fail its read with a better message.
+        return;
+    };
+
+    let mode = meta.permissions().mode();
+    let group_writable = mode & 0o020 != 0;
+    let world_writable = mode & 0o002 != 0;
+
+    if group_writable || world_writable {
+        let who = match (group_writable, world_writable) {
+            (true, true) => "the group and everybody else",
+            (true, false) => "the group",
+            (false, true) => "everybody",
+            (false, false) => unreachable!(),
+        };
+        // `eprintln!`, not `warn!`. Config layers are read *before* tracing is
+        // initialised — the verbosity that configures the subscriber is itself
+        // one of the settings being read — so a `warn!` here is emitted into a
+        // process with no subscriber and is never seen by anybody. Verified by
+        // trying it. The deprecation notice takes the same route for the same
+        // reason.
+        //
+        // Unconditional rather than behind `-v`: whose settings a run is
+        // obeying is not a debugging detail.
+        eprintln!(
+            "warning: {} is writable by {who}, so its settings are not only yours \
+             (mode {:o}). `chmod go-w` it if that was not intended.",
+            path.display(),
+            mode & 0o777
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_writable_by_others(_path: &Path) {}
 
 /// Read a discovered config file, where absence is an ordinary answer.
 ///

@@ -160,6 +160,19 @@ pub struct SidecarDate {
     pub has_time_of_day: bool,
 }
 
+/// The largest sidecar this will read.
+///
+/// A real XMP sidecar is a few kilobytes: an `rdf:Description` with a few dozen
+/// properties. Ten megabytes is three orders of magnitude past anything a
+/// camera or an editor writes, so the cap refuses only files that are not
+/// sidecars — a crafted one aimed at memory exhaustion, or something that
+/// acquired the extension by accident.
+///
+/// Chosen as a round number rather than measured against a corpus, and stated
+/// that way: the point is a ceiling far above legitimate use, not a tight
+/// bound.
+const MAX_SIDECAR_BYTES: u64 = 10 * 1024 * 1024;
+
 /// The date an XMP sidecar records, if it records one this can use.
 ///
 /// Returns `None` for every kind of failure, and each of them is a line in the
@@ -170,6 +183,32 @@ pub fn read_date(path: &Path) -> Option<SidecarDate> {
     let file = File::open(path)
         .map_err(|e| warn!(sidecar = %path.display(), error = %e, "could not open sidecar"))
         .ok()?;
+
+    // Refused before a byte is parsed. The parse itself streams — `NsReader`
+    // over a `BufReader`, not a `read_to_string` — but streaming bounds how much
+    // is read at a time, not how much a *single* element can allocate: one
+    // unclosed tag holding a gigabyte of text is one `Vec` growing to a
+    // gigabyte. A sidecar is a few kilobytes of XML written by a photo editor,
+    // so a file over the cap is not a sidecar this can use however it is
+    // parsed, and the cheapest correct answer is not to start.
+    match file.metadata() {
+        Ok(meta) if meta.len() > MAX_SIDECAR_BYTES => {
+            warn!(
+                sidecar = %path.display(),
+                bytes = meta.len(),
+                limit = MAX_SIDECAR_BYTES,
+                "sidecar is too large to be a sidecar; ignoring it"
+            );
+            return None;
+        }
+        Ok(_) => {}
+        // Unreadable metadata is not a reason to refuse the file — the parse
+        // below will fail on its own terms and log why, and treating a stat
+        // failure as "too large" would report the wrong cause.
+        Err(e) => {
+            debug!(sidecar = %path.display(), error = %e, "could not size the sidecar");
+        }
+    }
 
     let found = parse(BufReader::new(file), path);
 
@@ -724,6 +763,48 @@ mod tests {
             )),
             None,
             "the date is inside rdf:li, which is not a property this reads"
+        );
+    }
+    /// A sidecar over the cap is refused without being parsed, and one under it
+    /// is read as normal.
+    ///
+    /// Both halves matter. A cap that refused everything would pass the first
+    /// assertion alone, and a valid sidecar being ignored is a worse defect
+    /// than the memory exhaustion the cap exists to prevent.
+    #[test]
+    fn a_sidecar_larger_than_the_cap_is_refused_unparsed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let valid = r#"<?xml version="1.0"?>
+            <x:xmpmeta xmlns:x="adobe:ns:meta/">
+              <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+                <rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+                                 xmp:CreateDate="2024-03-15T14:30:00"/>
+              </rdf:RDF>
+            </x:xmpmeta>"#;
+
+        let small = dir.path().join("small.xmp");
+        std::fs::write(&small, valid).unwrap();
+        assert!(
+            read_date(&small).is_some(),
+            "a legitimate sidecar must still be read"
+        );
+
+        // The same valid XML, padded past the cap with a comment. Padding rather
+        // than junk so the *only* reason it is refused is its size — if the cap
+        // were removed this file would still parse to a date, and the test would
+        // fail rather than pass for the wrong reason.
+        let oversized = dir.path().join("oversized.xmp");
+        let padding = " ".repeat(usize::try_from(MAX_SIDECAR_BYTES).unwrap() + 1);
+        std::fs::write(&oversized, format!("<!--{padding}-->{valid}")).unwrap();
+        assert!(
+            std::fs::metadata(&oversized).unwrap().len() > MAX_SIDECAR_BYTES,
+            "the fixture must actually exceed the cap"
+        );
+        assert_eq!(
+            read_date(&oversized),
+            None,
+            "a sidecar past the cap must be refused"
         );
     }
 }
