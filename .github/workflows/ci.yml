@@ -177,7 +177,7 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - uses: taiki-e/install-action@583939ec0c8ee9c523cc60342d3d979ce6730f38 # main
+      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
         with:
           tool: cargo-llvm-cov
 
@@ -258,7 +258,14 @@ jobs:
         with:
           toolchain: nightly-2026-05-01
 
-      - uses: taiki-e/install-action@583939ec0c8ee9c523cc60342d3d979ce6730f38 # main
+      # Pinned to the `v2` release, not to `main`. A `main` SHA was tried and
+      # broke the job: that build of install-action has no entry for cargo-fuzz,
+      # so it fell back to `cargo-binstall`, which fetches a musl-static
+      # prebuilt — and a statically linked libc is incompatible with the
+      # sanitizer cargo-fuzz builds against. The failure surfaced two commits
+      # later as `sanitizer is incompatible with statically linked libc`, which
+      # names the symptom and not the cause.
+      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
         with:
           tool: cargo-fuzz
 
