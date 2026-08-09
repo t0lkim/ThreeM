@@ -140,8 +140,17 @@ jobs:
         run: cargo test --locked --all-targets
 
   coverage:
-    name: coverage floors (organiser · journal)
-    runs-on: ubuntu-latest
+    name: coverage floors (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Line coverage of the same source is largely platform-independent, but
+      # `organiser.rs` is not the same source on both: `errno` is `cfg`-split,
+      # and the arm that is compiled out on one platform is the arm whose lines
+      # go uncounted there. A floor met on Linux alone says nothing about the
+      # macOS-only branch beneath it.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v7
@@ -156,7 +165,7 @@ jobs:
         with:
           workspaces: code
           # Instrumented builds share nothing with the plain test profile.
-          key: coverage
+          key: coverage-${{ matrix.os }}
 
       - name: cargo llvm-cov
         working-directory: code
@@ -165,7 +174,7 @@ jobs:
       - name: Upload the report
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-json
+          name: coverage-json-${{ matrix.os }}
           path: code/coverage.json
 
       # The two files that move and record other people's photographs. Every
@@ -205,8 +214,18 @@ jobs:
           check src/journal.rs 96.0
 
   fuzz:
-    name: fuzz (60s per target)
-    runs-on: ubuntu-latest
+    name: fuzz (60s per target, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # The parsers are platform-independent Rust, so the *inputs* explored are
+      # the same — but the sanitiser underneath them is not. libFuzzer and ASan
+      # on aarch64-apple-darwin are a different runtime to the x86_64-linux one,
+      # and a fuzzing gate that only ever ran under one of them is a gate with a
+      # platform-shaped hole. Verified to work on arm64 macOS before this was
+      # added, rather than added and hoped for.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v7
@@ -227,7 +246,7 @@ jobs:
           # toolchain with sanitiser flags. It shares nothing with the entries
           # above.
           workspaces: code/fuzz
-          key: fuzz
+          key: fuzz-${{ matrix.os }}
 
       # Sixty seconds a target is not a fuzzing campaign, and it is not meant to
       # be — a real campaign runs for hours and belongs on somebody's machine or
@@ -260,7 +279,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts
+          name: fuzz-artifacts-${{ matrix.os }}
           path: code/fuzz/artifacts/
           if-no-files-found: ignore
 
