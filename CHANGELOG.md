@@ -35,6 +35,11 @@ A single fix, and the reason it is its own release rather than part of 0.2.0: th
 
   Two corrections to what the 0.2.0 notes said about this defect, both measured while fixing it: **a zero-byte file never panicked** — the parser refused it before reaching the assertion, so the boundary was exactly one byte, not "zero or one"; and it was **not confined to image extensions** — `.mov` and `.mp4` aborted at the same assertion, because the probe runs before the container is identified.
 
+> **Neither 0.2.0 nor 0.2.1 was ever tagged or published.** Both are development
+> milestones recorded here for the history they carry; the first release is
+> 0.3.0. Their links point at the commit log rather than at release pages that
+> do not exist.
+
 ## [0.2.0] — 2026-08-09
 
 The first release with a safety model. A bare `mmm ~/Photos` used to reorganise the library in place — no preview, no record of what it did, no way back. It now previews and exits; `--commit` is the only thing that moves a file; every committing run writes a journal before it touches anything; and `mmm undo` puts the whole run back. Alongside that: photographs are no longer filed under the wrong day, RAW files can finally be dated from the sidecar beside them, thirteen settings are configurable from a file, and the duplicate scan hashes on every core.
@@ -282,5 +287,5 @@ Six further defects on the destructive path — every one of them able to lose a
 - A file with GPS coordinates and no readable date loses its coordinates. The undated `FileMetadata` carrying them is discarded in favour of the filesystem timestamp, so the location never reaches the filename. Pre-existing rather than introduced; restoring it would change output filenames, so it is its own change.
 
 [Unreleased]: https://github.com/t0lkim/ThreeM/compare/v0.2.1...HEAD
-[0.2.1]: https://github.com/t0lkim/ThreeM/releases/tag/v0.2.1
-[0.2.0]: https://github.com/t0lkim/ThreeM/releases/tag/v0.2.0
+[0.2.1]: https://github.com/t0lkim/ThreeM/commits/main
+[0.2.0]: https://github.com/t0lkim/ThreeM/commits/main

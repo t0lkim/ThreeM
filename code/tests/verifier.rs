@@ -197,7 +197,7 @@ fn an_altered_copy_is_a_mismatch_and_exits_non_zero() {
 /// Property 2, the third verdict: an original that is no longer where the
 /// manifest says fails the run, with or without `--check-originals`.
 ///
-/// **This changed in 0.2.2.** It used to fail only under `--check-originals`,
+/// **This changed in 0.3.0.** It used to fail only under `--check-originals`,
 /// which meant the default invocation — the one somebody makes before deleting
 /// a `duplicates/` directory — printed "All verified groups are confirmed
 /// duplicates" and exited 0 having confirmed nothing at all. A group whose
@@ -252,7 +252,7 @@ fn a_group_without_a_manifest_is_skipped_not_confirmed() {
         stdout.contains("Groups verified: 0"),
         "a group with no manifest must not be counted as verified:\n{stdout}"
     );
-    // **Changed in 0.2.2.** This used to exit 0. A `duplicates/` directory
+    // **Changed in 0.3.0.** This used to exit 0. A `duplicates/` directory
     // holding files that were never checked is exactly the state in which an
     // all-clear is most dangerous — the operator is about to delete them.
     assert!(

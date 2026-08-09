@@ -361,7 +361,7 @@ fn the_manifest_records_where_the_original_actually_ended_up() {
     // The dedup pass runs *before* the organise pass, so the header line
     // `# Original kept at:` names the original's location in the *input* tree —
     // a path the organise pass then empties. That was the whole of the record
-    // until 0.2.2, and it made `mmm-dedup-verifier` vacuous: it resolved that
+    // until 0.3.0, and it made `mmm-dedup-verifier` vacuous: it resolved that
     // path, found nothing, recorded `OriginalMissing`, confirmed zero groups
     // and still exited 0 printing "All verified groups are confirmed
     // duplicates" — the independent second opinion somebody runs *before*
