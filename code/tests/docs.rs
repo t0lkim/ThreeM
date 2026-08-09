@@ -62,19 +62,22 @@ fn contributing_states_the_msrv_the_crate_declares() {
 fn the_security_policy_carries_a_disclosure_contact() {
     let security = read("SECURITY.md");
 
-    // The address itself is not pinned. It used to be, and the literal here was
-    // a second copy of a fact that lives in SECURITY.md — so changing the
-    // contact broke this test, which is the test reporting its own duplication
-    // rather than a defect. What must hold is that *an* address is there and
-    // reachable, not which one somebody chose.
-    let has_contact = security
-        .split_whitespace()
-        .any(|word| word.contains('@') && word.contains('.') && word.len() > 5);
-    assert!(
-        has_contact,
-        "SECURITY.md has no disclosure contact in it — a reporter arriving \
-         there has nowhere to send anything"
+    // Read out of SECURITY.md rather than written here, for the reason
+    // `DECLARED_MSRV` is `env!("CARGO_PKG_RUST_VERSION")` rather than "1.87.0":
+    // a literal in this file is a second copy of a fact, and the copy goes
+    // stale the first time somebody changes the original. This test used to
+    // hold that copy, and changing the contact address broke it — the test
+    // reporting its own duplication rather than a defect in the documentation.
+    let contacts = disclosure_addresses(&security);
+    assert_eq!(
+        contacts.len(),
+        1,
+        "SECURITY.md should name exactly one disclosure address, and names {}: \
+         {contacts:?}. A reporter cannot choose between two, and none leaves \
+         them nowhere to send anything.",
+        contacts.len()
     );
+    let contact = &contacts[0];
 
     for (name, body) in [
         ("README.md", read("README.md")),
@@ -89,7 +92,48 @@ fn the_security_policy_carries_a_disclosure_contact() {
             "{name} does not point at SECURITY.md, so a reporter arriving there \
              has nowhere to be sent"
         );
+
+        // If a document names an address at all, it has to name the one
+        // SECURITY.md does. Nothing but SECURITY.md carries one today, and this
+        // is what keeps that true: a second address added to the README later
+        // is a reporter sending a vulnerability somewhere nobody reads.
+        for found in disclosure_addresses(&body) {
+            assert_eq!(
+                &found, contact,
+                "{name} names {found}, but SECURITY.md names {contact}. Two \
+                 disclosure addresses in one repository means one of them is \
+                 wrong and a reporter cannot tell which."
+            );
+        }
     }
+}
+
+/// Every email address a document names.
+///
+/// Deliberately crude — a whitespace split with the surrounding markdown
+/// stripped — because the alternative is a regex crate carried by every build
+/// of a photo organiser to read four documents in one test. It finds
+/// `**security@t0lkim.dev**` and `<a@b.dev>` alike, which is the shape these
+/// files actually use.
+fn disclosure_addresses(body: &str) -> Vec<String> {
+    let mut found: Vec<String> = body
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '.'))
+        .filter(|word| {
+            // An address, not a version number or a `@v7` action pin: one `@`,
+            // something either side of it, and a dot in the domain.
+            word.matches('@').count() == 1
+                && word.split('@').next().is_some_and(|user| !user.is_empty())
+                && word
+                    .split('@')
+                    .nth(1)
+                    .is_some_and(|domain| domain.contains('.') && !domain.ends_with('.'))
+        })
+        .map(ToString::to_string)
+        .collect();
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// The template is only useful if it asks for the four things that make a
