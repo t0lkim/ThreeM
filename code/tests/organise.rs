@@ -1589,7 +1589,10 @@ fn the_preview_names_every_destination_the_commit_produces() {
 
     let preview = stdout_of(&run_commit_preview(tree.path(), &out_dir));
     let planned = destinations_in(&preview, &out_dir);
-    assert!(!planned.is_empty(), "the preview planned nothing:\n{preview}");
+    assert!(
+        !planned.is_empty(),
+        "the preview planned nothing:\n{preview}"
+    );
 
     assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
 
@@ -1648,4 +1651,48 @@ fn destinations_in(stdout: &str, output: &Path) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// The summary's `unsorted/` figure counts files actually going there.
+///
+/// It counted `DateSource::None` — a variant no CLI invocation produces — so a
+/// run that had just filled `unsorted/` reported `0` beside a tree that plainly
+/// disagreed. A file refused by `--require-exif` still carries the source its
+/// date came from, usually `Unsupported`, so where a file is *going* and how its
+/// date was *established* are two questions and only the second was being asked.
+#[test]
+fn the_summary_counts_the_files_it_filed_under_unsorted() {
+    let tree = MediaTree::new()
+        .jpeg_with_exif("dated.jpg", naive(2024, 1, 15, 14, 30, 0), None)
+        .jpeg_without_exif("scan.jpg");
+
+    let (_scratch, out_dir) = scratch_output();
+
+    let refused = stdout_of(
+        &Command::cargo_bin("mmm")
+            .unwrap()
+            .arg(tree.path())
+            .arg("-o")
+            .arg(&out_dir)
+            .arg("--require-exif")
+            .arg("--no-config")
+            .output()
+            .expect("running mmm with --require-exif"),
+    );
+    assert!(
+        refused.contains("Filed under unsorted/: 1"),
+        "the undateable file was not counted:\n{refused}"
+    );
+    assert!(
+        refused.contains("No date recorded at all: 0"),
+        "a file whose date was read and refused has a date source:\n{refused}"
+    );
+
+    // And the default posture files it under a date instead, so the same figure
+    // must be zero — a counter that answered 1 either way would be no counter.
+    let permitted = stdout_of(&run_commit_preview(tree.path(), &out_dir));
+    assert!(
+        permitted.contains("Filed under unsorted/: 0"),
+        "nothing goes to unsorted/ without --require-exif:\n{permitted}"
+    );
 }

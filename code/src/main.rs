@@ -557,7 +557,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
         hash_skipped: dedup_result.skipped,
         unprocessed: 0,
         errors: plan_errors,
-        dates: reporter::DateSourceTally::of(&planned_moves),
+        dates: reporter::DateSourceTally::of(&planned_moves, layout.unsorted()),
         // Counted over the whole index rather than over `planned_moves`: a
         // duplicate's sidecar travels too, and duplicates are not in that list.
         sidecars_found: sidecars.paired(),

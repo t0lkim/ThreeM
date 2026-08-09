@@ -227,14 +227,35 @@ pub struct DateSourceTally {
     pub unreadable: usize,
     pub unsupported: usize,
     pub undated: usize,
+    /// Files whose destination is the `unsorted/` directory.
+    ///
+    /// Counted from where each file is *going*, not from how its date was
+    /// established, because those are two different questions and only one of
+    /// them is answerable from [`DateSource`] alone. A file refused by
+    /// `--require-exif` still carries the source its date came from — usually
+    /// `Unsupported` or `Filesystem` — so a tally keyed on `DateSource::None`
+    /// reported `0` for a run that had just filled `unsorted/`, which is a
+    /// figure contradicting the tree beside it.
+    pub unsorted: usize,
 }
 
 impl DateSourceTally {
-    /// Count how each planned move established its date.
+    /// Count how each planned move established its date, and how many were
+    /// filed under `unsorted/` regardless of what that source was.
+    ///
+    /// `unsorted_dir` is the layout's own, relative to the output directory, so
+    /// a run that renamed it is still counted correctly.
     #[must_use]
-    pub fn of(moves: &[PlannedMove]) -> Self {
+    pub fn of(moves: &[PlannedMove], unsorted_dir: &Path) -> Self {
         let mut tally = Self::default();
         for planned in moves {
+            if planned
+                .destination
+                .parent()
+                .is_some_and(|dir| dir.ends_with(unsorted_dir))
+            {
+                tally.unsorted += 1;
+            }
             match planned.date_source {
                 DateSource::Exif => tally.exif += 1,
                 DateSource::Sidecar => tally.sidecar += 1,
@@ -307,7 +328,12 @@ impl DateSourceTally {
             "  Date from filesystem — format not supported: {}",
             self.unsupported
         );
-        println!("  No date (unsorted): {}", self.undated);
+        // Two different facts, and they were one line reporting the wrong one.
+        // `undated` is a file that recorded no date at all; `unsorted` is a file
+        // this run declined to date, which is what `--require-exif` produces and
+        // what a reader can go and look at.
+        println!("  No date recorded at all: {}", self.undated);
+        println!("  Filed under unsorted/: {}", self.unsorted);
 
         if self.warrants_warning(warn_above) {
             println!(
