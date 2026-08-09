@@ -947,16 +947,23 @@ fn the_full_library_journey_is_reversible() {
     assert_golden_tree(&scenario, &out_dir);
     assert_stayed_put(&scenario, &input);
 
-    // The plan was the truth: every destination it printed is a file that now
-    // exists, and every organised file was in it. Duplicates are excluded on
-    // both sides — they are reported by `print_duplicates`, not planned as moves,
-    // and `undo.rs` is where their journalling is proved.
-    let organised: Vec<String> = snapshot_tree(&out_dir)
+    // The plan was the truth, over the *whole* tree: every destination it
+    // printed is a file that now exists, and every file the run produced was in
+    // it — collision suffixes and `duplicates/NNN/` relocations included.
+    //
+    // Duplicates used to be excluded from both sides of this comparison,
+    // because they were reported as group counts rather than planned as moves.
+    // That exclusion is what let the preview stay silent about where a
+    // duplicate would land while this test still passed; the plan now covers
+    // them, so the comparison does too.
+    // `manifest.txt` is excluded: it is a *record* the run writes, not a file
+    // the run moves, so no plan could name it as a destination.
+    let produced: Vec<String> = snapshot_tree(&out_dir)
         .into_iter()
-        .filter(|rel| !rel.starts_with("duplicates/"))
+        .filter(|rel| !rel.ends_with("/manifest.txt"))
         .collect();
     assert_eq!(
-        planned, organised,
+        planned, produced,
         "the dry run's plan is not what the committing run did"
     );
 

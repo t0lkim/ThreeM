@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::hasher::DuplicateGroup;
 use crate::journal::{JournalEntry, RunHeader};
 use crate::metadata::DateSource;
-use crate::organiser::PlannedMove;
+use crate::organiser::{DuplicatePlan, PlannedMove};
 use crate::sidecar::{Orphan, OrphanReason};
 use crate::timezone::TimezoneSource;
 use crate::undo::{
@@ -62,13 +62,33 @@ pub fn print_mode_banner(dry_run: bool) {
 /// [`RunSummary::dates`], which now carries them for both postures so there is
 /// one block saying where a run's dates came from rather than one that appears
 /// only when nothing is being moved.
-pub fn print_dry_run(moves: &[PlannedMove]) {
-    if moves.is_empty() {
+pub fn print_dry_run(moves: &[PlannedMove], duplicates: &[DuplicatePlan]) {
+    if moves.is_empty() && duplicates.is_empty() {
         println!("\nNo files to organise.");
         return;
     }
 
     println!("\n═══ Dry Run — Planned Operations ═══\n");
+
+    // Duplicates first, because that is the order the committing run moves in,
+    // and printed as moves rather than as a tally: a preview that gave a count
+    // and no destination did not answer the question a preview is asked.
+    for plan in duplicates {
+        println!(
+            "  {DUPLICATE_TAG} {} → {}",
+            plan.planned.source.display(),
+            plan.planned.destination.display()
+        );
+        for sidecar in &plan.planned.sidecars {
+            println!(
+                "    {SIDECAR_TAG} {} → {}",
+                sidecar.path.display(),
+                sidecar
+                    .destination_beside(&plan.planned.destination)
+                    .display()
+            );
+        }
+    }
 
     let mut with_location = 0;
     let mut timezones = TimezoneTally::default();
@@ -111,6 +131,12 @@ pub fn print_dry_run(moves: &[PlannedMove]) {
 /// Exported so the integration suite asserts against the string the binary
 /// actually prints.
 pub const SIDECAR_TAG: &str = "[sidecar]";
+/// Marks a relocation into `duplicates/NNN/` in the planned-operations list.
+///
+/// Distinct from the organise moves it sits beside, because the two mean very
+/// different things to somebody reading the plan: one files a photograph, the
+/// other sets a copy aside.
+const DUPLICATE_TAG: &str = "[DUP]";
 
 /// Heading of the section listing sidecars that are staying where they are.
 pub const ORPHAN_SIDECAR_HEADING: &str = "Sidecars left in place";

@@ -329,6 +329,88 @@ pub fn collision_candidate(path: &Path, attempt: usize) -> PathBuf {
     }
 }
 
+/// Which destinations a run has already spoken for.
+///
+/// The preview used to print `planned.destination` — the *unsuffixed* name —
+/// for every file, because collision resolution happened only inside
+/// [`execute_move`]. Three files sharing a second therefore all previewed to
+/// one path, which is not merely imprecise: it is an outcome that cannot
+/// happen, and it reads as "two of these are about to be overwritten" to the
+/// one person a dry run exists to reassure. Duplicates were worse — never
+/// planned at all, so a preview did not say where any of them would land.
+///
+/// This makes the plan say what the run will do. It does **not** take authority
+/// away from the move: [`execute_move`] still walks candidates and lets
+/// [`move_no_clobber`] be the only thing that decides a name is free. That is
+/// deliberate, and it is what closed the TOCTOU overwrite in Phase 02. A ledger
+/// that asked the filesystem and then trusted its own answer would put the bug
+/// back. So the plan is a *prediction* — accurate for every file this run
+/// places, and honest about nothing else touching the tree meanwhile — while
+/// the move remains the *arbiter*, and the journal records where a file
+/// actually went if the two ever diverge.
+#[derive(Debug, Default)]
+pub struct DestinationLedger {
+    claimed: std::collections::HashSet<PathBuf>,
+    /// Directories whose existing contents have already been read in.
+    ///
+    /// Seeded lazily, and per directory rather than per file, because a run
+    /// into a library that is already organised is the ordinary case for this
+    /// tool — and a ledger that knew only about this run's own files would
+    /// mispredict every suffix the moment one name was already taken. One
+    /// `read_dir` per date directory, not one `exists()` per file.
+    scanned: std::collections::HashSet<PathBuf>,
+}
+
+impl DestinationLedger {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim a destination, returning the name this run will actually use.
+    ///
+    /// Walks the same candidate sequence [`execute_move`] does, so preview and
+    /// commit agree by construction rather than by two implementations
+    /// happening to match.
+    pub fn claim(&mut self, destination: &Path) -> PathBuf {
+        if let Some(dir) = destination.parent() {
+            self.seed_from_disk(dir);
+        }
+
+        for attempt in 0..MAX_COLLISION_ATTEMPTS {
+            let candidate = collision_candidate(destination, attempt);
+            if !self.claimed.contains(&candidate) {
+                self.claimed.insert(candidate.clone());
+                return candidate;
+            }
+        }
+
+        // Ten thousand files claiming one name. `execute_move` gives up here
+        // too, and reports it properly; predicting the unsuffixed name is the
+        // truthful thing to hand it.
+        destination.to_path_buf()
+    }
+
+    /// Read `dir` into the ledger once, so names already on disk are not
+    /// predicted as free.
+    ///
+    /// An unreadable directory is not an error here: the ledger is a
+    /// prediction, and a directory the run cannot list is one whose contents it
+    /// cannot predict around. The move still refuses to clobber whatever is
+    /// there.
+    fn seed_from_disk(&mut self, dir: &Path) {
+        if !self.scanned.insert(dir.to_path_buf()) {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            self.claimed.insert(entry.path());
+        }
+    }
+}
+
 /// The record of one duplicate group, written before that group's files move.
 ///
 /// Ordering is the whole point. The previous version accumulated the manifest
@@ -891,6 +973,77 @@ fn move_sidecars(
     run
 }
 
+/// One duplicate relocation, planned but not yet done.
+///
+/// Exists so the preview and the committing run read from the *same*
+/// computation rather than two that happen to agree. Duplicates used never to
+/// be planned at all — [`crate::reporter::print_duplicates`] reported them as
+/// group counts — so a dry run genuinely did not say where any of them would
+/// land, which is the one question a dry run is for.
+#[derive(Debug, Clone)]
+pub struct DuplicatePlan {
+    /// Which `duplicates/NNN/` directory this belongs to.
+    pub group: usize,
+    pub planned: PlannedMove,
+}
+
+/// Work out where every duplicate will go, claiming each name as it goes.
+///
+/// Pure but for the ledger it writes into, and called on both postures: the
+/// preview prints these, and the committing run executes exactly these. The
+/// ledger is shared with the organise pass, so a duplicate and a photograph can
+/// never be predicted onto the same path.
+pub fn plan_duplicate_moves(
+    groups: &[DuplicateGroup],
+    output_dir: &Path,
+    duplicates_dir: &Path,
+    sidecars: &SidecarIndex,
+    ledger: &mut DestinationLedger,
+) -> Vec<DuplicatePlan> {
+    let dup_base = output_dir.join(duplicates_dir);
+    let mut plans = Vec::new();
+
+    for (i, group) in groups.iter().enumerate() {
+        let group_dir = dup_base.join(format!("{i:03}"));
+
+        // The first file is the retained original and is organised by the other
+        // pass; everything after it is set aside here.
+        for dup_path in group.files.iter().skip(1) {
+            let filename = dup_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            plans.push(DuplicatePlan {
+                group: i,
+                planned: PlannedMove {
+                    source: dup_path.clone(),
+                    destination: ledger.claim(&group_dir.join(&filename)),
+                    date_source: DateSource::None,
+                    // A duplicate is filed by its group, not by its date, so no
+                    // wall clock was ever chosen for it.
+                    timezone_source: None,
+                    has_location: false,
+                    // The duplicate pass carries its digest on the purpose,
+                    // which is where the journal reads it from for this kind of
+                    // move.
+                    known_hash: None,
+                    // A duplicate's sidecar travels with it. It is the same
+                    // argument as for an organised file and it bites harder
+                    // here: a photograph in `duplicates/007/` is already the
+                    // copy nobody is looking at, and an `.xmp` left behind in
+                    // the source tree with no file to pair against is the one
+                    // that gets deleted in the next tidy-up.
+                    sidecars: sidecars.for_parent(dup_path).to_vec(),
+                },
+            });
+        }
+    }
+
+    plans
+}
+
 /// Move duplicate files into numbered subdirectories under the duplicates
 /// directory — `duplicates/000/`, `duplicates/001/`, and so on, or whatever
 /// `duplicates_dir` renamed it to.
@@ -917,7 +1070,7 @@ pub fn move_duplicates(
     groups: &[DuplicateGroup],
     output_dir: &Path,
     duplicates_dir: &Path,
-    sidecars: &SidecarIndex,
+    plans: &[DuplicatePlan],
     recorder: &mut MoveRecorder<'_>,
 ) -> Result<DuplicateRun> {
     let dup_base = output_dir.join(duplicates_dir);
@@ -941,44 +1094,22 @@ pub fn move_duplicates(
             original_manifests.insert(original.clone(), manifest_path.clone());
         }
 
-        // Skip the first file (kept as original), move the rest
-        for (done, dup_path) in group.files.iter().skip(1).enumerate() {
-            let filename = dup_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            // No pre-flight collision check: `execute_move` walks the
-            // candidate names itself and lets the move be the authority on
-            // which one is free.
-            let dest = group_dir.join(&filename);
+        // Exactly the moves the preview printed — `plan_duplicate_moves` is the
+        // only thing that decides a duplicate's destination, so a run cannot
+        // put a file somewhere the plan did not say.
+        let group_plans: Vec<&DuplicatePlan> =
+            plans.iter().filter(|plan| plan.group == i).collect();
 
-            let planned = PlannedMove {
-                source: dup_path.clone(),
-                destination: dest,
-                date_source: DateSource::None,
-                // A duplicate is filed by its group, not by its date, so no
-                // wall clock was ever chosen for it.
-                timezone_source: None,
-                has_location: false,
-                // The duplicate pass carries its digest on the purpose, which
-                // is where the journal reads it from for this kind of move.
-                known_hash: None,
-                // A duplicate's sidecar travels with it. It is the same argument
-                // as for an organised file and it bites harder here: a
-                // photograph in `duplicates/007/` is already the copy nobody is
-                // looking at, and an `.xmp` left behind in the source tree with
-                // no file to pair against is the one that gets deleted in the
-                // next tidy-up.
-                sidecars: sidecars.for_parent(dup_path).to_vec(),
-            };
+        for (done, plan) in group_plans.iter().enumerate() {
+            let planned = &plan.planned;
+            let dup_path = &planned.source;
 
             let purpose = MovePurpose::Duplicate {
                 group: i,
                 hash: &group.hash,
             };
 
-            let manifested = match recorded_move(recorder, &planned, purpose) {
+            let manifested = match recorded_move(recorder, planned, purpose) {
                 Ok(outcome) => {
                     moved += 1;
                     // The duplicate's own line first, then its sidecars', so the
@@ -2705,10 +2836,14 @@ mod tests {
         fs::remove_file(&doomed).unwrap();
 
         let run = move_duplicates(
-            &[group],
+            std::slice::from_ref(&group),
             &output,
             Path::new("duplicates"),
-            &SidecarIndex::empty(),
+            &dup_plans(
+                std::slice::from_ref(&group),
+                &output,
+                &SidecarIndex::empty(),
+            ),
             &mut MoveRecorder::disabled(),
         )
         .unwrap();
@@ -2754,10 +2889,14 @@ mod tests {
 
         let group = duplicate_group(&[kept, first.clone(), second.clone()], b"BODY");
         let run = move_duplicates(
-            &[group],
+            std::slice::from_ref(&group),
             &output,
             Path::new("duplicates"),
-            &SidecarIndex::empty(),
+            &dup_plans(
+                std::slice::from_ref(&group),
+                &output,
+                &SidecarIndex::empty(),
+            ),
             &mut MoveRecorder::disabled(),
         )
         .unwrap();
@@ -2836,6 +2975,25 @@ mod tests {
     /// Most move-path tests are about chunking and failure handling, not about
     /// duplicates, so they hand `process_moves` an empty backlink map — the
     /// same thing a run over a library with no duplicates gives it.
+    /// The duplicate plans production would build for these groups.
+    ///
+    /// Tests call `move_duplicates` with the plans rather than letting it
+    /// derive destinations, because that is now the only way it works — one
+    /// planner, used by the preview and the run alike.
+    fn dup_plans(
+        groups: &[DuplicateGroup],
+        output: &Path,
+        sidecars: &SidecarIndex,
+    ) -> Vec<DuplicatePlan> {
+        plan_duplicate_moves(
+            groups,
+            output,
+            Path::new("duplicates"),
+            sidecars,
+            &mut DestinationLedger::new(),
+        )
+    }
+
     fn no_backlinks() -> HashMap<PathBuf, PathBuf> {
         HashMap::new()
     }
@@ -3193,10 +3351,14 @@ mod tests {
 
         let mut journal = open_journal(tmp.path());
         let run = move_duplicates(
-            &[group],
+            std::slice::from_ref(&group),
             &output,
             Path::new("duplicates"),
-            &SidecarIndex::empty(),
+            &dup_plans(
+                std::slice::from_ref(&group),
+                &output,
+                &SidecarIndex::empty(),
+            ),
             &mut MoveRecorder::new(Some(&mut journal)),
         )
         .unwrap();
@@ -3242,10 +3404,14 @@ mod tests {
 
         let mut journal = open_journal(tmp.path());
         move_duplicates(
-            &[group],
+            std::slice::from_ref(&group),
             &tmp.path().join("output"),
             Path::new("duplicates"),
-            &SidecarIndex::empty(),
+            &dup_plans(
+                std::slice::from_ref(&group),
+                &tmp.path().join("output"),
+                &SidecarIndex::empty(),
+            ),
             &mut MoveRecorder::new(Some(&mut journal)),
         )
         .unwrap();
@@ -3532,10 +3698,14 @@ mod tests {
 
         let err = with_logs(|| {
             move_duplicates(
-                &[group],
+                std::slice::from_ref(&group),
                 &output,
                 Path::new("duplicates"),
-                &SidecarIndex::empty(),
+                &dup_plans(
+                    std::slice::from_ref(&group),
+                    &output,
+                    &SidecarIndex::empty(),
+                ),
                 &mut MoveRecorder::failing(),
             )
             .expect_err("a refused journal write must stop the duplicate pass")
@@ -3582,10 +3752,10 @@ mod tests {
         // intent is refused.
         let err = with_logs(|| {
             move_duplicates(
-                &[group],
+                std::slice::from_ref(&group),
                 &output,
                 Path::new("duplicates"),
-                &index,
+                &dup_plans(std::slice::from_ref(&group), &output, &index),
                 &mut MoveRecorder::failing_after(2),
             )
             .expect_err("a refused journal write must stop the duplicate pass")
@@ -3639,10 +3809,14 @@ mod tests {
         let run = with_manifest_failing_after(1, || {
             with_logs(|| {
                 move_duplicates(
-                    &[group],
+                    std::slice::from_ref(&group),
                     &output,
                     Path::new("duplicates"),
-                    &SidecarIndex::empty(),
+                    &dup_plans(
+                        std::slice::from_ref(&group),
+                        &output,
+                        &SidecarIndex::empty(),
+                    ),
                     &mut MoveRecorder::disabled(),
                 )
             })
@@ -3682,10 +3856,14 @@ mod tests {
         let run = with_manifest_failing_after(0, || {
             with_logs(|| {
                 move_duplicates(
-                    &[group],
+                    std::slice::from_ref(&group),
                     &output,
                     Path::new("duplicates"),
-                    &SidecarIndex::empty(),
+                    &dup_plans(
+                        std::slice::from_ref(&group),
+                        &output,
+                        &SidecarIndex::empty(),
+                    ),
                     &mut MoveRecorder::disabled(),
                 )
             })
@@ -3732,10 +3910,10 @@ mod tests {
         let run = with_manifest_failing_after(1, || {
             with_logs(|| {
                 move_duplicates(
-                    &[group],
+                    std::slice::from_ref(&group),
                     &output,
                     Path::new("duplicates"),
-                    &index,
+                    &dup_plans(std::slice::from_ref(&group), &output, &index),
                     &mut MoveRecorder::disabled(),
                 )
             })

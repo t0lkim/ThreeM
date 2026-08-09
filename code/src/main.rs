@@ -507,6 +507,19 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
     let mut planned_moves = Vec::new();
     let mut plan_errors = 0;
 
+    // One ledger across both passes, and duplicates claim first because that is
+    // the order the committing run moves in. Planning them here rather than
+    // inside `move_duplicates` is what lets a *preview* say where a duplicate
+    // will land — it used to report them as counts and nothing else.
+    let mut ledger = organiser::DestinationLedger::new();
+    let duplicate_plans = organiser::plan_duplicate_moves(
+        &dedup_result.duplicate_groups,
+        output_dir,
+        layout.duplicates(),
+        &sidecars,
+        &mut ledger,
+    );
+
     for unique in &dedup_result.unique {
         match organiser::plan_move(
             &unique.file,
@@ -518,7 +531,12 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
             &sidecars,
             unique.known_hash.clone(),
         ) {
-            Ok(planned) => planned_moves.push(planned),
+            Ok(mut planned) => {
+                // The name this run will actually use, suffix and all, so the
+                // preview and the commit describe the same tree.
+                planned.destination = ledger.claim(&planned.destination);
+                planned_moves.push(planned);
+            }
             Err(e) => {
                 error!(path = %unique.file.path.display(), error = %e, "failed to plan move");
                 plan_errors += 1;
@@ -549,7 +567,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
 
     // === DRY RUN (the default): stop here, before anything is moved ===
     if config.is_dry_run() {
-        reporter::print_dry_run(&planned_moves);
+        reporter::print_dry_run(&planned_moves, &duplicate_plans);
         reporter::print_sidecar_orphans(sidecars.orphans());
         // No journal, and none reported: a preview moves nothing, so there is
         // nothing to undo.
@@ -579,7 +597,7 @@ fn run_organise(config: &Config, settings: &Settings) -> Result<()> {
             &dedup_result.duplicate_groups,
             output_dir,
             layout.duplicates(),
-            &sidecars,
+            &duplicate_plans,
             &mut recorder,
         ) {
             Ok(run) => {

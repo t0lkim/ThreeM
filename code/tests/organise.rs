@@ -1562,3 +1562,90 @@ fn a_duplicate_pass_that_cannot_write_stops_the_run_and_closes_the_journal() {
         "nothing may have moved out of the input tree"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The preview describes the run
+// ---------------------------------------------------------------------------
+
+/// Every destination the preview printed is a file the commit produced, and
+/// nothing the commit produced went unannounced.
+///
+/// The fixture is built to break the old behaviour specifically: three files
+/// resolving to one name, and a duplicate pair. Before the collision ledger the
+/// preview printed the *unsuffixed* destination for all three — an outcome that
+/// cannot happen, since three files cannot occupy one path — and said nothing
+/// at all about where the duplicate would land, because duplicates were
+/// reported as group counts rather than planned as moves.
+#[test]
+fn the_preview_names_every_destination_the_commit_produces() {
+    let at = naive(2024, 3, 15, 14, 30, 0);
+    let tree = MediaTree::new()
+        .jpeg_with_exif("a.jpg", at, None)
+        .jpeg_with_exif("b.jpg", at, None)
+        .jpeg_with_exif("sub/c.jpg", at, None)
+        .duplicate_of("sub/a-copy.jpg", "a.jpg");
+
+    let (_scratch, out_dir) = scratch_output();
+
+    let preview = stdout_of(&run_commit_preview(tree.path(), &out_dir));
+    let planned = destinations_in(&preview, &out_dir);
+    assert!(!planned.is_empty(), "the preview planned nothing:\n{preview}");
+
+    assert_ok(&run_commit(tree.path(), &out_dir), "commit run");
+
+    // `manifest.txt` is a record the run writes, not a file it moves, so no
+    // plan could have named it.
+    let produced: Vec<String> = snapshot_tree(&out_dir)
+        .into_iter()
+        .filter(|rel| !rel.ends_with("/manifest.txt"))
+        .collect();
+
+    assert_eq!(
+        planned, produced,
+        "the preview does not describe the run:\n{preview}"
+    );
+
+    // And the specific shapes that used to be wrong, named so a failure says
+    // which half broke rather than only that the sets differ.
+    assert!(
+        produced.iter().any(|rel| rel.contains("-1.jpg")),
+        "the fixture must actually collide, or this proves nothing: {produced:?}"
+    );
+    assert!(
+        produced.iter().any(|rel| rel.starts_with("duplicates/")),
+        "the fixture must actually produce a duplicate: {produced:?}"
+    );
+}
+
+/// Run `mmm` previewing into `output`, so the preview and the commit are asked
+/// about the same output directory.
+fn run_commit_preview(input: &Path, output: &Path) -> std::process::Output {
+    Command::cargo_bin("mmm")
+        .unwrap()
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .arg("--no-config")
+        .output()
+        .expect("running mmm in preview mode")
+}
+
+/// The destinations a listing printed, relative to `output` and sorted.
+///
+/// Lines with nothing to the left of the arrow are the duplicate-group listing
+/// `print_duplicates` writes, whose right-hand side is an *input* path.
+fn destinations_in(stdout: &str, output: &Path) -> Vec<String> {
+    let prefix = format!("{}/", output.display());
+    let mut out: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" → ")?;
+            if left.trim().is_empty() {
+                return None;
+            }
+            right.strip_prefix(&prefix).map(ToString::to_string)
+        })
+        .collect();
+    out.sort();
+    out
+}
