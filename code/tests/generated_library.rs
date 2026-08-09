@@ -32,10 +32,16 @@ use tempfile::TempDir;
 use mmm::fixtures::{file_contents_by_marker, MediaTree};
 use mmm::generate::{expected_markdown, generate, Expect, Plan, Profile};
 
-/// UTC throughout: every dated fixture the generator lays down writes an
-/// explicit `+00:00`, so the run's own zone cannot move a file — but pinning it
-/// keeps the filesystem-dated fallbacks from drifting across a midnight
-/// boundary on a machine east of Greenwich.
+/// UTC throughout, and `EXPECTED.md` instructs the reader to pass the same
+/// flag, because the two have to be in one frame to be comparable at all.
+///
+/// Every dated fixture writes an explicit `+00:00` and is predicted at its wall
+/// clock as written, which is what a UTC run produces and no other. The
+/// filesystem-dated fallbacks used to be predicted in the machine's zone
+/// instead, so on a machine east of Greenwich the document contradicted itself
+/// for the eight hours after local midnight and this suite failed there — not
+/// because the organiser was wrong, but because the two halves of one document
+/// were measured against different clocks.
 const ARGS: &[&str] = &["--timezone", "UTC", "--no-prompt", "--commit"];
 
 fn organise(input: &Path, output: &Path) -> std::process::Output {
@@ -361,6 +367,20 @@ fn the_binary_writes_expected_md_and_prints_the_seed() {
         "a document that tells someone how to run a file-moving tool must tell them how to \
          reverse it"
     );
+
+    // The binary prints one set of commands and the document it writes prints
+    // another; a reader who follows the printed pair and then reads the tables
+    // written for the other pair is looking at a correct run and being told it
+    // is wrong. Both must offer the organise step with `--timezone UTC`, which
+    // is the only zone the predicted directories hold in.
+    for (surface, text) in [("stdout", stdout.as_ref()), ("EXPECTED.md", doc.as_str())] {
+        assert!(
+            text.contains("--timezone UTC"),
+            "{surface} tells the reader how to organise this library but omits \
+             `--timezone UTC`, so the directories it points them at are the ones they \
+             will get only if their machine happens to run UTC:\n{text}"
+        );
+    }
 }
 
 /// An unknown profile is refused by name, listing the ones that exist.

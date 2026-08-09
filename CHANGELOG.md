@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The README and User Guide no longer say there is no packaged build.** Prebuilt binaries for x86_64 Linux, Intel macOS and Apple Silicon have been attached to releases since v0.3.0. Both now also state that nothing is signed or notarised, so macOS quarantines the downloads until the attribute is cleared — which is the thing a reader actually needs to know before the binary refuses to run.
 
+### Fixed
+
+- **`EXPECTED.md` was written in two timezones at once, and told readers outside UTC that a correct run had misfiled their files.** The dated fixtures record an explicit `+00:00` and were predicted at the wall clock as written — which is what the tool produces under `--timezone UTC` and nothing else — while the filesystem-dated fallbacks were predicted by reading the file's modification time in the machine's own zone. The two frames agree only on a machine already running UTC. Everywhere else the document disagreed with itself, and since it instructed the reader to organise the library with no `--timezone` at all, it declared correctly-filed photographs to be defects against a section that says in terms "if one of them lands anywhere else, that is a defect". The filesystem fallback is now read in UTC, and every surface that tells a reader how to organise a generated library — `EXPECTED.md`, the "Try it:" block `mmm-fixtures` prints, the `README.md` and User Guide examples — passes `--timezone UTC` and explains why. **This changes only the generated library's documentation and the commands suggested alongside it; no file `mmm` moves, and no date it derives from your own photographs, is affected.** A library generated before this release carries the old document: regenerate it with the same `--seed` to get a corrected one, since the library bytes themselves are unchanged.
+
+- **`tests/generated_library.rs` no longer passes purely because CI runs in UTC.** The same defect made the suite fail for the eight hours after local midnight on any machine east of Greenwich, including CI's `Asia/Singapore` leg — a release gate that was red a third of the day and green if you retried later. It is now guarded by a unit test pinning the fallback to UTC, with instants chosen to fall on a different calendar day under both non-UTC legs of the CI timezone matrix so a regression fails there rather than nowhere, and by an assertion that the binary's printed commands and the document it writes both carry the flag.
+
 ## [0.3.1] — 2026-08-09
 
 ### Security

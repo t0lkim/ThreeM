@@ -22,11 +22,13 @@ Image and video organiser with deduplication, EXIF-based renaming, and date-base
 The sensible reaction to a tool that moves photographs is to refuse to point it at yours. `mmm-fixtures` builds a library that is safe to be wrong about:
 
 ```bash
-mmm-fixtures ~/mmm-demo                    # a few hundred synthetic files
-mmm ~/mmm-demo -o /tmp/organised           # preview — moves nothing
-mmm ~/mmm-demo -o /tmp/organised --commit  # do it
-mmm undo /tmp/organised --commit           # put it all back
+mmm-fixtures ~/mmm-demo                                       # a few hundred synthetic files
+mmm ~/mmm-demo -o /tmp/organised --timezone UTC               # preview — moves nothing
+mmm ~/mmm-demo -o /tmp/organised --timezone UTC --commit      # do it
+mmm undo /tmp/organised --commit                              # put it all back
 ```
+
+`--timezone UTC` is what makes the result checkable: the generated files record their capture times with an explicit `+00:00`, and the directories `EXPECTED.md` names are those times as written. Run it in your own zone and the tool is still correct — the document simply stops describing it.
 
 They are byte-valid images and videos carrying real EXIF — the same fixtures this project's own test suite runs against. Alongside them it writes `EXPECTED.md`, naming every file and saying where it should end up and why, so the result can be *checked* rather than merely watched. `--profile awkward` builds the malformed half — zero-byte files, unparseable EXIF, coordinates outside the ISO 6709 bounds — where warnings and files landing on their filesystem timestamps are the correct outcome, and the document marks each one. Every run prints its seed; `--seed N` reproduces that library exactly, so a bug report citing a profile and a seed is a complete reproduction. Full detail in the [User Guide](docs/USER-GUIDE.md#trying-it-on-files-that-are-not-yours).
 

@@ -47,11 +47,13 @@ mmm-dedup-verifier ~/Organised/duplicates/
 The sensible thing to do with a tool that moves photographs is to refuse to point it at your photographs. `mmm-fixtures` builds a library that is safe to be wrong about:
 
 ```bash
-mmm-fixtures ~/mmm-demo                    # a few hundred synthetic files
-mmm ~/mmm-demo -o /tmp/organised           # preview — moves nothing
-mmm ~/mmm-demo -o /tmp/organised --commit  # do it
-mmm undo /tmp/organised --commit           # put it all back
+mmm-fixtures ~/mmm-demo                                       # a few hundred synthetic files
+mmm ~/mmm-demo -o /tmp/organised --timezone UTC               # preview — moves nothing
+mmm ~/mmm-demo -o /tmp/organised --timezone UTC --commit      # do it
+mmm undo /tmp/organised --commit                              # put it all back
 ```
+
+**`--timezone UTC` is load-bearing here, and only here.** The generated files record their capture times with an explicit `+00:00` offset, and every directory `EXPECTED.md` names is that time as written. Organise them in your own zone instead and they land elsewhere — correctly, since that is what the offset means, but the document is then describing a different run and every table in it reads as a failure. On your own photographs you want the opposite: no `--timezone`, and the tool resolves your machine's zone.
 
 The files are byte-valid images and videos carrying real EXIF — the same fixtures this project's own test suite runs against, handed over so the claims elsewhere in this guide can be checked rather than taken on trust. None of it is a real photograph and none of it is worth keeping.
 

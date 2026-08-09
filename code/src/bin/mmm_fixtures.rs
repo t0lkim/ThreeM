@@ -168,10 +168,16 @@ fn report(dir: &Path, profile: Profile, seed: u64, files: usize) {
     println!();
     println!("What should happen to each file is written in {dir}/EXPECTED.md.");
     println!();
+    // `--timezone UTC` matches what EXPECTED.md tells the reader to run, and
+    // for the same reason: the dated fixtures carry an explicit `+00:00`, so a
+    // run in the machine's own zone files them somewhere else and every table
+    // in the document reads as a failure when nothing failed. Printing one pair
+    // of commands here and a different pair in the document is how a user ends
+    // up reporting a correct run as a bug.
     println!("Try it:");
-    println!("  mmm {dir} -o /tmp/mmm-demo            # preview — moves nothing");
-    println!("  mmm {dir} -o /tmp/mmm-demo --commit   # do it");
-    println!("  mmm undo /tmp/mmm-demo --commit       # put it all back");
+    println!("  mmm {dir} -o /tmp/mmm-demo --timezone UTC            # preview — moves nothing");
+    println!("  mmm {dir} -o /tmp/mmm-demo --timezone UTC --commit   # do it");
+    println!("  mmm undo /tmp/mmm-demo --commit                      # put it all back");
 
     if profile == Profile::Awkward {
         println!();

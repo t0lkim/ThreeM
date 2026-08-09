@@ -34,7 +34,7 @@ use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Datelike, Local, NaiveDateTime};
+use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 
 use crate::fixtures::{naive, MediaTree, VideoSpec, XmpForm};
 
@@ -689,10 +689,9 @@ fn awkward(mut tree: MediaTree, rng: &mut Rng, out: &mut Vec<Entry>) -> MediaTre
 /// recorded.
 ///
 /// Measured rather than assumed: the mtime is whatever the OS wrote a moment
-/// ago, read back in local time, which is exactly the reading the tool will
-/// take. Predicting "today" from the clock would be right nearly always and
-/// wrong across a midnight boundary, which is precisely the class of bug this
-/// library exists to catch.
+/// ago, read back in the document's declared zone. Predicting "today" from the
+/// clock would be right nearly always and wrong across a midnight boundary,
+/// which is precisely the class of bug this library exists to catch.
 fn resolve_filesystem_dates(root: &Path, entries: &mut [Entry]) {
     for entry in entries {
         if !matches!(entry.expect, Expect::FiledFromFilesystem(_)) {
@@ -711,15 +710,21 @@ fn directory_of(dt: NaiveDateTime) -> String {
     format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day())
 }
 
-/// The same, for a filesystem timestamp read in the local zone.
+/// The same, for a filesystem timestamp.
+///
+/// Read in **UTC**, because UTC is the one zone `EXPECTED.md` is written in.
+/// The dated fixtures record an explicit `+00:00` and their predicted
+/// directories are the wall clocks as written, which is what the tool produces
+/// under `--timezone UTC` and nothing else — so a filesystem timestamp read in
+/// the machine's zone would put the two halves of the same document in two
+/// different frames. They agreed only on a machine already running UTC: east of
+/// Greenwich the document contradicted itself for the eight hours after local
+/// midnight, and `every_definite_expectation_is_met` failed for exactly that
+/// window. `expected_markdown` tells the reader to pass `--timezone UTC` for
+/// the same reason.
 fn directory_of_system_time(t: SystemTime) -> String {
-    let local: DateTime<Local> = t.into();
-    format!(
-        "{:04}-{:02}-{:02}",
-        local.year(),
-        local.month(),
-        local.day()
-    )
+    let utc: DateTime<Utc> = t.into();
+    format!("{:04}-{:02}-{:02}", utc.year(), utc.month(), utc.day())
 }
 
 // ---------------------------------------------------------------------------
@@ -756,10 +761,17 @@ pub fn expected_markdown(plan: &Plan) -> String {
     s.push_str("## How to check\n\n");
     s.push_str(
         "```bash\n\
-         mmm <this directory> -o /tmp/organised          # preview — moves nothing\n\
-         mmm <this directory> -o /tmp/organised --commit  # do it\n\
-         mmm undo /tmp/organised --commit                 # put it all back\n\
+         mmm <this directory> -o /tmp/organised --timezone UTC           # preview — moves nothing\n\
+         mmm <this directory> -o /tmp/organised --timezone UTC --commit  # do it\n\
+         mmm undo /tmp/organised --commit                                # put it all back\n\
          ```\n\n\
+         **`--timezone UTC` is not decoration.** Every date in this document is \
+         stated in UTC, because that is the only zone in which they are a \
+         property of the library rather than of the machine reading it: the \
+         dated fixtures record their times with an explicit `+00:00`, so a run \
+         in your own zone files them somewhere else and every table below would \
+         look wrong when nothing was. Drop the flag and the tool is behaving \
+         correctly — this document simply stops describing it.\n\n\
          Compare `/tmp/organised` against the tables below. Directory names \
          assume the default `YYYY-MM-DD` layout; if you have configured \
          `date_directory_format`, the dates are the same and the spelling is \
@@ -996,6 +1008,30 @@ mod tests {
             assert!(
                 NaiveDate::parse_from_str(dir, "%Y-%m-%d").is_ok(),
                 "`{rel}` was left with an unresolved directory {dir:?}"
+            );
+        }
+    }
+
+    /// The filesystem fallback is predicted in UTC, the same zone every other
+    /// date in `EXPECTED.md` is stated in.
+    ///
+    /// Both instants are chosen to fall on a different calendar day somewhere
+    /// the CI matrix actually runs: the first is the day after in
+    /// `Asia/Singapore`, the second the day before in `America/New_York`. So
+    /// reading the mtime in the machine's zone — which is what this did until
+    /// it was found contradicting the rest of the document — fails one of these
+    /// two on either non-UTC leg. On the UTC leg it cannot fail, and that is
+    /// the point of running the suite under three zones rather than one.
+    #[test]
+    fn the_filesystem_fallback_is_predicted_in_utc() {
+        for (epoch, expected) in [(1_786_311_329, "2026-08-09"), (1_786_242_600, "2026-08-09")] {
+            let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(epoch);
+            assert_eq!(
+                directory_of_system_time(t),
+                expected,
+                "a filesystem timestamp must be read in UTC; reading it in the machine's \
+                 zone puts EXPECTED.md's two halves on different clocks, and the document \
+                 then calls a correct run a defect"
             );
         }
     }
