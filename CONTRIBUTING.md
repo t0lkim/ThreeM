@@ -182,7 +182,7 @@ it from there, in this order, and each step has to pass before the next starts:
 |---|---|
 | `verify` | Refuses the tag if `v<x.y.z>` does not match `version` in `code/Cargo.toml`, or if `CHANGELOG.md` has no `## [x.y.z]` section. Both take seconds, so a wrong tag fails before twenty minutes of builds. |
 | `gate` | `cargo fmt --check`, `clippy --all-targets -- -D warnings`, `test --all-targets` on Linux and macOS, against the tagged commit. **A failing test blocks the release.** |
-| `build` | `cargo build --release --target …` for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`, each archived as a `.tar.gz` with a `.sha256` beside it. |
+| `build` | `cargo build --release --target …` for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`. Every binary the release ships is then checked to be the architecture the matrix asked for and **run** — `mmm` does a dry run, `mmm-fixtures` builds a `minimal` library, `mmm-dedup-verifier` is made to refuse a path that is not a directory — before the three are archived as a `.tar.gz` with a `.sha256` beside it. |
 | `publish` | Creates the GitHub Release with the changelog section as its body and the six files attached. The only job with a write token. |
 
 Two of the pieces are scripts rather than inline YAML, so they can be run

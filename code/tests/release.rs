@@ -61,6 +61,144 @@ fn the_release_ships_exactly_the_binaries_the_crate_declares() {
     );
 }
 
+/// The shell of one step's `run:` block in `.github/workflows/release.yml`,
+/// found by the step's `name:`.
+///
+/// Hand-rolled rather than parsed as YAML: the crate has no YAML dependency,
+/// and adding one to read two blocks out of one file would put a parser in the
+/// dependency tree of a tool that moves photographs. It is exact about what it
+/// takes — the block ends at the first non-blank line indented no further than
+/// the `run:` that opened it — so a step gaining a sibling key cannot silently
+/// swallow the next step's script.
+fn workflow_step(step_name: &str) -> String {
+    let workflow = read(".github/workflows/release.yml");
+    let marker = format!("- name: {step_name}");
+
+    let mut lines = workflow
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with(&marker))
+        .peekable();
+    assert!(
+        lines.peek().is_some(),
+        "release.yml has no step named {step_name:?} — it was renamed, and this \
+         test would otherwise have nothing to check"
+    );
+    lines.next();
+
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let mut run_indent = None;
+    let mut body: Vec<&str> = Vec::new();
+    for line in lines {
+        match run_indent {
+            None => {
+                let trimmed = line.trim_start();
+                assert!(
+                    !trimmed.starts_with("- name:"),
+                    "the {step_name:?} step has no `run: |` block"
+                );
+                if trimmed == "run: |" {
+                    run_indent = Some(indent_of(line));
+                }
+            }
+            Some(indent) => {
+                if !line.trim().is_empty() && indent_of(line) <= indent {
+                    break;
+                }
+                body.push(line);
+            }
+        }
+    }
+    assert!(
+        run_indent.is_some(),
+        "the {step_name:?} step ran off the end of the file"
+    );
+
+    // Dedent by the shallowest non-blank line, so the extracted script is what
+    // bash would be handed rather than something uniformly over-indented.
+    let margin = body
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| indent_of(line))
+        .min()
+        .unwrap_or(0);
+    body.iter()
+        .map(|line| line.get(margin..).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The workflow's arch check and smoke run used to name `mmm` and nothing else,
+/// so `mmm-dedup-verifier` and `mmm-fixtures` were built, archived and published
+/// without ever being started. They now iterate a list the workflow reads out of
+/// `package-release.sh` at run time — and this runs that step, rather than
+/// reading it, because a derivation that silently produces an empty list would
+/// leave every loop below it passing having examined nothing.
+///
+/// Held against `[[bin]]`, so the chain is complete: the crate declares the
+/// binaries, [`the_release_ships_exactly_the_binaries_the_crate_declares`] pins
+/// the packaging script to that, and this pins the workflow's checks to the same
+/// line of the same script.
+#[test]
+fn the_workflow_derives_the_binary_list_it_checks() {
+    let step = workflow_step("Read the binary list from the packaging script");
+    let dir = tempfile::tempdir().unwrap();
+    let env_file = dir.path().join("github-env");
+    fs::write(&env_file, "").unwrap();
+
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(&step)
+        .current_dir(repo_root())
+        .env("GITHUB_ENV", &env_file)
+        .output()
+        .expect("bash is available on every platform CI runs on");
+    assert!(
+        out.status.success(),
+        "the step that reads the binary list failed: {out:?}"
+    );
+
+    let exported = fs::read_to_string(&env_file).unwrap();
+    let mut derived: Vec<String> = exported
+        .lines()
+        .find_map(|line| line.strip_prefix("RELEASE_BINARIES="))
+        .expect("the step exported no RELEASE_BINARIES, so both loops would be empty")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let mut declared = declared_binaries();
+    derived.sort();
+    declared.sort();
+
+    assert_eq!(
+        derived, declared,
+        "release.yml will arch-check and smoke-run {derived:?}, but the crate \
+         declares {declared:?}"
+    );
+}
+
+/// The list being right is worth nothing if the steps do not read it.
+///
+/// One honest limit: this pins the loop, which is what covers every binary's
+/// `--version`. The piece of real work each binary then does is written out one
+/// binary at a time — necessarily, since they do different things — so a fourth
+/// binary would be started here and given nothing to do, and only the loop would
+/// say so.
+#[test]
+fn the_workflows_checks_iterate_that_list_rather_than_their_own() {
+    for step_name in [
+        "Check the architecture is the one that was asked for",
+        "Smoke-run the binaries",
+    ] {
+        let body = workflow_step(step_name);
+        assert!(
+            body.contains("for name in $RELEASE_BINARIES"),
+            "the {step_name:?} step does not loop over $RELEASE_BINARIES, so it \
+             covers whichever binaries somebody wrote into it rather than the \
+             ones the release ships:\n{body}"
+        );
+    }
+}
+
 /// A workflow pointing at a script that has been renamed fails at tag time, on
 /// a tag that has already been pushed.
 #[test]

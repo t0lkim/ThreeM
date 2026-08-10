@@ -196,68 +196,142 @@ jobs:
         working-directory: code
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      # Two of the three published binaries used to reach users without anybody
-      # having run them: `x86_64-apple-darwin` is cross-compiled on an arm64
-      # runner, and `x86_64-unknown-linux-gnu` was only ever type-checked. A
-      # cross-compile that silently produced the host's architecture, or a
-      # binary that linked but could not start, would have been discovered by
-      # whoever downloaded it.
+      # One declaration, read here rather than restated. `package-release.sh`
+      # names the binaries a release ships on a single `BINARIES=` line, and
+      # `code/tests/release.rs` holds that line against the crate's `[[bin]]`
+      # targets. The two checks below iterate what this step reads, so a fourth
+      # binary is covered by being added to the crate — not by somebody
+      # remembering that the workflow keeps its own list.
+      #
+      # It used to keep one, implicitly: both checks named `mmm` and nothing
+      # else, so `mmm-dedup-verifier` and `mmm-fixtures` were archived and
+      # published without ever being started. That is the same shape as the
+      # cross-compile problem below, one level up — a thing shipped that nobody
+      # ran.
+      - name: Read the binary list from the packaging script
+        run: |
+          set -euo pipefail
+          binaries=$(sed -n 's/^BINARIES="\(.*\)"$/\1/p' .github/scripts/package-release.sh)
+          # An empty list is the dangerous outcome rather than an obvious one:
+          # every loop below would run zero times and every check would report
+          # success having examined nothing.
+          if [ -z "$binaries" ]; then
+            echo "::error::package-release.sh no longer declares BINARIES on its own line, \
+              so there is nothing to arch-check or smoke-run"
+            exit 1
+          fi
+          echo "binaries: $binaries"
+          echo "RELEASE_BINARIES=$binaries" >> "$GITHUB_ENV"
+
+      # The published binaries used to reach users without anybody having run
+      # them: `x86_64-apple-darwin` is cross-compiled on an arm64 runner, and
+      # `x86_64-unknown-linux-gnu` was only ever type-checked. A cross-compile
+      # that silently produced the host's architecture, or a binary that linked
+      # but could not start, would have been discovered by whoever downloaded
+      # it.
       #
       # Two checks, and they answer different questions. `file` asks whether
       # this is the architecture the matrix asked for — the failure a
       # cross-compile makes and a native build cannot. The smoke run asks
-      # whether it *works*: `--version` proves it starts, and a dry run over a
-      # throwaway file proves the scan, the metadata read and the planner all
-      # execute, which linking alone says nothing about.
+      # whether it *works*: starting proves the dynamic linking, and doing a
+      # small real piece of work proves the code paths behind it execute, which
+      # linking alone says nothing about.
       #
-      # The arm64 macOS runner executes the Intel binary through Rosetta.
-      # Verified locally on the same architecture before this was written. If a
-      # runner ever lacks it the step says so and moves on: a binary that cannot
-      # be *started here* is not a defect in the binary, and failing the release
-      # over it would be reporting the runner's limits as the artifact's.
+      # All three binaries come out of the one `cargo build` above, so checking
+      # each one's architecture catches nothing the `mmm` check alone did not.
+      # It loops anyway because the loop is already here for the smoke run, and
+      # "every packaged binary is the architecture we asked for" is a simpler
+      # thing to keep true than "one representative is, and here is why that
+      # generalises" — an argument that would stop holding, silently, the day a
+      # binary is produced some other way.
       - name: Check the architecture is the one that was asked for
         run: |
           set -euo pipefail
-          bin="code/target/${{ matrix.target }}/release/mmm"
-          described=$(file -b "$bin")
-          echo "$bin: $described"
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-gnu) expect="x86-64" ;;
             x86_64-apple-darwin)      expect="x86_64" ;;
             aarch64-apple-darwin)     expect="arm64" ;;
             *) echo "::error::no architecture expectation for ${{ matrix.target }}"; exit 1 ;;
           esac
-          if ! printf '%s' "$described" | grep -q -- "$expect"; then
-            echo "::error::${{ matrix.target }} produced '$described', which is not $expect — \
-              the cross-compile fell back to the host"
-            exit 1
-          fi
+          for name in $RELEASE_BINARIES; do
+            bin="code/target/${{ matrix.target }}/release/$name"
+            described=$(file -b "$bin")
+            echo "$bin: $described"
+            if ! printf '%s' "$described" | grep -q -- "$expect"; then
+              echo "::error::${{ matrix.target }} produced '$described' for $name, \
+                which is not $expect — the cross-compile fell back to the host"
+              exit 1
+            fi
+          done
 
-      - name: Smoke-run the binary
+      # The arm64 macOS runner executes the Intel binaries through Rosetta. All
+      # three were built for `x86_64-apple-darwin` and run on an arm64 machine
+      # before this was written, `--version` and the real work below, so this is
+      # not being discovered here. If a runner ever lacks Rosetta the step says
+      # so and moves on: a binary that cannot be *started here* is not a defect
+      # in the binary, and failing the release over it would be reporting the
+      # runner's limits as the artifact's.
+      - name: Smoke-run the binaries
         run: |
           set -euo pipefail
-          bin="$PWD/code/target/${{ matrix.target }}/release/mmm"
+          bin_dir="$PWD/code/target/${{ matrix.target }}/release"
 
-          if ! "$bin" --version >/dev/null 2>&1; then
+          # Asked once, of one binary. Whether this architecture can execute
+          # here is a property of the runner, so the answer is the same for all
+          # three and asking three times would only make the skip harder to read.
+          if ! "$bin_dir/mmm" --version >/dev/null 2>&1; then
             echo "::notice::${{ matrix.target }} cannot be executed on this runner; \
               skipping the smoke run"
             exit 0
           fi
 
-          echo "version: $("$bin" --version)"
+          # `--version` is a low bar on purpose: clap answers it and exits
+          # before `main` does anything, so what it proves is that the file
+          # loads and its dynamic libraries resolve. Each binary then does a
+          # piece of real work below.
+          for name in $RELEASE_BINARIES; do
+            echo "$name: $("$bin_dir/$name" --version)"
+          done
 
           scratch=$(mktemp -d)
+
+          # mmm: a dry run over a throwaway file exercises the scan, the
+          # metadata read and the planner. No --commit — the smoke test must not
+          # be the one thing in this workflow that moves a file.
           printf 'not a real photograph' > "$scratch/smoke.jpg"
-          # No --commit: the smoke test must not be the one thing in this
-          # workflow that moves a file.
-          "$bin" organise "$scratch" -o "$scratch/out" --no-config
+          "$bin_dir/mmm" organise "$scratch" -o "$scratch/out" --no-config
           if [ -e "$scratch/out" ]; then
             echo "::error::a preview created $scratch/out — the default posture is broken"
             exit 1
           fi
+
+          # mmm-fixtures: build the smallest library there is. This is the whole
+          # generator — image encoding, EXIF writing, and the document that
+          # states where each file should end up — and the document is what
+          # makes a generated library worth anything, so its absence is the
+          # failure worth naming rather than a non-zero exit alone.
+          "$bin_dir/mmm-fixtures" --profile minimal "$scratch/library"
+          if [ ! -s "$scratch/library/EXPECTED.md" ]; then
+            echo "::error::mmm-fixtures built a library with no EXPECTED.md, so there is \
+              nothing for a user to check their first run against"
+            exit 1
+          fi
+
+          # mmm-dedup-verifier: a real verification needs a duplicates/
+          # directory and a manifest, which only `mmm --commit` produces — and
+          # this job deliberately never commits. What can be run without moving
+          # a file is the refusal, and that is worth more than `--version`: it
+          # is the first thing `main` does, so it proves the binary's own code
+          # executes rather than only clap's.
+          if "$bin_dir/mmm-dedup-verifier" "$scratch/not-a-directory" >/dev/null 2>&1; then
+            echo "::error::mmm-dedup-verifier accepted a path that is not a directory, \
+              so its argument checking is not running"
+            exit 1
+          fi
+
           rm -rf "$scratch"
 
-      # Archives the two binaries with README, LICENSE and CHANGELOG, writes a
+      # Archives the three binaries with README, LICENSE and CHANGELOG, writes a
       # .sha256 beside the tarball, and refuses to package a binary that still
       # carries its symbols — `[profile.release] strip = true` is one line, and
       # deleting it would otherwise ship debug symbols silently.
