@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-08-10
+
 ### Added
 
 - **`mmm-fixtures`, a third binary, generates a throwaway photo library to try `mmm` on.** The sensible reaction to a tool that moves photographs is to refuse to point it at yours, which leaves a new user nowhere to start. This builds byte-valid images and videos carrying real EXIF — JPEG, HEIC, MP4, QuickTime, TIFF-based RAW with XMP sidecars, duplicate groups, GPS — in a directory that is safe to be wrong about. Four profiles: `minimal`, `realistic` (the default), `awkward` and `stress`. It refuses a non-empty directory unless `--force` is passed, because several hundred files with camera-style names written into a real library is a mess nothing can untangle afterwards — `mmm undo` cannot help, since nothing was moved.
@@ -343,7 +345,8 @@ Six further defects on the destructive path — every one of them able to lose a
 - No TIFF-based RAW is dated from the RAW itself — `nom-exif` reads four container families and none of them is a bare TIFF. An `.xmp` beside the file covers this for an edited library; a RAW library with no sidecars is dated from the filesystem unless `--require-exif` is passed.
 - A file with GPS coordinates and no readable date loses its coordinates. The undated `FileMetadata` carrying them is discarded in favour of the filesystem timestamp, so the location never reaches the filename. Pre-existing rather than introduced; restoring it would change output filenames, so it is its own change. *(Fixed in 0.3.0.)*
 
-[Unreleased]: https://github.com/t0lkim/ThreeM/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/t0lkim/ThreeM/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/t0lkim/ThreeM/releases/tag/v0.3.2
 [0.3.1]: https://github.com/t0lkim/ThreeM/releases/tag/v0.3.1
 [0.3.0]: https://github.com/t0lkim/ThreeM/releases/tag/v0.3.0
 [0.2.1]: https://github.com/t0lkim/ThreeM/commits/main
