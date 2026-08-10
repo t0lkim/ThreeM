@@ -47,6 +47,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "parse_offset"
+path = "fuzz_targets/parse_offset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "xmp_sidecar"
 path = "fuzz_targets/xmp_sidecar.rs"
 test = false

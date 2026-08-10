@@ -47,6 +47,21 @@ pub fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
     crate::metadata::parse_iso6709(s)
 }
 
+/// The `OffsetTimeOriginal` tag a camera writes beside its date: `+08:00`,
+/// `+0800` or `+08`.
+///
+/// Unlike its three neighbours this one is already `pub`, because
+/// [`crate::metadata`] wants the narrow parser rather than the whole of
+/// [`crate::timezone::Timezone`]. It is re-exported here anyway so the harness
+/// keeps one place to look — a target reaching past this module for one parser
+/// and through it for the others is the arrangement that leaves the next reader
+/// unsure which parsers are fuzzed.
+///
+/// See [`crate::timezone::parse_offset`].
+pub fn parse_offset(s: &str) -> Option<FixedOffset> {
+    crate::timezone::parse_offset(s)
+}
+
 /// An XMP sidecar, read from bytes rather than from a path.
 ///
 /// The filesystem is not the interesting part — the parse is — so this hands the
@@ -99,6 +114,10 @@ mod tests {
         let (lat, lon) = parse_iso6709("+48.8577+002.295/").unwrap();
         assert!((lat - 48.8577).abs() < 1e-6);
         assert!((lon - 2.295).abs() < 1e-6);
+
+        let offset = parse_offset("+08:00").unwrap();
+        assert_eq!(chrono::Offset::fix(&offset).local_minus_utc(), 8 * 3600);
+        assert_eq!(parse_offset("Asia/Singapore"), None);
 
         let sidecar = xmp_date(
             br#"<rdf:Description xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"

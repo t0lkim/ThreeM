@@ -1,10 +1,10 @@
 # Fuzzing the parsers that read untrusted bytes
 
-Four of `mmm`'s inputs are written by somebody else: a camera's EXIF date
-strings, a video container's ISO 6709 location string, an XMP sidecar, and a
-journal line left on a disk by a previous run that may have been power-cycled
-mid-write. Every one of them is parsed, and a parser that panics part-way
-through a library leaves the library part-way organised.
+Five of `mmm`'s inputs are written by somebody else: a camera's EXIF date
+strings, the offset tag beside them, a video container's ISO 6709 location
+string, an XMP sidecar, and a journal line left on a disk by a previous run that
+may have been power-cycled mid-write. Every one of them is parsed, and a parser
+that panics part-way through a library leaves the library part-way organised.
 
 The unit tests cover the shapes we thought of. These targets cover the ones we
 did not.
@@ -12,14 +12,18 @@ did not.
 | Target | Parser | What it is looking for |
 |---|---|---|
 | `parse_wall_clock` | `metadata::parse_wall_clock` | The five date spellings, and `chrono`'s strftime parser underneath them |
+| `parse_offset` | `timezone::parse_offset` | An `OffsetTimeOriginal` tag interpolated into a datetime string, and an offset that will not survive being written back out |
 | `parse_iso6709` | `metadata::parse_iso6709` | Hand-rolled byte-offset slicing, and coordinates that are not coordinates |
 | `xmp_sidecar` | `xmp::parse` | Namespace resolution, entity unescaping and decoding over malformed RDF/XML |
 | `journal_line` | `journal::parse_line` | That any byte sequence errors rather than panics — and that a parsed entry survives a round trip |
 
 The entry points live in `src/fuzz.rs`. A fuzz target is a separate crate, so
 the parsers it drives have to be reachable from outside the library; gathering
-the four in one module says plainly what that visibility is for and keeps the
-parsers themselves `pub(crate)`.
+the five in one module says plainly what that visibility is for and keeps the
+parsers themselves `pub(crate)`. `timezone::parse_offset` is the exception —
+already `pub` for `metadata`'s benefit — and it is re-exported through the module
+anyway, because a harness that reaches past `fuzz.rs` for one parser and through
+it for the others leaves the next reader unsure which parsers are fuzzed.
 
 ## Running them
 
@@ -34,9 +38,11 @@ writes every new unit it discovers into the **first** one. `scratch/` is
 gitignored and takes the machine-generated growth; `corpus/` is checked in and
 holds only what a person put there.
 
-`cargo fuzz list` names the four targets. `cargo fuzz build` compiles all of
-them without running anything, which is the fastest check that a change to the
-library has not broken the harness.
+`cargo fuzz list` names the five targets, and the CI job loops over its output
+rather than over a hard-coded list — so a target added here is fuzzed on the next
+push with nothing else edited. `cargo fuzz build` compiles all of them without
+running anything, which is the fastest check that a change to the library has not
+broken the harness.
 
 ## The pinned nightly
 
@@ -58,7 +64,11 @@ to take, and moving to 3.x is a major upgrade that would invalidate the
 format-support matrix and the mutation-testing baseline, both of which are
 measured against 1.x.
 
-Unpin when either the dependency is upgraded or nightly settles.
+Unpin when either the dependency is upgraded or nightly settles. **Re-checked
+2026-08-10** against nightly 1.99.0 (`969b803cb`, 2026-08-09): the same error at
+the same line, and crates.io still shows 1.5.2 as the newest 1.x with the line
+having moved on to 3.6.2. The pin holds. Record the date of each such check here
+rather than re-deriving whether it is still needed.
 
 ## The corpus
 
