@@ -21,10 +21,12 @@ categories = [
     "filesystem",
 ]
 # The floor is measured, not guessed, and its own CI job builds and tests here.
-# The library and both binaries compile on 1.86; `tests/common/mod.rs` uses
-# `is_multiple_of`, stabilised in 1.87, so 1.87 is the floor for anything that
-# has to pass the gate. One number that covers building *and* testing beats two
-# that have to be kept in step.
+# It used to be a floor only the tests imposed: `is_multiple_of`, stabilised in
+# 1.87, lived in `tests/common/mod.rs` while the library and both binaries built
+# on 1.86. The fixtures then moved into `src/fixtures.rs` so `mmm-fixtures` could
+# ship them, and the call came with them — so 1.87 now binds the library and all
+# three binaries. Same number, different reason; the `msrv` job measures it
+# either way.
 rust-version = "1.87.0"
 
 [dependencies]

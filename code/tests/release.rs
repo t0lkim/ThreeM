@@ -13,47 +13,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
 
-/// The repository root: one level up from the crate, which is `code/`.
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the crate directory always has a parent")
-        .to_path_buf()
-}
-
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} is unreadable: {e}", path.display()))
-}
-
-/// Every `name` under a `[[bin]]` table in `Cargo.toml`.
-fn declared_binaries() -> Vec<String> {
-    let manifest = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-        .expect("the crate's own manifest is readable");
-
-    let mut names = Vec::new();
-    let mut in_bin = false;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_bin = line == "[[bin]]";
-            continue;
-        }
-        if in_bin {
-            if let Some(value) = line.strip_prefix("name = ") {
-                names.push(value.trim_matches('"').to_string());
-            }
-        }
-    }
-    assert!(
-        !names.is_empty(),
-        "no [[bin]] targets found in Cargo.toml — this test is parsing it wrongly"
-    );
-    names
-}
+// Shared with `tests/docs.rs`, which checks the same binary list against the
+// documentation rather than against the packaging script.
+#[path = "common/repo.rs"]
+mod repo;
+use repo::{declared_binaries, read, repo_root};
 
 /// The `BINARIES="…"` declaration in the packaging script.
 ///

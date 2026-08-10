@@ -15,7 +15,8 @@ The repository root is the *product*; the crate lives one level down.
 | Path | Holds |
 |---|---|
 | `code/` | **The crate root.** `Cargo.toml`, `src/`, `tests/`, `benches/`, `fuzz/`. Every `cargo` command runs from here. |
-| `code/src/` | Library modules, `main.rs` (the `mmm` binary) and `bin/mmm_dedup_verifier.rs` (the second, independent one). |
+| `code/src/` | Library modules, `main.rs` (the `mmm` binary) and two more under `bin/`: `mmm_dedup_verifier.rs`, the independent verification channel, and `mmm_fixtures.rs`, the synthetic-library generator. |
+| `code/src/fixtures.rs`, `code/src/generate.rs` | **Shipped library code, not test code.** They build the synthetic media and write the `EXPECTED.md` that goes with it. They began under `tests/` and moved into the library so `mmm-fixtures` could hand a user the same fixtures the suite runs against — so a change here is a change to a binary somebody installed, not to a test helper. |
 | `code/tests/` | Integration suites, one file per surface, driving the real binary through `assert_cmd`. Shared fixtures in `tests/common/`. |
 | `code/fuzz/` | A separate crate — its own `Cargo.toml`, `Cargo.lock` and pinned toolchain. See [`code/fuzz/README.md`](code/fuzz/README.md). |
 | `docs/` | Everything a reader needs and no source. Start at [`docs/index.md`](docs/index.md), which links the lot. |
@@ -32,15 +33,18 @@ on every step.
 cd code
 cargo build                    # debug
 cargo build --release          # binaries at code/target/release/{mmm,mmm-dedup-verifier,mmm-fixtures}
-cargo install --path .         # both binaries onto your PATH
+cargo install --path .         # all three binaries onto your PATH
 ```
 
 The minimum supported Rust version is **1.87.0**, declared as `rust-version` in
-`code/Cargo.toml` and enforced by its own CI job. The library and the two
-binaries compile on 1.86, but the test fixtures use `u64::is_multiple_of`,
-stabilised in 1.87 — so 1.87 is the floor for anything that has to pass the
-gate, and one number is better than two. Raising it is a change a user can
-notice, so it goes in the changelog.
+`code/Cargo.toml` and enforced by its own CI job. It used to be a floor the
+*tests* imposed — `u64::is_multiple_of`, stabilised in 1.87, was used only by
+the fixtures under `tests/`, and the library and binaries themselves built on
+1.86. That stopped being true when the fixtures moved into `src/fixtures.rs` to
+ship as `mmm-fixtures`: the call is now in library code, so 1.87 binds the
+library and every binary, not just the gate. The number did not move and the
+`msrv` job measures it either way. Raising it is a change a user can notice, so
+it goes in the changelog.
 
 ## The test gate
 
@@ -58,8 +62,8 @@ cargo build --release
 Three things about them are not obvious:
 
 - **`--all-targets` is not optional.** Without it the integration suites, the
-  benches and the second binary are not compiled at all, so a clean `cargo
-  clippy` proves considerably less than it appears to.
+  benches and the two binaries under `src/bin/` are not compiled at all, so a
+  clean `cargo clippy` proves considerably less than it appears to.
 - **`-D warnings` makes the pedantic clippy group binding**, along with the
   `unwrap_used` and `expect_used` denials in `code/Cargo.toml`. Panicking
   helpers are banned outside `#[cfg(test)]` because a panic mid-run leaves a
@@ -79,13 +83,23 @@ CI adds three jobs beyond that gate:
 | Job | What it enforces |
 |---|---|
 | `coverage` | Line coverage floors on the two files that move and record photographs: `src/organiser.rs` ≥ 92.0%, `src/journal.rs` ≥ 96.0%. A drop means a destructive branch stopped being exercised. Raise the floors when the real figure rises; never lower them to make a build green. |
-| `fuzz` | Each of the four targets for 60 seconds from the checked-in corpus. It catches a regression seed crashing again and shallow new panics — it is not a campaign. |
+| `fuzz` | Each of the five targets for 60 seconds from the checked-in corpus. The job enumerates `cargo fuzz list`, so a new target is fuzzed on the next push with no workflow edit. It catches a regression seed crashing again and shallow new panics — it is not a campaign. |
 | `msrv` | `cargo build --release` and `cargo test --all-targets` on the declared `rust-version`, so the number in `Cargo.toml` is a measurement rather than a hope. |
 
-Mutation testing (`cargo mutants`) is **not** gated — a full run over the four
-destructive modules takes about an hour. Run it by hand when you change one of
-them; the baseline and the accepted survivors are in
+Mutation testing (`cargo mutants`) is **not** gated — the last whole-crate run
+was 440 mutants and two hours at `-j 4`. Run it by hand when you change a
+destructive module; the baseline and the accepted survivors are in
 [`docs/research/mutation-testing.md`](docs/research/mutation-testing.md).
+
+It is configured by [`code/.cargo/mutants.toml`](code/.cargo/mutants.toml), and
+both settings in there matter to anyone running it. `src/fixtures.rs` and
+`src/generate.rs` are excluded, because a mutated byte in a JPEG quantisation
+table is a survivor that means nothing. `no_default_features` turns off the
+`repository-tests` feature, which is the only thing that switches off
+`tests/docs.rs` and `tests/release.rs`: `cargo-mutants` copies `code/` into a
+temp directory, so those two targets find no repository above them and take the
+*baseline* down rather than any mutant. Between them landing and that line,
+mutation testing could not be run at all.
 
 ## Changing a destructive path requires a failing test first
 
@@ -123,10 +137,10 @@ ordinary test alongside the change is fine.
 
 ## Fuzzing
 
-The four parsers that read bytes somebody else wrote have targets under
+The five parsers that read bytes somebody else wrote have targets under
 `code/fuzz/`. If you change `metadata::parse_wall_clock`,
-`metadata::parse_iso6709`, `xmp::parse` or `journal::parse_line`, run the
-matching target locally for a few minutes:
+`metadata::parse_iso6709`, `timezone::parse_offset`, `xmp::parse` or
+`journal::parse_line`, run the matching target locally for a few minutes:
 
 ```sh
 cd code

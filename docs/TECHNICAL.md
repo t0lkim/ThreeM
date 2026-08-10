@@ -64,9 +64,12 @@ restores are previewed unless `--commit` is given.
 | `undo.rs` | Replaying a journal backwards, with per-file verification before anything is moved |
 | `reporter.rs` | Dry-run output, duplicate listing, summary reports, chunk prompts |
 | `fuzz.rs` | The entry points `code/fuzz/` drives, gathered in one documented module so the parsers stay private |
+| `fixtures.rs` | Synthesising byte-valid images and videos with real EXIF — the inputs the integration suites run against, and the ones `mmm-fixtures` hands to a user |
+| `generate.rs` | Assembling those fixtures into a profiled library, and writing the `EXPECTED.md` that states where each file should land |
 | `error.rs` | Typed error definitions (thiserror) |
 | `main.rs` | Orchestration, building the hashing pool, progress bars, terminal prompting via `ChunkController` |
 | `bin/mmm_dedup_verifier.rs` | Independent verification binary |
+| `bin/mmm_fixtures.rs` | Synthetic-library generator: profile and seed handling, refusing a non-empty directory, writing `EXPECTED.md` |
 
 ---
 
@@ -249,7 +252,7 @@ Earlier versions called `std::process::exit(0)` from inside the progress bar's `
 
 ## Verification: mmm vs mmm-dedup-verifier
 
-The two binaries use **deliberately different hashing approaches** so that a bug in one cannot produce a false positive in both. This is the same principle used in safety-critical systems: independent verification channels.
+These two of the three shipped binaries use **deliberately different hashing approaches** so that a bug in one cannot produce a false positive in both. This is the same principle used in safety-critical systems: independent verification channels. The third, `mmm-fixtures`, is not one of those channels — it builds inputs rather than checking outputs, and hashes nothing.
 
 ### Comparison Table
 

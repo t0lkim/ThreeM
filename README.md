@@ -4,8 +4,9 @@
 > **This software moves and reorganises your files. Use it at your own risk.**
 >
 > `mmm` is provided as-is, with no warranty of any kind, and the authors accept
-> no liability for lost, damaged or misfiled data. It is early software: this is
-> the first tagged release, and it has never been run on Windows.
+> no liability for lost, damaged or misfiled data. It is early software — a
+> handful of tagged releases, all of them pre-1.0 — and it has never been run on
+> Windows.
 >
 > **Back up your photographs before pointing it at a library you care about.**
 > Preview every run first — `mmm` shows you the plan and changes nothing until
