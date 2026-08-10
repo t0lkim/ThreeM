@@ -242,10 +242,15 @@ Two qualifications, because the headline number is better than the situation:
   `llvm-cov` counts closures as functions, so the two numbers are counting
   different things; the line figure is the one that describes the binary's
   behaviour here.
-- **Coverage is not the outstanding problem with this binary.** The
-  v0.2.0 readiness report records that `mmm-dedup-verifier` confirms nothing and
-  exits 0 against a stale manifest. Nothing in this measurement bears on that:
-  a test suite can execute every line of a tool that reaches the wrong verdict.
+- **Coverage is not an argument that this binary is correct.** A test suite can
+  execute every line of a tool that reaches the wrong verdict, and this binary
+  is the case history for it: it once confirmed zero groups against a stale
+  manifest, printed an all-clear and exited 0. **That was fixed in 0.3.0** —
+  the organise pass appends `# Original moved to:` and the verifier prefers it,
+  and a run that confirms nothing now exits 1. *(Corrected 2026-08-10: this
+  paragraph originally said the defect was still open, citing the v0.2.0
+  readiness report, which describes a release two versions back. The
+  reasoning was right and the example was two releases stale.)*
 
 ## `bin/mmm_fixtures.rs`: 74.16%, and why that is not the same kind of number
 

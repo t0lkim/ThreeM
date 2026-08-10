@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.2] — 2026-08-10
+### Added
+
+- **`docs/research/v0.3.2-readiness.md` — the status of the release at the commit that was tagged**, written for somebody deciding whether to publish the draft rather than whether to push a tag. It carries every figure re-measured against the tree that ships three binaries — 674 tests, 92.89% line coverage, 440 mutants at 93.93%, five fuzz targets over 15.9 million executions — with each one's qualifications rather than the number alone. The three defects the v0.2.0 report opened with are all closed, and each was re-checked against today's source rather than trusted from the entry claiming it. It also records what was found and *not* fixed, and says which of those has an owner and which is only written down.
+
+### Fixed
+
+- **The release workflow's gate is weaker than the one every push runs, and now says so.** Its own comment describes it as "the same gate `ci.yml` runs"; it omits `--locked` on `clippy` and `test`, and it has no timezone matrix, while the push gate has both. That is not academic — the `EXPECTED.md` defect fixed in 0.3.2 was red for eight hours a day east of Greenwich and green in UTC, so a tag pushed in that window would have passed the release gate on a tree the push gate would have failed. **This release records the finding and does not close it:** the release automation was verified end to end by executing that exact file, and editing it inside a report would leave the shipped workflow different from the rehearsed one. It is the first item of what the next release should carry.
+
+- **`docs/research/coverage-report.md` said the `mmm-dedup-verifier` defect was still open.** It cited the v0.2.0 readiness report — accurately — for a defect that release describes, and left the impression it was live today. It was fixed in 0.3.0, two releases before the coverage report was written. The paragraph's point survives and is kept: line coverage is not an argument that a tool reaches the right verdict. Only the example was stale.
 
 ### Added
 
