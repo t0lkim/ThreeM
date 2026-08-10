@@ -51,6 +51,26 @@
 //!   fixture's own", which is true at any hour including midnight. Their *leaf*
 //!   names are pinned, because every filesystem-dated fixture here carries a
 //!   distinct extension and so cannot collide with its siblings.
+//!
+//! ## The second library
+//!
+//! Everything above concerns a library this file declares. The tests at the end
+//! of the file run the same journey over a library this file did not write and
+//! does not describe: one built by the shipped `mmm-fixtures` binary, checked
+//! against the `EXPECTED.md` that binary wrote beside it.
+//!
+//! That is a different claim from the one `tests/generated_library.rs` makes,
+//! and the difference is the reason for the duplication. That suite calls
+//! [`mmm::generate::generate`] in-process and compares the outcome against the
+//! [`mmm::generate::Plan`] struct still in memory — so it proves the *generator*
+//! is right, through an API no user touches. What a user actually has is two
+//! binaries and a markdown file, and none of those are exercised by comparing a
+//! struct to a directory. Here the binary is run, the document it wrote is
+//! parsed back out of the filesystem as prose, and every row of every table in
+//! it is held against the organised tree. A claim that only survives in the
+//! `Plan` and gets lost on the way into the document would pass there and fail
+//! here, which is the whole point: the document is what somebody reads to decide
+//! whether the tool got their photographs right.
 
 #![allow(
     clippy::unwrap_used,
@@ -1054,5 +1074,531 @@ fn the_thread_count_does_not_change_the_outcome() {
         snapshot_tree_hashed(&input),
         before_tree,
         "after undo the input tree is not byte-for-byte the tree that went in"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The generated library, and the document that ships beside it
+// ---------------------------------------------------------------------------
+
+/// Rendered `EXPECTED.md` section headings, matched by title.
+///
+/// Constants because the parser panics on a heading it does not recognise: a
+/// section renamed in `generate.rs` and not here fails loudly rather than being
+/// skipped, and a skipped section is a table of claims that nothing checks.
+const SECTION_EXIF_DATED: &str = "Filed under a date the file itself records";
+const SECTION_FILESYSTEM_DATED: &str = "Filed on the filesystem timestamp";
+const SECTION_TIMEZONE_DEPENDENT: &str = "Depends on the timezone the run resolves";
+const SECTION_DUPLICATES: &str = "Duplicates";
+const SECTION_SIDECARS: &str = "Sidecars";
+const SECTION_UNTOUCHED: &str = "Untouched";
+const SECTION_UNSORTED: &str = "Unsorted";
+
+/// What one row of `EXPECTED.md` promises, read off the page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Claim {
+    /// Lands under a named date directory. `basis` is the heading the row sat
+    /// under — where the document says the date came from. Three headings
+    /// resolve to this because the *assertion* is the same for all three; the
+    /// distinction is the document's account of itself, and it belongs in the
+    /// failure message rather than in a third code path.
+    Under { dir: String, basis: &'static str },
+    /// A byte-identical copy of the named file: one member of the group is
+    /// filed under its date, the rest are relocated under `duplicates/`.
+    Duplicate { original: String },
+    /// A sidecar, which goes wherever the named parent goes and is renamed to
+    /// match it.
+    TravelsWith { parent: String },
+    /// Not media: left exactly where it is.
+    Untouched,
+    /// Routed to `unsorted/`.
+    Unsorted,
+}
+
+/// One row of one table.
+#[derive(Debug, Clone)]
+struct Row {
+    rel: String,
+    claim: Claim,
+    /// The row carries the ⚠ marking a deliberately malformed file.
+    malformed: bool,
+}
+
+/// The cells of a markdown table row, or `None` for anything that is not one.
+fn table_cells(line: &str) -> Option<Vec<String>> {
+    let line = line.trim();
+    let inner = line.strip_prefix('|')?.strip_suffix('|')?;
+    let cells: Vec<String> = inner.split('|').map(|c| c.trim().to_string()).collect();
+    (cells.len() == 3).then_some(cells)
+}
+
+/// The `n`th backtick-quoted token in a cell.
+///
+/// The document quotes every path and every directory, so this is how a claim
+/// is read without re-deriving the prose around it.
+fn backticked(cell: &str, n: usize) -> Option<String> {
+    cell.split('`').nth(2 * n + 1).map(ToString::to_string)
+}
+
+/// `` `2024-06-01/` `` → `2024-06-01`.
+fn date_directory(cell: &str) -> String {
+    backticked(cell, 0)
+        .unwrap_or_else(|| panic!("a date cell must quote its directory; got {cell:?}"))
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Read `EXPECTED.md` back as the set of claims it makes.
+///
+/// Deliberately a parser over the rendered prose rather than a call into
+/// `generate.rs`: a test that asked the library what it meant to write would
+/// prove nothing about what it did write, and the document is the artifact the
+/// user has.
+fn parse_expected_md(doc: &str) -> Vec<Row> {
+    let mut rows: Vec<Row> = Vec::new();
+    let mut section = String::new();
+
+    for line in doc.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            // Headings carry a `(N files)` count; the title is what identifies
+            // the section.
+            section = heading
+                .rsplit_once(" (")
+                .map_or_else(|| heading.to_string(), |(title, _)| title.to_string());
+            continue;
+        }
+
+        let Some(cells) = table_cells(line) else {
+            continue;
+        };
+        // The header and separator rows quote nothing, which is what tells them
+        // apart from a claim.
+        let Some(rel) = backticked(&cells[0], 0) else {
+            continue;
+        };
+        let (destination, what) = (&cells[1], &cells[2]);
+
+        let claim = match section.as_str() {
+            SECTION_EXIF_DATED => Claim::Under {
+                dir: date_directory(destination),
+                basis: "a date the file itself records",
+            },
+            SECTION_FILESYSTEM_DATED => Claim::Under {
+                dir: date_directory(destination),
+                basis: "the filesystem timestamp",
+            },
+            SECTION_TIMEZONE_DEPENDENT => Claim::Under {
+                dir: date_directory(destination),
+                basis: "the wall clock read at UTC",
+            },
+            SECTION_DUPLICATES => Claim::Duplicate {
+                original: backticked(destination, 1).unwrap_or_else(|| {
+                    panic!("a duplicate row names the file it copies; got {destination:?}")
+                }),
+            },
+            SECTION_SIDECARS => Claim::TravelsWith {
+                parent: backticked(destination, 0).unwrap_or_else(|| {
+                    panic!("a sidecar row names its parent; got {destination:?}")
+                }),
+            },
+            SECTION_UNTOUCHED => {
+                assert_eq!(
+                    destination, "left exactly where it is",
+                    "`{rel}` is under {SECTION_UNTOUCHED:?} and claims something else"
+                );
+                Claim::Untouched
+            }
+            SECTION_UNSORTED => Claim::Unsorted,
+            other => panic!(
+                "EXPECTED.md has a table under the heading {other:?}, which this suite does not \
+                 know how to check. A section nothing checks is a page of promises to the user \
+                 with nothing behind it — teach the parser the heading rather than deleting this \
+                 panic."
+            ),
+        };
+
+        rows.push(Row {
+            rel,
+            claim,
+            malformed: what.starts_with('⚠'),
+        });
+    }
+
+    rows
+}
+
+/// Two sorted lists are the same list, and the failure says how they differ.
+///
+/// A plain `assert_eq!` over a few hundred paths prints both lists in full and
+/// leaves the reader to diff a hundred and fifty lines of hex by eye. The claim
+/// is identical; only the message is different, and the message is the whole
+/// value of a failing test.
+fn assert_same_lines(
+    left: &[String],
+    right: &[String],
+    left_name: &str,
+    right_name: &str,
+    why_it_matters: &str,
+) {
+    let (l, r): (BTreeSet<&String>, BTreeSet<&String>) =
+        (left.iter().collect(), right.iter().collect());
+    let only_left: Vec<&&String> = l.difference(&r).take(10).collect();
+    let only_right: Vec<&&String> = r.difference(&l).take(10).collect();
+
+    assert!(
+        only_left.is_empty() && only_right.is_empty(),
+        "{left_name} and {right_name} are not the same ({} and {} entries). {why_it_matters}\n\
+         only in {left_name}: {only_left:#?}\n\
+         only in {right_name}: {only_right:#?}\n\
+         (at most ten of each shown)",
+        left.len(),
+        right.len(),
+    );
+}
+
+/// Build a library with the shipped binary.
+fn run_fixtures(dir: &Path, profile: &str, seed: Option<u64>) -> Output {
+    let mut cmd = Command::cargo_bin("mmm-fixtures").unwrap();
+    cmd.arg(dir).arg("--profile").arg(profile);
+    if let Some(seed) = seed {
+        cmd.arg("--seed").arg(seed.to_string());
+    }
+    cmd.output().expect("running mmm-fixtures")
+}
+
+/// The seed the binary printed, which is the whole of what a bug report can
+/// carry.
+fn printed_seed(stdout: &str) -> u64 {
+    let after = stdout
+        .split_once("--seed ")
+        .unwrap_or_else(|| panic!("mmm-fixtures must print a --seed line; it printed:\n{stdout}"))
+        .1;
+    after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|e| panic!("the printed seed is not a number ({e}):\n{stdout}"))
+}
+
+/// The directory part of an organised path, or `""` for a file at the root.
+fn directory_of(rel: &str) -> &str {
+    rel.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// The stem of an organised path — everything before the final `.`.
+fn stem_of(rel: &str) -> &str {
+    rel.rsplit_once('.').map_or(rel, |(stem, _)| stem)
+}
+
+/// Hold every row of `EXPECTED.md` against the organised tree.
+///
+/// If this fails, one of the two is wrong — the document or the run — and which
+/// one is the question the failure message has to leave answerable, because a
+/// user reading a document that quietly disagrees with the tool has no way to
+/// tell that they are the ones being lied to.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one document, checked claim by claim; splitting the match arms into helpers would \
+              scatter the failure messages away from the promises they are about"
+)]
+fn assert_the_document_is_true(rows: &[Row], input: &Path, output: &Path, library: &str) {
+    let landed = file_contents_by_marker(output);
+    let left_behind = file_contents_by_marker(input);
+
+    // A copy is byte-identical to its original and so carries the original's
+    // marker: the group is only observable through that one key. Counted first
+    // so the size of each group can be asserted rather than merely its shape.
+    let mut group_sizes: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in rows {
+        if let Claim::Duplicate { original } = &row.claim {
+            *group_sizes.entry(original.as_str()).or_insert(1) += 1;
+        }
+    }
+
+    let mut checked = 0_usize;
+    for row in rows {
+        let rel = &row.rel;
+        match &row.claim {
+            Claim::Under { dir, basis } => {
+                let paths = landed.get(rel).unwrap_or_else(|| {
+                    panic!(
+                        "{library}: EXPECTED.md says `{rel}` is filed under `{dir}/` on {basis}, \
+                         and no file in the organised tree carries its bytes at all"
+                    )
+                });
+                assert!(
+                    paths.iter().any(|p| directory_of(p) == dir),
+                    "{library}: EXPECTED.md says `{rel}` is filed under `{dir}/` on {basis}; it \
+                     is at {paths:?}.\n\nOne of the two is wrong. Either the organiser changed \
+                     and the document is now describing a tool that no longer exists, or the \
+                     document's prediction is — and shipping either without settling which hands \
+                     a user a wrong answer with a straight face."
+                );
+            }
+            Claim::Duplicate { original } => {
+                let paths = landed.get(original.as_str()).unwrap_or_else(|| {
+                    panic!(
+                        "{library}: `{rel}` is a copy of `{original}`, and the group's bytes are \
+                         nowhere in the organised tree"
+                    )
+                });
+                let (relocated, filed): (Vec<_>, Vec<_>) =
+                    paths.iter().partition(|p| p.starts_with("duplicates/"));
+                assert_eq!(
+                    filed.len(),
+                    1,
+                    "{library}: exactly one member of `{original}` must survive in the dated \
+                     tree — found {filed:?}. More than one means deduplication did nothing; \
+                     none means the only remaining copies are in the directory EXPECTED.md \
+                     tells the user they may delete."
+                );
+                assert!(
+                    !relocated.is_empty(),
+                    "{library}: EXPECTED.md says `{rel}` is relocated under `duplicates/`, and \
+                     nothing from its group is there: {paths:?}"
+                );
+                assert_eq!(
+                    paths.len(),
+                    group_sizes[original.as_str()],
+                    "{library}: EXPECTED.md accounts for {} copies of `{original}` and the tree \
+                     holds {}: {paths:?}",
+                    group_sizes[original.as_str()],
+                    paths.len(),
+                );
+            }
+            Claim::TravelsWith { parent } => {
+                let sidecar = landed.get(rel).unwrap_or_else(|| {
+                    panic!("{library}: sidecar `{rel}` is nowhere in the organised tree")
+                });
+                let parent_paths = landed.get(parent.as_str()).unwrap_or_else(|| {
+                    panic!("{library}: `{parent}`, which `{rel}` travels with, was never filed")
+                });
+                assert_eq!(
+                    parent_paths.len(),
+                    1,
+                    "{library}: `{parent}` landed in more than one place, so `{rel}` has no one \
+                     file to have travelled with: {parent_paths:?}"
+                );
+                assert_eq!(sidecar.len(), 1, "{library}: `{rel}` landed more than once");
+
+                // "Wherever it goes, renamed to match it" — asserted against the
+                // parent's *actual* destination rather than a predicted one, so
+                // a collision suffix on the parent is something the sidecar is
+                // required to follow rather than something this test trips over.
+                let expected = format!("{}.xmp", stem_of(&parent_paths[0]));
+                assert_eq!(
+                    sidecar[0], expected,
+                    "{library}: EXPECTED.md says `{rel}` goes wherever `{parent}` goes and is \
+                     renamed to match. `{parent}` is at `{}`, so the sidecar belongs at \
+                     `{expected}` and is at `{}`. A sidecar left under its old name beside a \
+                     renamed photograph is an edit history the editor will never find again.",
+                    parent_paths[0], sidecar[0],
+                );
+            }
+            Claim::Untouched => {
+                assert!(
+                    input.join(rel).exists(),
+                    "{library}: EXPECTED.md says `{rel}` is left exactly where it is, and it is \
+                     gone from the input tree"
+                );
+                assert!(
+                    !landed.contains_key(rel),
+                    "{library}: `{rel}` is not media and EXPECTED.md promises it is untouched; \
+                     it was moved into the output tree. A tool that moves these has rearranged \
+                     somebody's disk."
+                );
+                assert!(
+                    left_behind
+                        .get(rel)
+                        .is_none_or(|paths| paths.len() == 1 && &paths[0] == rel),
+                    "{library}: `{rel}` is still in the input tree but not where it was: {:?}",
+                    left_behind.get(rel),
+                );
+            }
+            Claim::Unsorted => {
+                let paths = landed.get(rel).unwrap_or_else(|| {
+                    panic!("{library}: EXPECTED.md routes `{rel}` to `unsorted/` and it is nowhere")
+                });
+                assert!(
+                    paths.iter().any(|p| p.starts_with("unsorted/")),
+                    "{library}: EXPECTED.md routes `{rel}` to `unsorted/`; it is at {paths:?}"
+                );
+            }
+        }
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 20,
+        "{library}: only {checked} claims were read out of EXPECTED.md, which is too few for \
+         this test to be evidence of anything — the likely cause is a parser that stopped \
+         recognising the tables rather than a document that stopped making claims"
+    );
+}
+
+/// Every file in the generated library appears in the document, and every file
+/// the document names is in the library.
+///
+/// Without this a file could be generated and left out of `EXPECTED.md`
+/// entirely, and every assertion above would still pass — over a document that
+/// silently covered less of the library than the user believes it does.
+fn assert_the_document_covers_the_library(rows: &[Row], input: &Path) {
+    // The trailing-slash rows are directories, which no file walk returns, and
+    // `EXPECTED.md` is written after the plan is made so it names itself
+    // nowhere.
+    let mut named: Vec<String> = rows
+        .iter()
+        .map(|r| r.rel.clone())
+        .filter(|rel| !rel.ends_with('/'))
+        .collect();
+    named.push("EXPECTED.md".to_string());
+    named.sort();
+    named.dedup();
+
+    assert_same_lines(
+        &named,
+        &snapshot_tree(input),
+        "the files EXPECTED.md names",
+        "the library on disk",
+        "A file generated and left out of the document is a file the user has no stated \
+         expectation for, and every assertion below would still pass over it.",
+    );
+}
+
+/// The shipped generator, the shipped organiser, and the document that joins
+/// them — end to end, through the binaries a user actually runs.
+#[test]
+fn a_generated_library_lands_where_its_own_document_says_it_will() {
+    for profile in ["realistic", "awkward"] {
+        let library = TempDir::new().expect("creating the library TempDir");
+        let input = library.path().to_path_buf();
+        let (_scratch, out_dir) = scratch_output();
+
+        let built = run_fixtures(&input, profile, None);
+        assert_ok(&built, "mmm-fixtures");
+
+        let doc = std::fs::read_to_string(input.join("EXPECTED.md"))
+            .expect("mmm-fixtures writes EXPECTED.md beside the library it built");
+        let rows = parse_expected_md(&doc);
+        assert_the_document_covers_the_library(&rows, &input);
+
+        let seed = printed_seed(&stdout_of(&built));
+        let label = format!("{profile}/seed {seed}");
+
+        let before_tree = snapshot_tree_hashed(&input);
+        let before_hashes = hash_multiset(&input);
+
+        let committed = commit(&input, &out_dir, &[]);
+        assert_ok(&committed, &format!("organising the {label} library"));
+
+        // Conservation first, for the same reason as the declared library: "did
+        // anything of yours disappear" outranks "is the tree the shape the
+        // document promised".
+        assert_conserved(&input, &out_dir, &before_hashes, &label);
+        assert_the_document_is_true(&rows, &input, &out_dir, &label);
+
+        if profile == "awkward" {
+            let marked = rows.iter().filter(|r| r.malformed).count();
+            assert!(
+                marked >= 8,
+                "{label}: the awkward library is deliberately broken and EXPECTED.md marked only \
+                 {marked} files ⚠. A reader who cannot tell which files are meant to be wrong \
+                 reports a correct result as a bug."
+            );
+        }
+
+        // And the document's own closing instruction — `mmm undo` — puts the
+        // library back, which is the last thing it promises and the one a user
+        // relies on before trusting any of the rest.
+        assert_ok(&undo(&out_dir), &format!("undoing the {label} run"));
+        assert_eq!(
+            snapshot_tree_hashed(&input),
+            before_tree,
+            "{label}: after the undo EXPECTED.md tells the reader to run, the generated library \
+             is not byte-for-byte the library that went in"
+        );
+    }
+}
+
+/// A bug report can only carry a seed.
+///
+/// So the seed the binary prints has to rebuild the library it printed it for —
+/// through the binary, from a cold start, exactly as somebody reproducing a
+/// report would. Asserted over the bytes on disk rather than over the plan,
+/// because bytes are what the reporter and the maintainer end up comparing.
+#[test]
+fn the_printed_seed_rebuilds_the_library_it_was_printed_for() {
+    // Unseeded, like a first run: the seed under test is one the binary chose.
+    let first = TempDir::new().expect("creating the first TempDir");
+    let built = run_fixtures(first.path(), "realistic", None);
+    assert_ok(&built, "the unseeded mmm-fixtures run");
+    let seed = printed_seed(&stdout_of(&built));
+
+    let again = TempDir::new().expect("creating the second TempDir");
+    assert_ok(
+        &run_fixtures(again.path(), "realistic", Some(seed)),
+        "the reproducing mmm-fixtures run",
+    );
+
+    // `EXPECTED.md` is excluded from the byte comparison and checked separately
+    // below: it states the filesystem dates of the undated files, which are
+    // measured from the mtimes of files written moments ago and are therefore a
+    // property of when the run happened rather than of the seed. Two runs
+    // either side of UTC midnight differ there, correctly, and folding that into
+    // a byte-identity claim would buy a flake once a day.
+    let bytes_of = |dir: &Path| -> Vec<String> {
+        snapshot_tree_hashed(dir)
+            .into_iter()
+            .filter(|line| !line.starts_with("EXPECTED.md"))
+            .collect()
+    };
+    assert_same_lines(
+        &bytes_of(first.path()),
+        &bytes_of(again.path()),
+        "the library the binary built on its own",
+        &format!("the library rebuilt from the `--seed {seed}` it printed"),
+        "A bug report citing a seed is then worth nothing, because the maintainer is looking at \
+         a different library from the reporter.",
+    );
+
+    // The document has to reproduce too, or the reproduction is of the files
+    // without the claims about them. Compared as parsed claims with the
+    // measured filesystem dates set aside — everything else in it, the seed
+    // included, is settled by the seed alone.
+    let claims_of = |dir: &Path| -> Vec<String> {
+        let doc = std::fs::read_to_string(dir.join("EXPECTED.md")).expect("EXPECTED.md");
+        parse_expected_md(&doc)
+            .into_iter()
+            .map(|row| match row.claim {
+                Claim::Under {
+                    basis: basis @ "the filesystem timestamp",
+                    ..
+                } => format!("{} → measured against {basis}", row.rel),
+                claim => format!("{} → {claim:?}", row.rel),
+            })
+            .collect()
+    };
+    assert_same_lines(
+        &claims_of(first.path()),
+        &claims_of(again.path()),
+        "the first library's EXPECTED.md",
+        "the rebuilt library's EXPECTED.md",
+        "The two libraries are byte-identical and the documents shipped with them disagree, so \
+         one of the two readers is being told the wrong thing about the same files.",
+    );
+
+    // And a different seed is a different library, or `--seed` means nothing at
+    // all and the reproduction above proved only that the generator is
+    // constant.
+    let elsewhere = TempDir::new().expect("creating the third TempDir");
+    assert_ok(
+        &run_fixtures(elsewhere.path(), "realistic", Some(seed.wrapping_add(1))),
+        "the differing mmm-fixtures run",
+    );
+    assert!(
+        bytes_of(first.path()) != bytes_of(elsewhere.path()),
+        "seeds {seed} and {} produced the same library, so --seed selects nothing",
+        seed.wrapping_add(1)
     );
 }
