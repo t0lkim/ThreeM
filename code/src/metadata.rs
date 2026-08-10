@@ -276,6 +276,14 @@ pub fn extract_metadata(path: &Path, is_video: bool, tz: &TimezonePolicy) -> Res
     // a GPS block and an unreadable date knows perfectly well where it was
     // taken, and dropping that here is what left it filed under a filesystem
     // timestamp with no location in its name.
+    //
+    // `&&` rather than `||` is unreachable today and stays on purpose, the same
+    // invariant `organiser::plan_move`'s `has_location` rests on: `get_gps_info`
+    // yields a record holding both coordinates or no record at all, and
+    // `parse_iso6709` returns a pair or `None`, so nothing that reaches here has
+    // one without the other. A survivor of mutation testing for that reason, and
+    // an equivalent one besides — both fields are assigned together below, so a
+    // half-located file would still be refused by the `&&` downstream.
     let (latitude, longitude) = position;
     if latitude.is_some() && longitude.is_some() {
         debug!(
@@ -884,6 +892,14 @@ pub(crate) fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
     //
     // Found by `fuzz/fuzz_targets/parse_iso6709.rs` on `-33.8688+302.2093/`
     // within seconds of the target first being pointed at this function.
+    // `||` rather than `&&` is an equivalent mutation, and mutation testing duly
+    // survives it: the range check below already refuses every non-finite value,
+    // because `RangeInclusive::contains` is false for `NaN` and for both
+    // infinities. This guard exists for the message rather than the verdict — a
+    // coordinate that is not a number and one that is off the planet are
+    // different corruptions, and `-vv` should say which. Deleting it would not
+    // change where a single file goes; it would only make the two cases
+    // indistinguishable in the log.
     if !lat.is_finite() || !lon.is_finite() {
         debug!(lat, lon, location = s, "ignoring a non-finite coordinate");
         return None;

@@ -1653,6 +1653,80 @@ fn destinations_in(stdout: &str, output: &Path) -> Vec<String> {
     out
 }
 
+/// A name already sitting in the output tree is not previewed as free.
+///
+/// The test above builds its collision out of files from a *single* run, so it
+/// is satisfied by a ledger that knows only about this run's own claims. This
+/// one organises into a directory that is already occupied — which
+/// `DestinationLedger`'s own doc comment calls "the ordinary case for this
+/// tool", a user pointing `mmm` at a library it has organised before.
+///
+/// Without `seed_from_disk` the ledger starts empty, so it predicts the
+/// unsuffixed name as free while `move_no_clobber` — still the arbiter —
+/// produces the suffixed one. The preview then names a path the run does not
+/// create, and does so specifically about a file that is already on disk, which
+/// reads as "that one is about to be overwritten".
+///
+/// Found by mutation testing: both `seed_from_disk` mutants survived the whole
+/// suite, because every existing preview test organises into an empty tree.
+#[test]
+fn the_preview_accounts_for_names_already_in_the_output_tree() {
+    let at = naive(2024, 3, 15, 14, 30, 0);
+    let (_scratch, out_dir) = scratch_output();
+
+    let first = MediaTree::new().jpeg_with_exif("first.jpg", at, None);
+    assert_ok(&run_commit(first.path(), &out_dir), "the first commit");
+
+    let settled = snapshot_tree(&out_dir);
+    assert_eq!(
+        settled.len(),
+        1,
+        "the first run must leave exactly one file for the second to collide with: {settled:?}"
+    );
+    let occupied = settled[0].clone();
+    let expected = format!(
+        "{}-1.jpg",
+        occupied
+            .strip_suffix(".jpg")
+            .expect("the first run produced a .jpg")
+    );
+
+    // A different file — different marker, so a different content hash — that
+    // resolves to the same second, and therefore to the taken name.
+    let second = MediaTree::new().jpeg_with_exif("second.jpg", at, None);
+
+    let preview = stdout_of(&run_commit_preview(second.path(), &out_dir));
+    assert_eq!(
+        destinations_in(&preview, &out_dir),
+        vec![expected.clone()],
+        "the preview must route around the name the first run already took:\n{preview}"
+    );
+
+    assert_ok(&run_commit(second.path(), &out_dir), "the second commit");
+
+    let mut both = vec![occupied.clone(), expected.clone()];
+    both.sort();
+    assert_eq!(
+        snapshot_tree(&out_dir),
+        both,
+        "the commit must produce exactly what the preview named, and keep what was there"
+    );
+
+    // Which file is which, rather than merely how many there are: the failure
+    // this guards against is the second file landing on top of the first.
+    let landed = file_contents_by_marker(&out_dir);
+    assert_eq!(
+        landed.get("first.jpg"),
+        Some(&vec![occupied]),
+        "the file that was already organised must not have moved: {landed:?}"
+    );
+    assert_eq!(
+        landed.get("second.jpg"),
+        Some(&vec![expected]),
+        "the new file must have taken the suffixed name: {landed:?}"
+    );
+}
+
 /// The summary's `unsorted/` figure counts files actually going there.
 ///
 /// It counted `DateSource::None` — a variant no CLI invocation produces — so a

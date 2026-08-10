@@ -1,7 +1,7 @@
 ---
 type: analysis
 title: Mutation Testing Report
-created: 2026-08-09
+created: 2026-08-10
 tags:
   - testing
   - mutation
@@ -9,15 +9,22 @@ tags:
 related:
   - '[[coverage-report]]'
   - '[[hashing-baseline]]'
+  - '[[fuzzing]]'
   - '[[journal-format]]'
 ---
 
 # Mutation Testing Report
 
-Measured with [`cargo-mutants`](https://github.com/sourcefrog/cargo-mutants) 27.1.0
-over `code/`, on macOS 15 (aarch64), rustc 1.92.0, scoped to the four modules
-that decide what moves and what is recorded: `organiser.rs`, `journal.rs`,
-`hasher.rs`, `metadata.rs`.
+Measured with [`cargo-mutants`](https://github.com/sourcefrog/cargo-mutants) 27.1.0,
+rustc 1.92.0, macOS 26.5.2 on an 8-core arm64 machine. **440 mutants, 2 hours at
+`-j 4`.** This supersedes the 2026-08-09 report measured at v0.2.0; that run
+covered four modules and 313 mutants, and its figures are quoted below only for
+comparison.
+
+Two things changed since it. The scope now includes `undo.rs` and `sidecar.rs` —
+the two destructive modules the previous run named as a gap and did not measure —
+and the crate has taken two releases of feature work, so the four original
+modules generate 343 mutants where they generated 313.
 
 Reproduce with:
 
@@ -26,11 +33,22 @@ cd code
 cargo install cargo-mutants --locked
 cargo mutants -j 4 \
   --file src/organiser.rs --file src/journal.rs \
-  --file src/hasher.rs --file src/metadata.rs
+  --file src/hasher.rs --file src/metadata.rs \
+  --file src/undo.rs --file src/sidecar.rs
 ```
 
-Roughly an hour at `-j 4` on an 8-core M1 Pro: every mutant rebuilds the crate
-and runs the whole suite.
+Configuration lives in [`code/.cargo/mutants.toml`](../../code/.cargo/mutants.toml),
+which is read automatically and does two things this run depends on. It excludes
+`src/fixtures.rs` and `src/generate.rs`, because a mutated byte in a JPEG
+quantisation table produces a fixture that is differently shaped rather than
+wrong and nothing asserts on the shape of a fixture — dozens of unkillable
+survivors would hide the real ones. And it passes `no_default_features`, which
+switches off `tests/docs.rs` and `tests/release.rs`: `cargo-mutants` copies the
+package into a temp directory, so those two read repository-root files that do
+not exist during a run, and they took the *baseline* down with them. Between
+those targets landing and that line, mutation testing could not be run at all.
+Neither target executes a line of any module measured here, so the exclusion
+costs no detection.
 
 ## Why this exists, given the coverage report
 
@@ -40,155 +58,194 @@ taken only one of its two outcomes — and a line that ran is not a line whose
 result anything looked at. Mutation testing asks the stronger question directly:
 change the code so it is wrong, and see whether a test notices.
 
-It found that 19 changes to these four modules could be made without any of 603
-tests failing. Eleven of them were real gaps and are now closed; the other eight
-are recorded below with the reason each is not a gap. Two of the eleven are
-changes that would have moved somebody's photographs to the wrong place.
-
 ## Figures
+
+Baseline sweep — the suite as it stood at 665 tests, before anything in this
+report was written:
+
+| Module | Mutants | Caught | Missed | Unviable | Timeout | Score |
+|---|---|---|---|---|---|---|
+| `hasher.rs` | 62 | 39 | 4 | 18 | 1 | 88.64% |
+| `journal.rs` | 47 | 42 | **0** | 5 | 0 | **100.00%** |
+| `metadata.rs` | 102 | 83 | 3 | 16 | 0 | 96.51% |
+| `organiser.rs` | 132 | 115 | 5 | 12 | 0 | 95.83% |
+| `sidecar.rs` | 20 | 17 | 1 | 2 | 0 | 94.44% |
+| `undo.rs` | 77 | 55 | **14** | 8 | 0 | **79.71%** |
+| **Total** | **440** | **351** | **27** | **61** | **1** | **92.61%** |
+
+Score is caught ÷ viable, where viable excludes the mutants that did not compile
+and counts the one timeout against us.
+
+After the three tests this run produced:
 
 | | Baseline | After |
 |---|---|---|
-| Mutants generated | 313 | 313 |
-| Caught | 246 | **257** |
-| **Missed** | **19** | **8** |
-| Unviable (did not compile) | 47 | 47 |
-| Timeout | 1 | 1 |
-| Mutation score (caught ÷ viable) | 92.83% | **96.98%** |
+| Caught | 351 | **356** |
+| **Missed** | **27** | **22** |
+| Mutation score | 92.61% | **93.93%** |
+| `organiser.rs` | 95.83% | **97.50%** |
+| `undo.rs` | 79.71% | **84.06%** |
 
-Tests: 603 → 609. The whole suite still runs in about 28 seconds.
+Tests: 665 → **668**. Full gate green afterwards — `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`.
 
-The "After" column is the baseline sweep with the eighteen re-examined mutants'
-outcomes substituted in. Rather than pay another hour for an identical full
-sweep, the verification run was scoped by regex to every function that had a
-surviving mutant plus every function touched by the new tests — 53 mutants,
-11 minutes — and the unaffected 260 were not re-run. The one surviving mutant
-outside that regex (`STREAM_BUFFER_BYTES`, below) was re-examined on its own.
+**The "After" column is not a second full sweep.** Re-running 440 mutants to
+re-confirm 427 unchanged outcomes is two more hours for no information, so the
+five mutants these tests target were re-run scoped by regex — 13 mutants, 5
+minutes, `12 caught, 1 unviable, 0 missed` — and the rest are carried across
+from the baseline. This is the same shortcut the v0.2.0 report took, and it is
+stated for the same reason: the number is a substitution, not a measurement of
+the whole.
 
-## What was actually wrong
+### Against the v0.2.0 run
 
-Eleven surviving mutants, in the order they matter.
+Comparable only over the four modules both runs covered:
 
-### A file lost between the two hashing reads was not counted
+| | v0.2.0 (2026-08-09) | This run | After |
+|---|---|---|---|
+| Mutants | 313 | 343 | 343 |
+| Caught | 257 | 279 | 281 |
+| Missed | 8 | 12 | 10 |
+| Score | 96.98% | 95.55% | **96.23%** |
 
-`skipped += full.skipped` in `find_duplicates` could be changed to `-=` and no
-test failed. That line is how a file dropped by **phase 3** reaches the count the
-operator is shown; phase 2's skips were tested, phase 3's had never happened in a
-test at all. A file excluded from duplicate detection is excluded from the plan
-too — it is not moved, not reported as moved, and if the count is wrong the
-operator reads a clean summary over a library that was only partly processed.
+The four modules grew by 30 mutants across two releases, and the score fell
+1.43 points before this run's tests and 0.75 after. **The v0.2.0 96.98% was
+itself a substituted figure**, not a full sweep, so this comparison is direction
+rather than arithmetic.
 
-Phase 3 skips a file that phase 2 could read and phase 3 could not: a file
-deleted, truncated or locked *between the two reads*. That race cannot be
-produced against a real filesystem, so the read is now injected —
-`find_duplicates_with` takes the phase-3 hash function, and `find_duplicates`
-passes `full_hash`. This follows the injected `copy` parameter on
-`copy_verify_delete` rather than the thread-local used for the manifest: the
-phase-3 read happens on the pool's worker threads, so a thread-local armed by the
-test would never be seen by the code under test.
+## The eight accepted survivors, re-checked one at a time
 
-The new test makes both phases skip — phase 2 refuses two files whose length no
-longer matches the scan, phase 3 is told one file has gone — and asserts the
-total is their sum. A single skip in one phase would be counted the same by any
-arithmetic at all.
+The v0.2.0 report accepted eight survivors and one timeout with a stated reason
+for each. The instruction for this run was to check that each is still the same
+survivor with the same reason, rather than re-accept a count. **All eight are,
+at the same site, with the same mutation, for the same reason** — and the
+timeout is still the same timeout:
 
-### A camera that spells its datetime as text was silently undated
+| v0.2.0 site | Today | Still the same reason? |
+|---|---|---|
+| `hasher.rs` `STREAM_BUFFER_BYTES` `128 * 1024` → `+` | `hasher.rs:25:40` | Yes — a read-buffer length; every digest is byte-identical at any buffer size. |
+| `hasher.rs` `candidate_groups += 1` → `*=` | `hasher.rs:407:30` | Yes — the counter is read only by a `debug!` field. |
+| `hasher.rs` duplicate-group tie-break, delete arm | `hasher.rs:556:17` | Yes — unreachable by construction; commented at the site. |
+| `hasher.rs` `if skipped > 0` → `<` | `hasher.rs:564:16` | Yes — suppresses a `warn!`; the count itself is asserted. |
+| `metadata.rs` `"CreateDate" \| "DateTimeOriginal"`, delete arm | `metadata.rs:631:13` | Yes — dead against `nom-exif` 1.x, and the pin is still `nom-exif = "1"`. |
+| `organiser.rs` `has_location` `&&` → `\|\|` | `organiser.rs:150:47` | Yes — the coordinate-pair invariant still holds; commented at the site. |
+| `organiser.rs` `ChunkController::chunk_started` | `organiser.rs:1599:9` | Yes — equivalent mutant, default body discards its arguments. |
+| `organiser.rs` `ChunkController::should_continue` | `organiser.rs:1608:9` | Yes — equivalent mutant. |
+| `hasher.rs` `hash_reader` `== 0` → `!=` (timeout) | `hasher.rs:841:23` | Yes — still a non-terminating loop, still detected by the suite hanging. |
 
-Both `entry_to_wall_clock` and `entry_to_reading` could have their
-`EntryValue::Text` arm deleted with no test failing. `nom-exif` hands most files
-over as an already-parsed `EntryValue::Time`, so the text arm fires only for the
-cameras that write the tag their own way — which is exactly why nothing in the
-fixture tree reached it, and exactly why losing it would be invisible until
-somebody with one of those cameras found their photographs filed under the date
-they copied them off the card. **This is a mutant that moves files to the wrong
-place.** Both arms are now pinned by unit tests, including the video side's
-requirement that an offset in the string comes back as `Reading::Zoned` and not
-as an instant.
+Nothing on that list quietly became a different mutant, and nothing on it was
+re-accepted on the strength of the count matching.
 
-### The year check could be answered by a constant
+## What this run found
 
-`reading_year` could return `1` or `0` for every reading. The function exists to
-catch the negative year `chrono` will parse out of a corrupt EXIF string before
-it reaches `naming` — a constant would let every one of them through, and the
-first sign would be a directory called `-44-03-15` at the top of somebody's photo
-library whose name every command-line tool reads as a flag. **The second mutant
-that moves files to the wrong place.** Now pinned across all three `Reading`
-variants.
+### Two mutants in the collision ledger, and a preview test that could not see them
 
-### "Your file has no date" and "we could not read your file's date" were the same test
+`DestinationLedger::seed_from_disk` could be replaced with `()`, or have its `!`
+deleted, and all 665 tests passed. That function is what makes the plan account
+for names **already on disk**, and the ledger's own doc comment calls a run into
+an already-organised library "the ordinary case for this tool".
 
-`date_entry_is_unreadable` could return `true` unconditionally, and its `&&`
-could become `||`, without failing anything. The distinction it draws is the
-subject of a long doc comment and of `DateSource`'s five variants: a photograph
-that records no date is a fact about the photograph, and a photograph whose
-recorded date we could not read is a limitation of this tool.
+Without it the ledger starts empty, so it predicts the unsuffixed name as free
+while `move_no_clobber` — still the arbiter — produces the suffixed one. The
+preview then names a path the run does not create, and does so specifically
+about a file already sitting in the output tree, which reads as *that one is
+about to be overwritten*. That is the exact defect the ledger was added in 0.3.0
+to fix.
 
-The gap was a missing fixture, not a missing assertion. `jpeg_without_exif` never
-reaches the question — with no `APP1` segment the parser returns first — and
-`jpeg_with_unreadable_date` is already on the `true` side of it. Nothing in the
-tree was a JPEG whose EXIF *parses* and contains no datetime entry, which is the
-only file that can prove the question is being asked correctly. `MediaTree::
-jpeg_with_exif_but_no_date` builds one, with a control test that puts the fixture
-to `nom-exif` directly — the block yields entries, and none of them is a datetime
-— because a fixture whose EXIF silently failed to parse would classify as
-`Filesystem` too, by returning before the question is ever asked, and would have
-made the assertion vacuous.
+It survived because **every existing preview test organises into an empty
+directory**, including the one written for the 0.3.0 fix. That test builds its
+collision out of files from a single run, so it is satisfied by a ledger that
+knows only about its own claims. `the_preview_accounts_for_names_already_in_the_output_tree`
+organises twice into the same output directory and asserts the second preview
+names the suffixed path, that the commit produces exactly what the preview
+named, and — by provenance marker rather than by filename — which of the two
+files ended up where. Both mutants were injected by hand and both fail it on the
+intended assertion, printing the unsuffixed name against the suffixed one.
 
-### The default thread count could be 1
+### `undo.rs` is the least-verified module in the crate
 
-`default_hash_threads` could return `1` unconditionally. The existing test
-asserted only `<= DEFAULT_HASH_THREAD_CEILING`, which a constant of one
-satisfies — a test named after the ceiling that passes while every machine
-hashes single-threaded. It now asserts the rule the doc comment states,
-`min(cores, ceiling)`.
+Its first mutation run at all, and it scores **79.71%** against 88–100% for
+everything else. Fourteen survivors, three of which are closed here.
 
-### `is_filesystem` had no caller at all
+`Verification::is_intact` could return `true` for everything or `false` for
+everything with nothing failing, because **nothing in the crate calls it** —
+`execute_restore` matches on the variants directly. This is the same shape as
+`DateSource::is_filesystem` in the previous run, and it is resolved the same
+way: it is public API on a public enum and its contract is the one sentence undo
+rests on, so it is pinned by a test over all four variants rather than deleted,
+and its lack of an in-crate caller is recorded here as the finding.
 
-Both mutants of `DateSource::is_filesystem` survived because nothing calls it:
-`reporter.rs` tallies the three filesystem variants by matching them directly. It
-is public API on a public enum, documented as the counterpart to `is_recorded`
-(which *is* used), and its contract includes a genuine trap — `DateSource::None`
-is not a filesystem fallback, and counting it as one would inflate the figure the
-run reports. It is now pinned by a test over all five variants rather than
-deleted; that it has no in-crate caller is recorded here as the finding it is.
+More seriously, `verify_step`'s `NotFound` guard could be widened to match every
+error, so that a file this process cannot inspect returns `Missing` instead of
+`Unverifiable`. Those two verdicts are counted differently — `skipped_missing`
+against `failed` — and printed differently, and the difference is the whole of
+`Unverifiable`'s doc comment: *the check itself could not be made, so nothing is
+known either way*. `Missing` tells somebody mid-recovery that the file the run
+left there is gone, which is a statement about their photograph. A file sitting
+safely inside a directory this process cannot search is not that. The `NotFound`
+path was tested; the path where the question cannot be asked at all was not.
+`a_file_that_cannot_be_inspected_is_not_reported_as_missing` locks a directory
+to `0o000` and asserts the verdict, skipping with a printed reason if the
+process turns out to ignore permission bits.
 
-### An error message could quote nothing at all
-
-`elide` could stop keeping any prefix of a corrupt journal line and the existing
-test still passed: it asserted the `… (500 bytes)` suffix and that the whole line
-was not quoted, both of which a completely empty elision satisfies. An operator
-cannot find the offending line in a journal from a byte count. The test now
-asserts the first 160 bytes survive.
+**Every one of the three tests was verified in the failing direction** — five
+injections, five catches by the intended assertion, each source restored and
+`diff`ed byte-identical afterwards.
 
 ## Surviving mutants, and why each is accepted
 
-Eight, none of which can change where a file goes or what is recorded about it.
+Twenty-two, plus the one timeout. None can change where a file goes.
+
+### The four original modules — ten, plus the timeout
+
+Nine are the v0.2.0 list above, unchanged. Two are new since that run, both
+arriving with 0.3.0 feature work:
 
 | Site | Mutation | Why it is accepted |
 |---|---|---|
-| `hasher.rs` `STREAM_BUFFER_BYTES` | `128 * 1024` → `128 + 1024` | A read-buffer length. Every digest and every copy is byte-identical at any buffer size; only throughput moves, and no test asserts throughput. |
-| `hasher.rs` `candidate_groups += 1` | `+=` → `*=` | The counter is only ever read by a `debug!` field. Cosmetic by the task's own definition. |
-| `hasher.rs` duplicate-group tie-break | delete `(Some(x), Some(y))` arm | Unreachable by construction: the groups were the keys of a `HashMap`, so no two share a digest and `then_with` never runs. Kept because it states the total order the sort would need if that stopped being true; commented at the site. |
-| `hasher.rs` `if skipped > 0` | `>` → `<` | Suppresses a `warn!` line. The count itself is reported by `reporter` and is asserted — see the phase-3 test above. |
-| `hasher.rs` `hash_reader` | `== 0` → `!= 0` | **Timeout, not a survivor.** The loop never terminates, so no assertion can run. The suite detects it by hanging, which is detection by the least useful signal available; there is no assertion that would improve on it. |
-| `metadata.rs` `"CreateDate" \| "DateTimeOriginal"` | delete arm | Dead against `nom-exif` 1.x, measured rather than assumed: a probe over every video fixture the harness can build (`mp4`, `mov`, Apple `creationdate`) shows the parser normalises every date onto `com.apple.quicktime.creationdate`, and it refuses outright any file that is not a container it supports — so a mislabelled JPEG or HEIC cannot reach the arm either. Kept and commented: the key names are the parser's, and a version that started reporting `CreateDate` verbatim would otherwise send every affected video to its filesystem timestamp in silence. |
-| `organiser.rs` `has_location` | `&&` → `\|\|` | Unreachable: the EXIF and ISO 6709 extractors both set the two coordinates together or set neither, so no metadata this can be handed has one without the other. Commented at the site. |
-| `organiser.rs` `ChunkController::chunk_started` and `should_continue` | replace default body | Equivalent mutants. The default bodies are `let _ = (args);` and `let _ = (args); true` — discarding the arguments has no effect, so the mutations are the same programs. |
+| `metadata.rs:280` keeping a location whose date fell back | `&&` → `\|\|` | Unreachable, and equivalent besides. `get_gps_info` yields a record holding both coordinates or no record at all, and `parse_iso6709` returns a pair or `None`, so nothing reaching here has one without the other — the same invariant `has_location` rests on. Both fields are assigned together below the guard, so even a half-located file would be refused downstream. Now commented at the site. |
+| `metadata.rs:887` the non-finite coordinate guard | `\|\|` → `&&` | Equivalent. The range check on the next line already refuses every non-finite value: `RangeInclusive::contains` is false for `NaN` and for both infinities — **measured, not reasoned**. The guard exists for the message rather than the verdict, so a coordinate that is not a number and one that is off the planet are distinguishable at `-vv`. Now commented at the site. |
+
+### `undo.rs` — eleven
+
+| Site | Mutation | Why it is accepted |
+|---|---|---|
+| `521`, `592`, `608`, `612` — four counters in `execute_restore` | `+=` → `-=` and `*=` (eight mutants) | **Accepted for now, not argued to be safe.** Every one is in an error branch — a file that could not be checked, a restore that failed, a journal that could not be written — so reaching them needs failure injection the undo suite does not yet have. The main `restored += 1` on the success path *is* caught. See the gap below. |
+| `680` — `prune_empty_dirs`'s `NotFound` guard | guard → `true`, guard → `false`, `==` → `!=` (three mutants) | Equivalent, by an invariant worth writing down: **a directory that still holds an entry makes every one of its ancestors non-empty too**, so `remove_dir` refuses all of them. Continuing to climb past a refusal can therefore only waste syscalls, never remove something that should have stayed; and stopping early cannot strand an empty ancestor, because whichever pass empties that ancestor climbs to it from below. |
+
+### `sidecar.rs` — one
+
+| Site | Mutation | Why it is accepted |
+|---|---|---|
+| `185` `SidecarIndex::empty` | → `Default::default()` | Equivalent in the strictest sense: the body **is** `Self::default()`. There is no program here to tell apart. |
 
 ## What this does not cover
 
-- **Only four modules.** `naming.rs`, `config.rs`, `settings.rs`, `undo.rs`,
-  `scanner.rs`, `sidecar.rs`, `xmp.rs`, `reporter.rs` and `timezone.rs` have not
-  been mutated. `undo.rs` and `sidecar.rs` are the notable absences: `undo` puts
-  files back and `sidecar` moves them, so both are destructive surfaces by the
-  standard this project uses. They were out of the task's stated scope and are a
-  real gap, not a judgement that they are safe.
-- **No CI gate.** Unlike coverage, mutation testing is not wired into
-  `.github/workflows/ci.yml`. An hour per run at `-j 4` is too slow for a pull
-  request, and `--in-diff` mode (mutating only changed lines) has not been
-  evaluated. Nothing currently stops a new surviving mutant from appearing.
+- **The undo counters are a real gap and this run does not close it.** Eight
+  survivors across four `+=` sites mean the undo summary's `failed` and
+  `restored` figures are unasserted on every error path. A user who runs
+  `mmm undo` reads those numbers to decide whether their library came back.
+  Closing it needs the failure-injection seams the organiser already has
+  (`Sink::Failing`, `MoveRecorder::failing_after`) extended to the restore loop —
+  a change to `undo.rs`'s test surface, not an afternoon's assertions, which is
+  why it is named here as scheduled work rather than done badly in passing.
+- **Nine modules have still never been mutated:** `naming.rs`, `config.rs`,
+  `settings.rs`, `settings_report.rs`, `scanner.rs`, `xmp.rs`, `reporter.rs`,
+  `timezone.rs`, `geocoder.rs`. `undo.rs` and `sidecar.rs` have come off this
+  list; nothing else has.
+- **`fixtures.rs` and `generate.rs` are excluded by configuration** and
+  therefore unmeasured. The argument for the exclusion is in the config file and
+  repeated above; the stronger check on that code is
+  `tests/generated_library.rs`, which asserts the generator's own predictions
+  against the real binary's behaviour.
+- **Still no CI gate.** Two hours a run is too slow for a pull request, and
+  `--in-diff` mode (mutating only changed lines) has still not been evaluated.
+  Nothing stops a new surviving mutant from appearing — which is exactly what
+  happened between the two runs, twice.
 - **`--baseline` is the same suite.** A mutant is "caught" if the suite fails,
-  which includes failing for the wrong reason. Every kill above was confirmed by
-  reading the test that does the killing, but that is a manual check.
-- **The figures are macOS.** `#[cfg(unix)]` tests run; nothing Windows-specific
-  was mutated or exercised.
+  which includes failing for the wrong reason. Every kill claimed above was
+  confirmed by injecting the mutation by hand and reading which assertion fired,
+  but that is a manual check over five mutants, not over 351.
+- **The figures are macOS.** `#[cfg(unix)]` tests run — including the new
+  permission-denied one, which is skipped rather than failed if the process
+  ignores permission bits. Nothing Windows-specific was mutated or exercised.

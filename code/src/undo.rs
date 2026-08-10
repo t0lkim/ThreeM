@@ -1593,6 +1593,88 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Verification
+    // -----------------------------------------------------------------
+
+    /// Only `Intact` may proceed, and the other three verdicts are each a
+    /// refusal.
+    ///
+    /// Found by mutation testing: `is_intact` could be made to return `true`
+    /// for everything or `false` for everything and the whole suite stayed
+    /// green, because nothing in the crate calls it — `execute_restore`
+    /// matches on the variants directly. It is public API on a public enum and
+    /// its contract is the one sentence undo rests on, so it is pinned here
+    /// rather than deleted; that it has no in-crate caller is recorded in
+    /// `docs/research/mutation-testing.md` as the finding it is.
+    #[test]
+    fn only_an_intact_file_may_be_restored() {
+        assert!(Verification::Intact.is_intact());
+
+        for refused in [
+            Verification::Missing,
+            Verification::Modified {
+                detail: "size changed".to_string(),
+            },
+            Verification::Unverifiable {
+                detail: "it could not be inspected".to_string(),
+            },
+        ] {
+            assert!(
+                !refused.is_intact(),
+                "{refused:?} is a refusal, not a licence to move the file"
+            );
+        }
+    }
+
+    /// "I could not look" is not reported as "it is gone".
+    ///
+    /// The two verdicts are counted differently and printed differently, and
+    /// the difference is the whole of the doc comment on
+    /// [`Verification::Unverifiable`]: `Missing` says the file the run left
+    /// here is no longer here, which for somebody in the middle of a recovery
+    /// is a statement about their photograph. A file sitting safely inside a
+    /// directory this process cannot search is not that.
+    ///
+    /// Found by mutation testing: widening the `NotFound` guard to match every
+    /// error — so that a permission failure returns `Missing` — survived the
+    /// whole suite. The `NotFound` path itself was tested; the path where the
+    /// question could not be asked at all was not.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_inspected_is_not_reported_as_missing() {
+        let tmp = TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let hidden = locked.join("photo.jpg");
+        fs::write(&hidden, b"contents").unwrap();
+
+        let Some(_guard) = crate::fixtures::deny_reads(&locked) else {
+            eprintln!(
+                "SKIPPED a_file_that_cannot_be_inspected_is_not_reported_as_missing: \
+                 a 0o000 directory was still searchable, so this process ignores \
+                 permission bits (running as root?)"
+            );
+            return;
+        };
+
+        let step = RestoreStep {
+            seq: 1,
+            current: hidden,
+            original: tmp.path().join("photo.jpg"),
+            source_size: Some(8),
+            source_hash: None,
+            kind: IntentKind::Organise,
+        };
+
+        assert!(
+            matches!(verify_step(&step), Verification::Unverifiable { .. }),
+            "a file inside an unsearchable directory has not been shown to be gone, \
+             so the verdict must say the check failed: {:?}",
+            verify_step(&step)
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Pruning
     // -----------------------------------------------------------------
 
