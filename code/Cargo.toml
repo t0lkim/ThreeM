@@ -95,6 +95,22 @@ criterion = { version = "0.8", default-features = false, features = [
 # available to test targets too, so it needs no promotion here for the
 # `snapshot_tree` helper the integration suites will use.
 
+[features]
+# `repository-tests` is on by default and exists to be switched *off* by one
+# caller. `tests/docs.rs` and `tests/release.rs` assert facts about files that
+# live at the repository root — `README.md`, `CONTRIBUTING.md`, `SECURITY.md`,
+# `.github/` — and those files are outside the cargo package. Any tool that
+# builds the package in isolation therefore has no repository above it, and
+# both targets fail on a missing file rather than on a broken claim.
+#
+# `cargo-mutants` is that tool: it copies the package into a temp directory for
+# every mutant, so the whole suite was unrunnable under it. It turns this off
+# via `no_default_features` in `.cargo/mutants.toml`. Nothing else does — an
+# ordinary `cargo test`, `cargo test --all-targets`, CI and the coverage job
+# all run both targets exactly as before.
+default = ["repository-tests"]
+repository-tests = []
+
 [lib]
 name = "mmm"
 path = "src/lib.rs"
@@ -110,6 +126,19 @@ path = "src/bin/mmm_dedup_verifier.rs"
 [[bin]]
 name = "mmm-fixtures"
 path = "src/bin/mmm_fixtures.rs"
+
+# The only two test targets that read outside the package. Declared explicitly
+# so the dependency is visible here rather than only in the failure message;
+# every other file under `tests/` is still auto-discovered and unconditional.
+[[test]]
+name = "docs"
+path = "tests/docs.rs"
+required-features = ["repository-tests"]
+
+[[test]]
+name = "release"
+path = "tests/release.rs"
+required-features = ["repository-tests"]
 
 # `harness = false` hands `main` to criterion instead of libtest, which is how
 # criterion collects samples at all.

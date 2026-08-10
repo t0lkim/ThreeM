@@ -12,3 +12,19 @@
 # the result against the generator's own predictions — a mutated fixture that
 # changed anything observable fails there.
 exclude_globs = ["src/fixtures.rs", "src/generate.rs"]
+
+# cargo-mutants copies the package — `code/` — into a temp directory and builds
+# there, so nothing above `code/` exists during a run. `tests/docs.rs` and
+# `tests/release.rs` read `README.md`, `CONTRIBUTING.md`, `SECURITY.md`,
+# `.github/ISSUE_TEMPLATE/bug_report.md` and `.github/scripts/*` from the
+# repository root, so both panic on a missing file and the *baseline* fails:
+# "cargo test failed in an unmutated tree, so no mutants were tested". Between
+# those two targets landing and this line, mutation testing could not be run at
+# all.
+#
+# The two targets carry `required-features = ["repository-tests"]` in
+# `Cargo.toml`, and that feature is on by default — so this switch is the only
+# thing anywhere that turns them off. It costs no detection: neither target
+# executes a line of `organiser.rs`, `journal.rs`, `hasher.rs` or `metadata.rs`,
+# so neither could ever have been the test that killed a mutant in them.
+no_default_features = true
