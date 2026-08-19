@@ -1,6 +1,6 @@
 [package]
 name = "mmm"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Image and video organiser with deduplication, EXIF-based renaming, and date-based directory structure"
 authors = ["Mike Lott <me@t0lkim.dev>"]

@@ -540,7 +540,24 @@ fn extract_image_metadata(path: &Path, tz: &TimezonePolicy) -> Result<Extracted>
                 + gps.longitude.2.as_float() / 3600.0;
             let lat = if gps.latitude_ref == 'S' { -lat } else { lat };
             let lon = if gps.longitude_ref == 'W' { -lon } else { lon };
-            (Some(lat), Some(lon))
+
+            // A rational with a zero denominator is a valid EXIF encoding
+            // that `as_float()` turns into NaN or infinity, exactly the
+            // corruption `parse_iso6709` below was fuzzed into refusing. The
+            // same k-d tree geocoder sits downstream of both paths, so an
+            // unvalidated EXIF GPS IFD invents a location the same way an
+            // unvalidated ISO 6709 string does.
+            match validate_gps_coordinate(lat, lon) {
+                Ok(()) => (Some(lat), Some(lon)),
+                Err(CoordinateRejection::NonFinite) => {
+                    warn!(lat, lon, path = %path.display(), "ignoring a non-finite EXIF GPS coordinate");
+                    (None, None)
+                }
+                Err(CoordinateRejection::OffPlanet) => {
+                    warn!(lat, lon, path = %path.display(), "ignoring an off-planet EXIF GPS coordinate");
+                    (None, None)
+                }
+            }
         }
         _ => (None, None),
     };
@@ -900,16 +917,45 @@ pub(crate) fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
     // different corruptions, and `-vv` should say which. Deleting it would not
     // change where a single file goes; it would only make the two cases
     // indistinguishable in the log.
+    match validate_gps_coordinate(lat, lon) {
+        Ok(()) => Some((lat, lon)),
+        Err(CoordinateRejection::NonFinite) => {
+            debug!(lat, lon, location = s, "ignoring a non-finite coordinate");
+            None
+        }
+        Err(CoordinateRejection::OffPlanet) => {
+            debug!(lat, lon, location = s, "ignoring an off-planet coordinate");
+            None
+        }
+    }
+}
+
+/// Why [`validate_gps_coordinate`] refused a pair.
+///
+/// Kept distinct from a plain `bool` so each call site can log which
+/// corruption it saw — a coordinate that is not a number and one that is off
+/// the planet are different failures, and `-vv` should say which.
+enum CoordinateRejection {
+    NonFinite,
+    OffPlanet,
+}
+
+/// The bounds check both GPS paths in this file need: EXIF's rational IFD
+/// (`extract_image_metadata`) and ISO 6709's string form (`parse_iso6709`).
+/// Both hand their result to the same k-d tree reverse geocoder, which
+/// accepts `NaN`, infinity, and any out-of-range magnitude without
+/// complaint — a `NaN` latitude resolves to the first record in the
+/// dataset (El Tarter, Andorra), inventing a location with nothing in the
+/// output to say so. Bounds are the coordinate system's own: latitude ±90,
+/// longitude ±180.
+fn validate_gps_coordinate(lat: f64, lon: f64) -> Result<(), CoordinateRejection> {
     if !lat.is_finite() || !lon.is_finite() {
-        debug!(lat, lon, location = s, "ignoring a non-finite coordinate");
-        return None;
+        return Err(CoordinateRejection::NonFinite);
     }
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
-        debug!(lat, lon, location = s, "ignoring an off-planet coordinate");
-        return None;
+        return Err(CoordinateRejection::OffPlanet);
     }
-
-    Some((lat, lon))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1126,6 +1172,35 @@ mod tests {
                 "{text} is not a place, and must not be reverse geocoded into one"
             );
         }
+    }
+
+    /// The shared bounds check both GPS paths call: EXIF's rational IFD and
+    /// ISO 6709's string form. Exercised directly because the EXIF path only
+    /// reaches this guard from inside a real image's GPS IFD, and a
+    /// zero-denominator rational is the fuzz-discovered corruption that
+    /// produces exactly the NaN/infinity this rejects.
+    #[test]
+    fn validate_gps_coordinate_refuses_non_finite_and_off_planet() {
+        assert!(validate_gps_coordinate(48.8577, 2.295).is_ok());
+        assert!(validate_gps_coordinate(90.0, 180.0).is_ok());
+        assert!(validate_gps_coordinate(-90.0, -180.0).is_ok());
+
+        assert!(matches!(
+            validate_gps_coordinate(f64::NAN, 2.295),
+            Err(CoordinateRejection::NonFinite)
+        ));
+        assert!(matches!(
+            validate_gps_coordinate(48.8577, f64::INFINITY),
+            Err(CoordinateRejection::NonFinite)
+        ));
+        assert!(matches!(
+            validate_gps_coordinate(91.0, 0.0),
+            Err(CoordinateRejection::OffPlanet)
+        ));
+        assert!(matches!(
+            validate_gps_coordinate(0.0, 302.2093),
+            Err(CoordinateRejection::OffPlanet)
+        ));
     }
 
     /// `chrono` accepts these; the naming scheme cannot spell them.

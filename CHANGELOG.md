@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] — 2026-08-19
+
+### Fixed
+
+- **EXIF GPS coordinates from photos are now validated before reaching the reverse geocoder.** A crafted EXIF rational with a zero denominator produces NaN or infinity via `as_float()`, which the k-d tree geocoder silently resolves to its first record (El Tarter, Andorra), inventing a location with nothing in the output to say it was fabricated rather than read. The ISO 6709 path (videos) already had this guard after a fuzz-discovered incident; the EXIF GPS IFD path (photos) did not. Both paths now call a shared `validate_gps_coordinate` helper that rejects non-finite and out-of-range (±90 lat, ±180 lon) coordinates, returning `None` with a `tracing::warn!` so the file falls back to date-only naming instead of a wrong location.
+
 ## [Unreleased]
 
 ### Added
